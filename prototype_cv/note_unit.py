@@ -341,6 +341,7 @@ def build_note_units(notes, music_symbols, binary, dy):
         for n in group:
             base_str, suffix_str = y_to_jianpu(n['y_center'], n['system'], n.get('clef', 'treble'))
             pitch = base_str + suffix_str
+            ind_dur = detect_duration_per_note(n, binary, dy)
             note_entries.append({
                 'pitch': pitch,
                 'accidental': n.get('accidental', None),
@@ -350,6 +351,7 @@ def build_note_units(notes, music_symbols, binary, dy):
                 'system': n['system'],
                 'pair_idx': n.get('pair_idx', 0),
                 'w': n['w'],
+                'individual_duration': ind_dur,
             })
 
         # Detect duration
