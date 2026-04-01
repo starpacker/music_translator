@@ -91,10 +91,54 @@ def main(image_path):
     ]
     print(f"   Detected {len(all_notes)} noteheads total")
 
-    # Filter clef area
+    # Filter clef area — adaptive per-system boundary
+    # Line 1 (pair 0) has clef + key-sig + time-sig → wider exclusion (17%)
+    # Lines 2+ → detect actual first notehead and set boundary just before it
     img_w = binary.shape[1]
-    clef_area_x = int(img_w * 0.17)
-    all_notes = [n for n in all_notes if n['x'] > clef_area_x]
+    clef_area_x_first = int(img_w * 0.17)
+
+    from template_matching import create_notehead_template
+    nh_template = create_notehead_template(dy)
+    th, tw = nh_template.shape
+
+    clef_boundaries = {}
+    for pi, (treble_sys, bass_sys) in enumerate(grand_staff_pairs):
+        if pi == 0:
+            clef_boundaries[pi * 2] = clef_area_x_first
+            clef_boundaries[pi * 2 + 1] = clef_area_x_first
+            continue
+        # Scan x=200-500 for first notehead on each staff
+        boundary = clef_area_x_first  # fallback
+        for sys_info in [treble_sys, bass_sys]:
+            y1 = max(0, sys_info[0] - int(dy * 2))
+            y2 = min(binary.shape[0], sys_info[4] + int(dy * 2))
+            roi = binary[y1:y2, 200:500]
+            if tw < roi.shape[1] and th < roi.shape[0]:
+                res = cv2.matchTemplate(roi, nh_template, cv2.TM_CCOEFF_NORMED)
+                loc = np.where(res >= 0.55)
+                if len(loc[0]) > 0:
+                    first_x = int(np.min(loc[1])) + 200
+                    candidate = max(200, first_x - int(dy))
+                    boundary = min(boundary, candidate)
+        clef_boundaries[pi * 2] = boundary
+        clef_boundaries[pi * 2 + 1] = boundary
+
+    # Filter notes based on their system's clef boundary
+    filtered_notes = []
+    for n in all_notes:
+        n_cy = n['y_center']
+        best_sys_idx = None
+        best_dist = float('inf')
+        for si, sys in enumerate(systems):
+            mid_y = (sys[0] + sys[4]) / 2.0
+            dist = abs(n_cy - mid_y)
+            if dist < best_dist:
+                best_dist = dist
+                best_sys_idx = si
+        boundary = clef_boundaries.get(best_sys_idx, clef_area_x_first)
+        if n['x'] > boundary:
+            filtered_notes.append(n)
+    all_notes = filtered_notes
     print(f"   After clef area filtering: {len(all_notes)} notes")
 
     # ── 5. Assign Notes to Treble/Bass ──
@@ -121,7 +165,7 @@ def main(image_path):
     # ── 7. Detect Rests ──
     print("7. Detecting rests...")
     all_rests = detect_rests(binary, systems, dy)
-    all_rests = [r for r in all_rests if r['x'] > clef_area_x]
+    all_rests = [r for r in all_rests if r['x'] > int(img_w * 0.10)]
     all_rests = _filter_rests(all_rests, barlines_per_pair, treble_notes + bass_notes, dy)
     print(f"   Found {len(all_rests)} rests (after filtering)")
 
@@ -148,8 +192,13 @@ def main(image_path):
         treble_units = build_note_units(pair_treble, music_symbols, binary, dy)
         bass_units = build_note_units(pair_bass, music_symbols, binary, dy)
 
-        treble_measures = segment_into_measures(treble_units, pair_t_rests, barlines, dy)
-        bass_measures = segment_into_measures(bass_units, pair_b_rests, barlines, dy)
+        is_first = (pair_idx == 0)
+        treble_measures = segment_into_measures(treble_units, pair_t_rests, barlines, dy,
+                                                beats_per_measure=2.0,
+                                                is_first_system=is_first)
+        bass_measures = segment_into_measures(bass_units, pair_b_rests, barlines, dy,
+                                              beats_per_measure=2.0,
+                                              is_first_system=is_first)
 
         # Strip leading empty measures for lines 2+ (clef/key-sig area before first barline)
         if pair_idx >= 1:
@@ -188,51 +237,121 @@ def _merge_barlines(treble_bl, bass_bl, dy, binary=None,
                     treble_sys=None, bass_sys=None):
     """Merge and verify barlines from treble and bass staves.
 
-    In a grand staff, real barlines span BOTH staves through the gap.
-    If binary image and system info are provided, verify each candidate
-    by checking vertical density across both staves and the gap.
-    Otherwise fall back to simple deduplication.
+    Strategy:
+    1. Match treble/bass barlines pairwise within tolerance
+    2. Use average position for matched pairs
+    3. Verify candidates with _is_real_barline (with ±5px search)
+    4. Scan for missed barlines with minimum spacing constraint
+    5. Fallback to averaged candidates if verification fails
     """
-    all_bx = sorted(set(treble_bl + bass_bl))
-    if not all_bx:
+    if not treble_bl and not bass_bl:
         return []
+
+    # Step 1: Match treble and bass barlines pairwise
+    match_tolerance = dy * 8  # ~170px
+    t_sorted = sorted(treble_bl)
+    b_sorted = sorted(bass_bl)
+    t_used = [False] * len(t_sorted)
+    b_used = [False] * len(b_sorted)
+    matched = []
+    unmatched = []
+
+    for ti, tx in enumerate(t_sorted):
+        best_bi = -1
+        best_dist = match_tolerance
+        for bi, bx in enumerate(b_sorted):
+            if b_used[bi]:
+                continue
+            dist = abs(tx - bx)
+            if dist < best_dist:
+                best_dist = dist
+                best_bi = bi
+        if best_bi >= 0:
+            avg_x = int((tx + b_sorted[best_bi]) / 2)
+            matched.append(avg_x)
+            t_used[ti] = True
+            b_used[best_bi] = True
+        else:
+            unmatched.append(int(tx))
+            t_used[ti] = True
+
+    for bi, bx in enumerate(b_sorted):
+        if not b_used[bi]:
+            unmatched.append(int(bx))
+
+    # Matched pairs are high confidence; unmatched are low confidence
+    all_candidates = sorted(matched + unmatched)
 
     # Deduplicate with dy tolerance
     deduped = []
-    for bx in all_bx:
+    for bx in all_candidates:
         if not deduped or abs(bx - deduped[-1]) > dy:
             deduped.append(bx)
         else:
             deduped[-1] = (deduped[-1] + bx) // 2
 
-    # If we have image data, verify candidates AND scan for missed barlines.
-    # Real grand-staff barlines span both staves through the gap.
-    if binary is not None and treble_sys is not None and bass_sys is not None:
-        # Verify existing candidates
-        verified = set()
-        for bx in deduped:
-            bx = int(bx)
-            if _is_real_barline(binary, bx, treble_sys, bass_sys):
+    if binary is None or treble_sys is None or bass_sys is None:
+        return deduped
+
+    # Step 2: Verify candidates — search in wider range around each
+    # The averaged position may be far from the actual barline (e.g., treble at 1154,
+    # bass at 1297, average 1225 — actual barline is at neither position).
+    # Search in a range proportional to the match tolerance.
+    search_radius = int(dy * 4)  # ~85px
+    verified = set()
+    for bx in deduped:
+        best_x = None
+        best_density = 0
+        for test_x in range(int(bx) - search_radius, int(bx) + search_radius + 1):
+            if test_x < 2 or test_x >= binary.shape[1] - 2:
+                continue
+            col_t = binary[treble_sys[0]:treble_sys[4], test_x-1:test_x+2]
+            col_b = binary[bass_sys[0]:bass_sys[4], test_x-1:test_x+2]
+            d_t = np.max(np.mean(col_t, axis=0)) / 255 if col_t.size > 0 else 0
+            d_b = np.max(np.mean(col_b, axis=0)) / 255 if col_b.size > 0 else 0
+            if d_t > 0.55 and d_b > 0.55:
+                total = d_t + d_b
+                if total > best_density:
+                    best_density = total
+                    best_x = test_x
+        if best_x is not None:
+            verified.add(best_x)
+
+    # Step 3: Scan for missed barlines with minimum spacing
+    clef_end = int(binary.shape[1] * 0.25)
+    # Minimum spacing: use individual system spacings as reference
+    all_spacings = []
+    for bl_list in [t_sorted, b_sorted]:
+        if len(bl_list) >= 2:
+            all_spacings.extend([bl_list[i+1]-bl_list[i] for i in range(len(bl_list)-1)])
+    min_gap = np.median(all_spacings) * 0.5 if all_spacings else dy * 15
+
+    for bx in range(clef_end, binary.shape[1], 3):
+        if _is_real_barline(binary, bx, treble_sys, bass_sys):
+            if all(abs(bx - v) > min_gap for v in verified):
                 verified.add(bx)
 
-        # Scan for missed barlines in gaps between existing ones.
-        # Only add if far enough from all existing barlines (> 40% of avg spacing).
-        clef_end = int(binary.shape[1] * 0.20)
-        if verified:
-            sorted_v = sorted(verified)
-            spacings_v = [sorted_v[i+1]-sorted_v[i] for i in range(len(sorted_v)-1)]
-            min_gap = np.mean(spacings_v) * 0.4 if spacings_v else dy * 10
-        else:
-            min_gap = dy * 10
-        for bx in range(clef_end, binary.shape[1], 3):
-            if _is_real_barline(binary, bx, treble_sys, bass_sys):
-                if all(abs(bx - v) > min_gap for v in verified):
-                    verified.add(bx)
+    # Step 4: Apply minimum spacing filter to remove false positives
+    if verified:
+        sorted_v = sorted(verified)
+        filtered = [sorted_v[0]]
+        for bx in sorted_v[1:]:
+            if bx - filtered[-1] > min_gap:
+                filtered.append(bx)
+        # Remove barlines too close to left edge or right edge
+        filtered = [bx for bx in filtered
+                    if clef_end < bx < binary.shape[1] * 0.96]
+        if len(filtered) >= 2:
+            return filtered
 
-        if len(verified) >= 2:
-            return sorted(verified)
-
-    return deduped
+    # Fallback: use averaged candidates with spacing filter
+    filtered = [deduped[0]] if deduped else []
+    for bx in deduped[1:]:
+        if bx - filtered[-1] > min_gap:
+            filtered.append(bx)
+    filtered = [bx for bx in filtered
+                if clef_end < bx < binary.shape[1] * 0.96]
+    return filtered
 
 
 def _is_real_barline(binary, bx, treble_sys, bass_sys):
@@ -243,13 +362,15 @@ def _is_real_barline(binary, bx, treble_sys, bass_sys):
     Only system barlines cross the gap. So we require high density on
     BOTH staves but not necessarily in the gap.
     """
-    if bx < 1 or bx >= binary.shape[1] - 1:
+    if bx < 2 or bx >= binary.shape[1] - 2:
         return False
-    col_t = binary[treble_sys[0]:treble_sys[4], bx-1:bx+2]
-    col_b = binary[bass_sys[0]:bass_sys[4], bx-1:bx+2]
-    d_t = np.mean(col_t) / 255 if col_t.size > 0 else 0
-    d_b = np.mean(col_b) / 255 if col_b.size > 0 else 0
-    return d_t > 0.6 and d_b > 0.6
+    # Check a 5-pixel-wide column (±2) for more robust detection
+    col_t = binary[treble_sys[0]:treble_sys[4], bx-2:bx+3]
+    col_b = binary[bass_sys[0]:bass_sys[4], bx-2:bx+3]
+    # Use max across columns (barline might be only 1-2px wide)
+    d_t = np.max(np.mean(col_t, axis=0)) / 255 if col_t.size > 0 else 0
+    d_b = np.max(np.mean(col_b, axis=0)) / 255 if col_b.size > 0 else 0
+    return d_t > 0.55 and d_b > 0.55
 
 
 def _filter_rests(all_rests, barlines_per_pair, all_notes, dy):
