@@ -22,5 +22,17 @@ def test_first_chord_detected():
     raise AssertionError("System 2 not found in output")
 
 
+def test_individual_duration_detection():
+    """Detect duration per notehead, not per chord group."""
+    from note_unit import _detect_individual_duration
+    assert _detect_individual_duration(beam_count=0, has_flag=True, is_hollow=False) == 0.5
+    assert _detect_individual_duration(beam_count=0, has_flag=False, is_hollow=False) == 1.0
+    assert _detect_individual_duration(beam_count=1, has_flag=False, is_hollow=False) == 0.5
+    assert _detect_individual_duration(beam_count=2, has_flag=False, is_hollow=False) == 0.25
+    assert _detect_individual_duration(beam_count=0, has_flag=False, is_hollow=True) == 2.0
+    print("PASS: test_individual_duration_detection")
+
+
 if __name__ == "__main__":
     test_first_chord_detected()
+    test_individual_duration_detection()

@@ -203,6 +203,46 @@ def _detect_duration(music_symbols, binary, notes_in_group, dy):
     return 1.0
 
 
+def _detect_individual_duration(beam_count=0, has_flag=False, is_hollow=False):
+    """Convert beam/flag/hollow info into a duration value.
+
+    Returns float: 4.0 (whole), 2.0 (half), 1.0 (quarter), 0.5 (eighth), 0.25 (sixteenth).
+    """
+    if is_hollow:
+        return 2.0  # half note (whole notes have no stem, handled separately)
+    if beam_count >= 2:
+        return 0.25  # sixteenth
+    if beam_count == 1 or has_flag:
+        return 0.5   # eighth
+    return 1.0  # quarter (default)
+
+
+def detect_duration_per_note(note, binary, dy):
+    """Detect duration for a single note using its stem's beam/flag info.
+
+    Parameters
+    ----------
+    note : dict with 'stem' key (from track_stem), 'y_center', 'system'
+    binary : ndarray, full binary image (beams intact)
+    dy : float, staff line spacing
+
+    Returns
+    -------
+    float : duration in beats
+    """
+    stem = note['stem']
+    if stem['stem_dir'] is None:
+        return 1.0  # no stem → default quarter
+
+    staff_lines = note.get('system', None)
+    beam_count, has_flag = _count_beams(
+        binary, stem['stem_tip_y'], stem['stem_x'], dy,
+        staff_lines=staff_lines, stem_dir=stem['stem_dir']
+    )
+    is_hollow = False  # filled noteheads assumed; hollow detected elsewhere
+    return _detect_individual_duration(beam_count, has_flag, is_hollow)
+
+
 def build_note_units(notes, music_symbols, binary, dy):
     """
     Group notes by shared stem and detect duration for each group.
@@ -338,7 +378,8 @@ def build_note_units(notes, music_symbols, binary, dy):
     return note_units
 
 
-def segment_into_measures(note_units, rests, barline_xs, dy):
+def segment_into_measures(note_units, rests, barline_xs, dy,
+                          beats_per_measure=2.0, is_first_system=True):
     """
     Segment NoteUnits and rests into measures by barline x-positions.
 
@@ -348,6 +389,8 @@ def segment_into_measures(note_units, rests, barline_xs, dy):
     rests : list of dict with 'x' and 'duration' keys
     barline_xs : list of float/int, sorted x-positions of barlines
     dy : float, staff line spacing
+    beats_per_measure : float, beats per measure (default 2.0 for 2/4 time)
+    is_first_system : bool, if True allow pickup measure detection
 
     Returns
     -------
@@ -401,8 +444,9 @@ def segment_into_measures(note_units, rests, barline_xs, dy):
 
     # Estimate durations using proportional spacing
     for mi, measure in enumerate(measures):
-        _estimate_durations_in_measure(measure, beats_per_measure=2.0,
-                                       measure_idx=mi, barline_xs=sorted_barlines)
+        _estimate_durations_in_measure(measure, beats_per_measure=beats_per_measure,
+                                       measure_idx=mi, barline_xs=sorted_barlines,
+                                       is_first_system=is_first_system)
 
     # Strip trailing empty measures (region after last barline)
     while measures and not measures[-1]:
@@ -423,7 +467,7 @@ def _snap_duration(dur):
 
 
 def _estimate_durations_in_measure(measure, beats_per_measure=2.0, measure_idx=0,
-                                   barline_xs=None):
+                                   barline_xs=None, is_first_system=True):
     """Estimate note durations using proportional x-spacing within a measure."""
     note_events = [e for e in measure if e['type'] == 'note_unit']
     rest_events = [e for e in measure if e['type'] == 'rest']
@@ -432,8 +476,8 @@ def _estimate_durations_in_measure(measure, beats_per_measure=2.0, measure_idx=0
     if n == 0:
         return
 
-    # Detect pickup measure (first measure, events clustered in the right portion)
-    if measure_idx == 0 and n >= 2 and barline_xs and len(barline_xs) > 0:
+    # Detect pickup measure (only on the first system's first measure)
+    if is_first_system and measure_idx == 0 and n >= 2 and barline_xs and len(barline_xs) > 0:
         first_barline = barline_xs[0]
         event_xs = [e['x'] for e in note_events]
         if first_barline > 0 and all(x > first_barline * 0.4 for x in event_xs):
