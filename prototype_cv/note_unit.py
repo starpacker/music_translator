@@ -380,6 +380,72 @@ def build_note_units(notes, music_symbols, binary, dy):
     return note_units
 
 
+def merge_overlapping_note_units(note_units, beats_per_measure=2.0, dy=21.0):
+    """Merge notes whose durations overlap into shared events.
+
+    For each note in a NoteUnit, if its individual_duration extends past
+    the next NoteUnit's start time, copy that note into the next NoteUnit.
+
+    This handles two-voice notation where an eighth note in one voice
+    sustains across two sixteenth notes in another voice.
+
+    Parameters
+    ----------
+    note_units : list of NoteUnit dicts, sorted by x
+    beats_per_measure : float
+    dy : float, staff spacing
+
+    Returns
+    -------
+    list of NoteUnit dicts with merged notes
+    """
+    if len(note_units) <= 1:
+        return note_units
+
+    # Sort by x
+    units = sorted(note_units, key=lambda u: u['x'])
+
+    # Assign start_time to each unit based on cumulative shortest durations
+    start_times = []
+    t = 0.0
+    for u in units:
+        start_times.append(t)
+        event_dur = min((n.get('individual_duration', 0.25) for n in u['notes']), default=0.25)
+        t += event_dur
+
+    # For each note in each unit, check if it sustains into later units
+    for i in range(len(units)):
+        for note in list(units[i]['notes']):  # copy list since we may modify other units
+            ind_dur = note.get('individual_duration', 0.25)
+            note_end_time = start_times[i] + ind_dur
+
+            # Check subsequent units
+            for j in range(i + 1, len(units)):
+                if start_times[j] >= note_end_time:
+                    break  # note has ended
+
+                # This note is still sounding at unit j's start time
+                existing_pitches = {n['pitch'] for n in units[j]['notes']}
+                if note['pitch'] not in existing_pitches:
+                    # Copy the sustained note into unit j
+                    sustained = dict(note)
+                    # Set its individual_duration to match the target event
+                    target_dur = min(
+                        (n.get('individual_duration', 0.25) for n in units[j]['notes']),
+                        default=0.25
+                    )
+                    sustained['individual_duration'] = target_dur
+                    units[j]['notes'].append(sustained)
+
+    # Update each unit's duration to the minimum individual duration
+    for u in units:
+        durations = [n.get('individual_duration', 1.0) for n in u['notes']]
+        if durations:
+            u['duration'] = min(durations)
+
+    return units
+
+
 def segment_into_measures(note_units, rests, barline_xs, dy,
                           beats_per_measure=2.0, is_first_system=True):
     """

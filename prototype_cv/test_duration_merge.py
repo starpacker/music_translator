@@ -33,6 +33,45 @@ def test_individual_duration_detection():
     print("PASS: test_individual_duration_detection")
 
 
+def test_merge_overlapping_notes():
+    """An eighth-note 1' at x=284 should be merged into the next sixteenth-note event."""
+    from note_unit import merge_overlapping_note_units
+
+    units = [
+        {
+            'notes': [
+                {'pitch': '3', 'x': 284, 'y_center': 1310, 'individual_duration': 0.25,
+                 'accidental': None, 'clef': 'treble', 'system': [1225,1246,1268,1289,1310], 'pair_idx': 0, 'w': 27},
+                {'pitch': "1'", 'x': 284, 'y_center': 1257, 'individual_duration': 0.5,
+                 'accidental': None, 'clef': 'treble', 'system': [1225,1246,1268,1289,1310], 'pair_idx': 0, 'w': 27},
+            ],
+            'duration': 0.25, 'stem_dir': 'down', 'stem_x': 284, 'x': 284.0,
+        },
+        {
+            'notes': [
+                {'pitch': '2', 'x': 370, 'y_center': 1321, 'individual_duration': 0.25,
+                 'accidental': None, 'clef': 'treble', 'system': [1225,1246,1268,1289,1310], 'pair_idx': 0, 'w': 27},
+            ],
+            'duration': 0.25, 'stem_dir': 'down', 'stem_x': 370, 'x': 370.0,
+        },
+    ]
+
+    merged = merge_overlapping_note_units(units, beats_per_measure=2.0, dy=21.2)
+
+    # First event should have both 3 and 1'
+    pitches_0 = {n['pitch'] for n in merged[0]['notes']}
+    assert '3' in pitches_0, f"Expected '3' in first event, got {pitches_0}"
+    assert "1'" in pitches_0, f"Expected 1' in first event, got {pitches_0}"
+
+    # Second event should have 2 AND the sustained 1'
+    pitches_1 = {n['pitch'] for n in merged[1]['notes']}
+    assert '2' in pitches_1, f"Expected '2' in second event, got {pitches_1}"
+    assert "1'" in pitches_1, f"Expected sustained 1' in second event, got {pitches_1}"
+
+    print("PASS: test_merge_overlapping_notes")
+
+
 if __name__ == "__main__":
     test_first_chord_detected()
     test_individual_duration_detection()
+    test_merge_overlapping_notes()
