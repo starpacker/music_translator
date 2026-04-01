@@ -29,7 +29,7 @@ from symbol_detection import (
 )
 from note_assignment import assign_notes_to_staves, filter_false_positive_notes
 from stem_tracking import track_stem
-from note_unit import build_note_units, segment_into_measures
+from note_unit import build_note_units, segment_into_measures, merge_overlapping_note_units
 from jianpu_formatter import format_measure, format_output
 
 
@@ -191,6 +191,10 @@ def main(image_path):
 
         treble_units = build_note_units(pair_treble, music_symbols, binary, dy)
         bass_units = build_note_units(pair_bass, music_symbols, binary, dy)
+
+        # Merge notes whose durations overlap (two-voice alignment)
+        treble_units = merge_overlapping_note_units(treble_units, beats_per_measure=2.0, dy=dy)
+        bass_units = merge_overlapping_note_units(bass_units, beats_per_measure=2.0, dy=dy)
 
         is_first = (pair_idx == 0)
         treble_measures = segment_into_measures(treble_units, pair_t_rests, barlines, dy,
