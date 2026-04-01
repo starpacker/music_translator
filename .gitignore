@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+output_*.png
+output_*.txt
+*.png
+!input_page1.png
+repo/
