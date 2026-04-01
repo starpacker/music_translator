@@ -192,9 +192,12 @@ def main(image_path):
         treble_units = build_note_units(pair_treble, music_symbols, binary, dy)
         bass_units = build_note_units(pair_bass, music_symbols, binary, dy)
 
-        # Merge notes whose durations overlap (two-voice alignment)
-        treble_units = merge_overlapping_note_units(treble_units, beats_per_measure=2.0, dy=dy)
-        bass_units = merge_overlapping_note_units(bass_units, beats_per_measure=2.0, dy=dy)
+        # TODO: Merge notes whose durations overlap (two-voice alignment)
+        # Currently disabled — beam/flag detection returns unreliable per-note
+        # durations (1 beam instead of 2 for sixteenths, stem_dir=None for some
+        # notes). Enable once beam detection is fixed.
+        # treble_units = merge_overlapping_note_units(treble_units, beats_per_measure=2.0, dy=dy)
+        # bass_units = merge_overlapping_note_units(bass_units, beats_per_measure=2.0, dy=dy)
 
         is_first = (pair_idx == 0)
         treble_measures = segment_into_measures(treble_units, pair_t_rests, barlines, dy,

@@ -413,23 +413,33 @@ def merge_overlapping_note_units(note_units, beats_per_measure=2.0, dy=21.0):
         event_dur = min((n.get('individual_duration', 0.25) for n in u['notes']), default=0.25)
         t += event_dur
 
-    # For each note in each unit, check if it sustains into later units
+    # For each note in each unit, check if it sustains into later units.
+    # Strict guard: only propagate when we have high confidence in the
+    # duration mismatch. Specifically, only propagate a note with
+    # individual_duration=0.5 (eighth, detected via flag) when the event's
+    # shortest duration is 0.25 (sixteenth). This avoids false positives
+    # from inconsistent beam detection.
     for i in range(len(units)):
-        for note in list(units[i]['notes']):  # copy list since we may modify other units
+        event_min_dur = min(
+            (n.get('individual_duration', 0.25) for n in units[i]['notes']),
+            default=0.25
+        )
+        for note in list(units[i]['notes']):
             ind_dur = note.get('individual_duration', 0.25)
+
+            # Only propagate eighth notes (0.5) over sixteenth events (0.25)
+            if not (ind_dur == 0.5 and event_min_dur == 0.25):
+                continue
+
             note_end_time = start_times[i] + ind_dur
 
-            # Check subsequent units
             for j in range(i + 1, len(units)):
                 if start_times[j] >= note_end_time:
-                    break  # note has ended
+                    break
 
-                # This note is still sounding at unit j's start time
                 existing_pitches = {n['pitch'] for n in units[j]['notes']}
                 if note['pitch'] not in existing_pitches:
-                    # Copy the sustained note into unit j
                     sustained = dict(note)
-                    # Set its individual_duration to match the target event
                     target_dur = min(
                         (n.get('individual_duration', 0.25) for n in units[j]['notes']),
                         default=0.25
