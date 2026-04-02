@@ -155,7 +155,8 @@ def main(image_path):
 
     # ── 6. Detect Accidentals ──
     print("6. Detecting accidentals...")
-    global_accs = detect_accidentals_global(binary, systems, dy)
+    global_accs = detect_accidentals_global(binary, systems, dy,
+                                               clef_boundaries=clef_boundaries)
     all_detected_notes = treble_notes + bass_notes
     accidentals_map = assign_accidentals_to_notes(global_accs, all_detected_notes, dy)
     n_sharps = sum(1 for v in accidentals_map.values() if v == '#')
@@ -174,7 +175,7 @@ def main(image_path):
     # ── 8. Track Stems ──
     print("8. Tracking stems...")
     for note in treble_notes + bass_notes:
-        note['stem'] = track_stem(music_symbols, note, dy)
+        note['stem'] = track_stem(music_symbols, note, dy, binary=binary)
     print(f"   Tracked stems for {len(treble_notes) + len(bass_notes)} notes")
 
     # ── 9. Group into Chords, Segment Measures, Estimate Durations ──
@@ -192,12 +193,8 @@ def main(image_path):
         treble_units = build_note_units(pair_treble, music_symbols, binary, dy)
         bass_units = build_note_units(pair_bass, music_symbols, binary, dy)
 
-        # TODO: Merge notes whose durations overlap (two-voice alignment)
-        # Currently disabled — beam/flag detection returns unreliable per-note
-        # durations (1 beam instead of 2 for sixteenths, stem_dir=None for some
-        # notes). Enable once beam detection is fixed.
-        # treble_units = merge_overlapping_note_units(treble_units, beats_per_measure=2.0, dy=dy)
-        # bass_units = merge_overlapping_note_units(bass_units, beats_per_measure=2.0, dy=dy)
+        treble_units = merge_overlapping_note_units(treble_units, beats_per_measure=2.0, dy=dy)
+        bass_units = merge_overlapping_note_units(bass_units, beats_per_measure=2.0, dy=dy)
 
         is_first = (pair_idx == 0)
         treble_measures = segment_into_measures(treble_units, pair_t_rests, barlines, dy,

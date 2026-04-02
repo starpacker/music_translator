@@ -28,24 +28,30 @@ def _is_hollow(music_symbols, note, dy):
 
 def _count_beams(binary, tip_y, stem_x, dy, staff_lines=None, stem_dir=None):
     """
-    Count horizontal beams near the stem tip using horizontal projection analysis.
-    Uses the full binary image (beams intact) and filters out staff line positions.
-    The ROI is directional: looks PAST the tip (away from noteheads).
+    Count horizontal beams near the stem tip using horizontal projection.
+    Uses a focused ROI (±dy width, ±1.5*dy height from tip) with staff line masking.
     Returns (beam_count, has_flag).
     """
     h_img, w_img = binary.shape[:2]
-    # Look past the tip in the stem direction (away from noteheads)
+
+    # Y range: beams are near the tip. For inner notes in a beam group,
+    # beams may be past the tip (inner stems shorter than outer stems).
+    # For stem_dir=down: scan wide in both directions (beams can be above or below tip)
+    # For stem_dir=up: limit downward scan to avoid picking up lower voice beams
     if stem_dir == 'down':
-        roi_y1 = max(0, int(tip_y - dy * 0.2))
-        roi_y2 = min(h_img, int(tip_y + dy * 1.0))
+        roi_y1 = max(0, int(tip_y - dy * 1.5))
+        roi_y2 = min(h_img, int(tip_y + dy * 1.5))
     elif stem_dir == 'up':
-        roi_y1 = max(0, int(tip_y - dy * 1.0))
-        roi_y2 = min(h_img, int(tip_y + dy * 0.2))
-    else:
-        roi_y1 = max(0, int(tip_y - dy * 0.5))
+        roi_y1 = max(0, int(tip_y - dy * 1.5))
         roi_y2 = min(h_img, int(tip_y + dy * 0.5))
-    roi_x1 = max(0, int(stem_x - dy * 1.5))
-    roi_x2 = min(w_img, int(stem_x + dy * 1.5))
+    else:
+        roi_y1 = max(0, int(tip_y - dy * 1.5))
+        roi_y2 = min(h_img, int(tip_y + dy * 1.5))
+
+    # X range: ±dy centered on stem. Wide enough to capture beams, narrow
+    # enough to avoid noise from adjacent noteheads.
+    roi_x1 = max(0, int(stem_x - dy))
+    roi_x2 = min(w_img, int(stem_x + dy))
 
     if roi_y2 <= roi_y1 or roi_x2 <= roi_x1:
         return 0, False
@@ -55,28 +61,29 @@ def _count_beams(binary, tip_y, stem_x, dy, staff_lines=None, stem_dir=None):
     if roi_h == 0 or roi_w == 0:
         return 0, False
 
-    # Horizontal projection: fraction of white pixels per row
+    # Horizontal projection
     projection = np.count_nonzero(roi > 127, axis=1) / roi_w
 
-    # Mask out staff line rows (they look like beams but aren't)
+    # Mask staff line rows
     if staff_lines is not None:
         for line_y in staff_lines:
-            local_y = int(line_y) - roi_y1
-            for offset in range(-1, 2):  # mask ±1 row around each line
-                row = local_y + offset
-                if 0 <= row < roi_h:
-                    projection[row] = 0.0
+            for offset in range(-2, 3):
+                local_y = int(line_y) + offset - roi_y1
+                if 0 <= local_y < roi_h:
+                    projection[local_y] = 0.0
 
-    # Find bands with density > 0.4
+    # Beam threshold: a beam ~15px in ~42px ROI gives ~0.36 density.
+    # A stem alone (~3px) gives ~0.07. Threshold at 0.25 catches beams.
+    beam_threshold = 0.25
     min_thickness = max(1, int(dy * 0.08))
-    max_thickness = max(min_thickness + 1, int(dy * 0.45))
+    max_thickness = max(min_thickness + 1, int(dy * 0.55))
 
     beam_count = 0
     i = 0
     while i < len(projection):
-        if projection[i] > 0.4:
+        if projection[i] > beam_threshold:
             start = i
-            while i < len(projection) and projection[i] > 0.4:
+            while i < len(projection) and projection[i] > beam_threshold:
                 i += 1
             thickness = i - start
             if min_thickness <= thickness <= max_thickness:
@@ -87,10 +94,17 @@ def _count_beams(binary, tip_y, stem_x, dy, staff_lines=None, stem_dir=None):
     # Check for flag if no beams found
     has_flag = False
     if beam_count == 0:
-        flag_x1 = max(0, int(stem_x))
-        flag_x2 = min(w_img, int(stem_x + dy * 1.0))
-        flag_y1 = max(0, int(tip_y - dy * 0.4))
-        flag_y2 = min(h_img, int(tip_y + dy * 0.4))
+        flag_x1 = max(0, int(stem_x - dy * 0.2))
+        flag_x2 = min(w_img, int(stem_x + dy * 1.5))
+        if stem_dir == 'up':
+            flag_y1 = max(0, int(tip_y - dy * 0.2))
+            flag_y2 = min(h_img, int(tip_y + dy * 1.5))
+        elif stem_dir == 'down':
+            flag_y1 = max(0, int(tip_y - dy * 1.5))
+            flag_y2 = min(h_img, int(tip_y + dy * 0.2))
+        else:
+            flag_y1 = max(0, int(tip_y - dy * 0.6))
+            flag_y2 = min(h_img, int(tip_y + dy * 0.6))
         if flag_y2 > flag_y1 and flag_x2 > flag_x1:
             flag_roi = binary[flag_y1:flag_y2, flag_x1:flag_x2]
             if flag_roi.size > 0:
@@ -203,6 +217,7 @@ def _detect_duration(music_symbols, binary, notes_in_group, dy):
     return 1.0
 
 
+
 def _detect_individual_duration(beam_count=0, has_flag=False, is_hollow=False):
     """Convert beam/flag/hollow info into a duration value.
 
@@ -265,7 +280,27 @@ def build_note_units(notes, music_symbols, binary, dy):
         return []
 
     stem_threshold = dy * 0.5
-    x_threshold = dy * 0.9  # fallback: notehead x-proximity
+    x_threshold = dy * 0.9  # notehead x-proximity
+
+    # Pre-filter false positives BEFORE grouping to avoid corrupting chord groups.
+    # Notes with very low fill on music_symbols are accidentals/symbols, not noteheads.
+    verified_notes = []
+    for n in notes:
+        cx = n['x'] + n['w'] // 2
+        cy = n['y_center']
+        pad = max(2, int(dy * 0.15))
+        ny1 = max(0, cy - pad)
+        ny2 = min(music_symbols.shape[0], cy + pad)
+        nx1 = max(0, cx - pad)
+        nx2 = min(music_symbols.shape[1], cx + pad)
+        region = music_symbols[ny1:ny2, nx1:nx2]
+        if region.size > 0:
+            fill = np.mean(region) / 255.0
+            if fill >= 0.25:
+                verified_notes.append(n)
+        else:
+            verified_notes.append(n)
+    notes = verified_notes
 
     # Build chord groups by stem_x proximity OR notehead x-proximity, same system
     used = [False] * len(notes)
@@ -306,30 +341,6 @@ def build_note_units(notes, music_symbols, binary, dy):
 
         groups.append(group)
 
-    # Filter false positives: remove notes with very low density on music_symbols
-    # (these are accidentals/other symbols detected as noteheads by morphology)
-    verified_groups = []
-    for group in groups:
-        good_notes = []
-        for n in group:
-            cx = n['x'] + n['w'] // 2
-            cy = n['y_center']
-            pad = max(2, int(dy * 0.15))
-            ny1 = max(0, cy - pad)
-            ny2 = min(music_symbols.shape[0], cy + pad)
-            nx1 = max(0, cx - pad)
-            nx2 = min(music_symbols.shape[1], cx + pad)
-            region = music_symbols[ny1:ny2, nx1:nx2]
-            if region.size > 0:
-                fill = np.mean(region) / 255.0
-                if fill >= 0.25:  # real noteheads have high fill on music_symbols
-                    good_notes.append(n)
-            else:
-                good_notes.append(n)
-        if good_notes:
-            verified_groups.append(good_notes)
-    groups = verified_groups
-
     # Build NoteUnit for each group
     note_units = []
     for group in groups:
@@ -352,6 +363,7 @@ def build_note_units(notes, music_symbols, binary, dy):
                 'pair_idx': n.get('pair_idx', 0),
                 'w': n['w'],
                 'individual_duration': ind_dur,
+                'stem_dir': n['stem']['stem_dir'],
             })
 
         # Detect duration
@@ -381,13 +393,18 @@ def build_note_units(notes, music_symbols, binary, dy):
 
 
 def merge_overlapping_note_units(note_units, beats_per_measure=2.0, dy=21.0):
-    """Merge notes whose durations overlap into shared events.
+    """Merge notes whose durations overlap into shared events (two-voice alignment).
 
-    For each note in a NoteUnit, if its individual_duration extends past
-    the next NoteUnit's start time, copy that note into the next NoteUnit.
+    Detects two-voice chords where one voice (stem_dir=up) plays a longer note
+    (e.g., eighth) while the other voice (stem_dir=down) plays shorter notes
+    (e.g., sixteenths). The longer note is propagated to subsequent events.
 
-    This handles two-voice notation where an eighth note in one voice
-    sustains across two sixteenth notes in another voice.
+    The key signal is stem_dir: in a two-voice chord, notes have opposing
+    stem directions. A note is only propagated if:
+    1. Its event contains notes with BOTH stem_dir=up and stem_dir=down
+    2. It has a DIFFERENT stem_dir from the majority of notes in its event
+    3. Its individual_duration > the majority's duration
+    4. The target event has no note with the same stem_dir
 
     Parameters
     ----------
@@ -413,22 +430,35 @@ def merge_overlapping_note_units(note_units, beats_per_measure=2.0, dy=21.0):
         event_dur = min((n.get('individual_duration', 0.25) for n in u['notes']), default=0.25)
         t += event_dur
 
-    # For each note in each unit, check if it sustains into later units.
-    # Strict guard: only propagate when we have high confidence in the
-    # duration mismatch. Specifically, only propagate a note with
-    # individual_duration=0.5 (eighth, detected via flag) when the event's
-    # shortest duration is 0.25 (sixteenth). This avoids false positives
-    # from inconsistent beam detection.
     for i in range(len(units)):
-        event_min_dur = min(
-            (n.get('individual_duration', 0.25) for n in units[i]['notes']),
-            default=0.25
-        )
-        for note in list(units[i]['notes']):
-            ind_dur = note.get('individual_duration', 0.25)
+        notes = units[i]['notes']
+        if len(notes) < 2:
+            continue
 
-            # Only propagate eighth notes (0.5) over sixteenth events (0.25)
-            if not (ind_dur == 0.5 and event_min_dur == 0.25):
+        # Check for two-voice: must have both stem_dir=up and stem_dir=down
+        dirs = [n.get('stem_dir') for n in notes]
+        has_up = 'up' in dirs
+        has_down = 'down' in dirs
+        if not (has_up and has_down):
+            continue
+
+        # Find the minority stem_dir (the sustained voice)
+        n_up = sum(1 for d in dirs if d == 'up')
+        n_down = sum(1 for d in dirs if d == 'down')
+        minority_dir = 'up' if n_up <= n_down else 'down'
+
+        # Propagate minority-dir notes to subsequent events
+        for note in list(notes):
+            if note.get('stem_dir') != minority_dir:
+                continue
+            ind_dur = note.get('individual_duration', 0.25)
+            # Must have longer duration than the majority
+            majority_durs = [n.get('individual_duration', 0.25)
+                             for n in notes if n.get('stem_dir') != minority_dir]
+            if not majority_durs:
+                continue
+            majority_min = min(majority_durs)
+            if ind_dur <= majority_min:
                 continue
 
             note_end_time = start_times[i] + ind_dur
@@ -437,21 +467,30 @@ def merge_overlapping_note_units(note_units, beats_per_measure=2.0, dy=21.0):
                 if start_times[j] >= note_end_time:
                     break
 
+                # Check if target event OR any nearby NoteUnit already has
+                # a note with the minority stem_dir (within dy*1.5 x tolerance)
+                target_x = units[j]['x']
+                has_minority_nearby = False
+                for k in range(len(units)):
+                    if k == i:
+                        continue
+                    if abs(units[k]['x'] - target_x) < dy * 1.5:
+                        k_dirs = {n.get('stem_dir') for n in units[k]['notes']}
+                        if minority_dir in k_dirs:
+                            has_minority_nearby = True
+                            break
+
+                if has_minority_nearby:
+                    break  # voice-note already present, stop propagating
+
                 existing_pitches = {n['pitch'] for n in units[j]['notes']}
                 if note['pitch'] not in existing_pitches:
                     sustained = dict(note)
-                    target_dur = min(
+                    sustained['individual_duration'] = min(
                         (n.get('individual_duration', 0.25) for n in units[j]['notes']),
                         default=0.25
                     )
-                    sustained['individual_duration'] = target_dur
                     units[j]['notes'].append(sustained)
-
-    # Update each unit's duration to the minimum individual duration
-    for u in units:
-        durations = [n.get('individual_duration', 1.0) for n in u['notes']]
-        if durations:
-            u['duration'] = min(durations)
 
     return units
 

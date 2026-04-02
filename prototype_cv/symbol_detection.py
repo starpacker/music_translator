@@ -159,7 +159,7 @@ def detect_barlines(binary_img, staff_systems, dy):
 # ============================================================
 # 2. ACCIDENTAL DETECTION - GLOBAL APPROACH
 # ============================================================
-def detect_accidentals_global(binary_img, staff_systems, dy):
+def detect_accidentals_global(binary_img, staff_systems, dy, clef_boundaries=None):
     """
     Detect accidentals globally in each staff region using multi-scale template matching.
     Uses ALL available sharp/flat/natural templates from the new template/ folder.
@@ -199,8 +199,11 @@ def detect_accidentals_global(binary_img, staff_systems, dy):
         search_y1 = max(0, y_top - margin)
         search_y2 = min(img_h, y_bot + margin)
         
-        # Skip clef area (first ~18% of width)
-        search_x1 = int(img_w * 0.18)
+        # Skip clef area: use per-system boundary if available, else 18% fallback
+        if clef_boundaries and sys_idx in clef_boundaries:
+            search_x1 = max(0, clef_boundaries[sys_idx] - int(dy * 2))
+        else:
+            search_x1 = int(img_w * 0.18)
         
         roi = binary_img[search_y1:search_y2, search_x1:]
         roi_h, roi_w = roi.shape

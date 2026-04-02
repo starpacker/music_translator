@@ -7,7 +7,7 @@ using the staff-removed binary image (music_symbols).
 import numpy as np
 
 
-def track_stem(music_symbols, note, dy):
+def track_stem(music_symbols, note, dy, binary=None):
     """Trace the stem of a musical note from its notehead.
 
     Parameters
@@ -15,9 +15,13 @@ def track_stem(music_symbols, note, dy):
     music_symbols : np.ndarray
         Staff-removed binary image (uint8, white=255 is ink).
     note : dict
-        Notehead info with keys: x, y, w, h, y_center.
+        Notehead info with keys: x, y, w, h, y_center, and optionally 'system'
+        (list of 5 staff line y-positions).
     dy : float
         Staff line spacing in pixels.
+    binary : np.ndarray, optional
+        Original binary image (staff lines intact). Used as fallback when
+        music_symbols has gaps from staff line removal.
 
     Returns
     -------
@@ -30,6 +34,16 @@ def track_stem(music_symbols, note, dy):
     img_h, img_w = music_symbols.shape[:2]
     x, y, w, h, y_center = note['x'], note['y'], note['w'], note['h'], note['y_center']
     cx = x + w // 2
+
+    # Build set of staff line rows (±2px) to forgive gaps from staff removal
+    staff_line_rows = set()
+    system = note.get('system', None)
+    if system is not None:
+        for line_y in system:
+            for offset in range(-2, 3):
+                row = int(line_y) + offset
+                if 0 <= row < img_h:
+                    staff_line_rows.add(row)
 
     stem_half = max(3, int(dy * 0.15))
     search_range = max(int(dy * 0.3), w // 2 + int(dy * 0.2))
@@ -86,6 +100,15 @@ def track_stem(music_symbols, note, dy):
         strip = music_symbols[row, stem_left:stem_right]
         row_density = np.count_nonzero(strip) / max(1, strip.size)
         if row_density < density_threshold:
+            # If this gap is at a staff line, check binary image instead
+            if row in staff_line_rows and binary is not None:
+                bin_strip = binary[row, stem_left:stem_right]
+                bin_density = np.count_nonzero(bin_strip) / max(1, bin_strip.size)
+                if bin_density >= density_threshold:
+                    # Stem exists here in binary — staff removal caused the gap
+                    gap_count = 0
+                    stem_top_y = row
+                    continue
             gap_count += 1
             if gap_count >= gap_tolerance:
                 stem_top_y = row + gap_tolerance
@@ -107,6 +130,14 @@ def track_stem(music_symbols, note, dy):
         strip = music_symbols[row, stem_left:stem_right]
         row_density = np.count_nonzero(strip) / max(1, strip.size)
         if row_density < density_threshold:
+            # If this gap is at a staff line, check binary image instead
+            if row in staff_line_rows and binary is not None:
+                bin_strip = binary[row, stem_left:stem_right]
+                bin_density = np.count_nonzero(bin_strip) / max(1, bin_strip.size)
+                if bin_density >= density_threshold:
+                    gap_count = 0
+                    stem_bot_y = row
+                    continue
             gap_count += 1
             if gap_count >= gap_tolerance:
                 stem_bot_y = row - gap_tolerance
