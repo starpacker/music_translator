@@ -1368,6 +1368,22 @@ def _estimate_durations_in_measure(measure, beats_per_measure=2.0, measure_idx=0
                 beam_durs[idx] = 0.5
                 surplus -= 0.5
 
+            # Paired swap: if surplus ≈ 0.25 and there's a quarter note AND
+            # a sixteenth note, swap both to eighths (net change = -0.25).
+            # This corrects the common case where beam detection misses one
+            # beam (quarter instead of eighth) and over-counts another
+            # (sixteenth instead of eighth).
+            if 0.2 <= surplus <= 0.3:
+                q_idxs = [i for i in range(n) if beam_durs[i] == 1.0]
+                s_idxs = [i for i in range(n) if beam_durs[i] == 0.25]
+                if q_idxs and s_idxs:
+                    # Pick quarter with narrowest gap, sixteenth with widest
+                    qi = min(q_idxs, key=lambda i: gaps_r[i])
+                    si = max(s_idxs, key=lambda i: gaps_r[i])
+                    beam_durs[qi] = 0.5
+                    beam_durs[si] = 0.5
+                    surplus -= 0.25
+
         for i, e in enumerate(note_events):
             e['unit']['duration'] = beam_durs[i]
         return
