@@ -13,11 +13,35 @@ Handles:
 
 
 def duration_to_suffix(duration):
-    """Convert numeric duration to Jianpu suffix."""
-    if duration == 0.25:
+    """Convert numeric duration to Jianpu suffix.
+
+    Tuplet durations from base × 2/3:
+      /6  = 1/6 (sixteenth triplet: /4 × 2/3)
+      /3  = 1/3 (eighth triplet: /2 × 2/3)
+      /12 = 1/12 (thirty-second triplet: /4 ÷ 2 × 2/3, rare)
+    """
+    if abs(duration - 1.0 / 12.0) < 0.01:
+        return "/12"
+    if abs(duration - 1.0 / 6.0) < 0.02:
+        return "/6"
+    if abs(duration - 1.0 / 3.0) < 0.03:
+        return "/3"
+    if abs(duration - 2.0 / 3.0) < 0.05:
+        return "/3*2"  # quarter-note triplet (2/3 beat each)
+    if abs(duration - 0.25) < 0.01:
         return "/4"
-    elif duration == 0.5:
+    if abs(duration - 0.5) < 0.01:
         return "/2"
+    if abs(duration - 0.75) < 0.05:
+        return "/2."     # dotted eighth
+    if abs(duration - 1.5) < 0.1:
+        return "."       # dotted quarter
+    if abs(duration - 2.0) < 0.1:
+        return "-"       # half note (2 beats)
+    if abs(duration - 3.0) < 0.1:
+        return "--"      # dotted half note (3 beats)
+    if abs(duration - 4.0) < 0.1:
+        return "---"     # whole note (4 beats)
     return ""
 
 
@@ -42,7 +66,12 @@ def format_note(note, accidentals_map, persistent_accs=None, dy=21.0):
     note_x = note['x']
 
     pitch_key = base + suffix
-    max_persist_gap = dy * 10
+
+    # Accidental persistence within a measure (persistent_accs is reset per
+    # measure in format_measure). Distance limit kept as heuristic guard
+    # until key-signature detection is implemented — without it, accidentals
+    # from the key-sig area can over-propagate across the whole measure.
+    max_persist_gap = dy * 5.0
 
     if acc == 'n':
         if persistent_accs is not None and pitch_key in persistent_accs:
@@ -81,9 +110,9 @@ def format_rest(event):
     """Format a rest event."""
     dur = event.get('duration', 1.0)
     if dur == 4.0:
-        return "0 0 0 0"
+        return "0---"
     elif dur == 2.0:
-        return "0 0"
+        return "0-"
     elif dur == 0.5:
         return "0/2"
     elif dur == 0.25:

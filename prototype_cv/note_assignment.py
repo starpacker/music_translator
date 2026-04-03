@@ -3,6 +3,7 @@ note_assignment.py
 Assign detected noteheads to treble/bass staves and filter false positives.
 """
 import numpy as np
+from config import CFG
 
 
 def assign_notes_to_staves(noteheads, grand_staff_pairs, dy):
@@ -77,23 +78,27 @@ def filter_false_positive_notes(notes, dy, clef='treble'):
         if clef == 'treble':
             below_staff = y - y_bot
             above_staff = y_top - y
-            if below_staff > dy * 0.5 and score < 0.90:
+            ac = CFG.assignment
+            if below_staff > dy * ac.treble_below_1[0] and score < ac.treble_below_1[1]:
                 continue
-            if below_staff > dy * 2.0 and score < 0.95:
+            if below_staff > dy * ac.treble_below_2[0] and score < ac.treble_below_2[1]:
                 continue
-            if score < 0.58:
+            if score < ac.treble_min_score:
                 continue
-            if above_staff > dy * 3.0 and score < 0.98:
+            if above_staff > dy * ac.treble_above_2[0] and score < ac.treble_above_2[1]:
+                continue
+            if above_staff > dy * ac.treble_above_1[0] and score < ac.treble_above_1[1]:
                 continue
 
         if clef == 'bass':
             above_staff = y_top - y
             below_staff = y - y_bot
-            if above_staff > dy * 1.0 and score < 0.80:
+            ac = CFG.assignment
+            if above_staff > dy * ac.bass_above_1[0] and score < ac.bass_above_1[1]:
                 continue
-            if below_staff > dy * 4.0 and score < 0.65:
+            if below_staff > dy * ac.bass_below_1[0] and score < ac.bass_below_1[1]:
                 continue
-            if score < 0.60:
+            if score < ac.bass_min_score:
                 continue
             if below_staff > dy * 0.5 and score < 0.90 and abs(score - 0.95) > 0.02 and abs(score - 1.0) > 0.02:
                 continue

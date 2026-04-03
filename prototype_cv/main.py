@@ -19,13 +19,15 @@ import numpy as np
 import os
 
 from staff_removal import extract_staff_lines
-from pitch_detection import get_staff_systems, pair_grand_staves
+from pitch_detection import get_staff_systems, pair_grand_staves, detect_staff_layout
 from template_matching import find_noteheads
 from symbol_detection import (
     detect_barlines,
     detect_accidentals_global,
     assign_accidentals_to_notes,
     detect_rests,
+    detect_tuplet_markers,
+    detect_time_signature,
 )
 from note_assignment import assign_notes_to_staves, filter_false_positive_notes
 from stem_tracking import track_stem
@@ -52,6 +54,18 @@ def main(image_path):
 
     print(f"   Found {len(systems)} individual staves")
 
+    # Calculate average dy (staff line spacing)
+    dy = np.mean([(sys[4] - sys[0]) / 4.0 for sys in systems])
+    print(f"   Average staff line spacing (dy): {dy:.1f}px")
+
+    # Detect layout: grand staff (piano) vs single staff (solo instrument)
+    layout = detect_staff_layout(systems)
+    print(f"   Layout: {layout}")
+
+    if layout == 'single':
+        return _main_single_staff(image_path, systems, staff_lines, music_symbols,
+                                   binary, dy)
+
     grand_staff_pairs = pair_grand_staves(systems)
     print(f"   Paired into {len(grand_staff_pairs)} grand staff systems (treble+bass)")
 
@@ -59,9 +73,16 @@ def main(image_path):
         print("Error: Could not pair staves into grand staff systems!")
         return
 
-    # Calculate average dy (staff line spacing)
-    dy = np.mean([(sys[4] - sys[0]) / 4.0 for sys in systems])
-    print(f"   Average staff line spacing (dy): {dy:.1f}px")
+    # ── 2b. Auto-detect time signature ──
+    time_sig = detect_time_signature(binary, systems[0], dy)
+    if time_sig:
+        num, den = time_sig
+        bpm_detected = num * (4.0 / den)  # e.g., 2/4 → 2.0, 4/4 → 4.0, 3/8 → 1.5
+        from config import CFG
+        CFG.duration.beats_per_measure = bpm_detected
+        print(f"   Time signature: {num}/{den} → beats_per_measure={bpm_detected}")
+    else:
+        print(f"   Time signature: not detected, using default {CFG.duration.beats_per_measure}")
 
     # ── 3. Detect Barlines ──
     print("3. Detecting barlines...")
@@ -95,7 +116,7 @@ def main(image_path):
     # Line 1 (pair 0) has clef + key-sig + time-sig → wider exclusion (17%)
     # Lines 2+ → detect actual first notehead and set boundary just before it
     img_w = binary.shape[1]
-    clef_area_x_first = int(img_w * 0.17)
+    clef_area_x = int(img_w * 0.17)
 
     from template_matching import create_notehead_template
     nh_template = create_notehead_template(dy)
@@ -104,11 +125,11 @@ def main(image_path):
     clef_boundaries = {}
     for pi, (treble_sys, bass_sys) in enumerate(grand_staff_pairs):
         if pi == 0:
-            clef_boundaries[pi * 2] = clef_area_x_first
-            clef_boundaries[pi * 2 + 1] = clef_area_x_first
+            clef_boundaries[pi * 2] = clef_area_x
+            clef_boundaries[pi * 2 + 1] = clef_area_x
             continue
         # Scan x=200-500 for first notehead on each staff
-        boundary = clef_area_x_first  # fallback
+        boundary = clef_area_x  # fallback
         for sys_info in [treble_sys, bass_sys]:
             y1 = max(0, sys_info[0] - int(dy * 2))
             y2 = min(binary.shape[0], sys_info[4] + int(dy * 2))
@@ -135,7 +156,7 @@ def main(image_path):
             if dist < best_dist:
                 best_dist = dist
                 best_sys_idx = si
-        boundary = clef_boundaries.get(best_sys_idx, clef_area_x_first)
+        boundary = clef_boundaries.get(best_sys_idx, clef_area_x)
         if n['x'] > boundary:
             filtered_notes.append(n)
     all_notes = filtered_notes
@@ -156,7 +177,8 @@ def main(image_path):
     # ── 6. Detect Accidentals ──
     print("6. Detecting accidentals...")
     global_accs = detect_accidentals_global(binary, systems, dy,
-                                               clef_boundaries=clef_boundaries)
+                                               clef_boundaries=clef_boundaries,
+                                               music_symbols=music_symbols)
     all_detected_notes = treble_notes + bass_notes
     accidentals_map = assign_accidentals_to_notes(global_accs, all_detected_notes, dy)
     n_sharps = sum(1 for v in accidentals_map.values() if v == '#')
@@ -171,6 +193,15 @@ def main(image_path):
     print(f"   Found {len(all_rests)} rests (after filtering)")
 
     treble_rests, bass_rests = _split_rests_by_clef(all_rests, grand_staff_pairs)
+
+    # ── 7b. Detect Tuplet Markers ──
+    print("7b. Detecting tuplet markers...")
+    original_gray = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+    tuplet_markers = detect_tuplet_markers(original_gray, grand_staff_pairs, dy,
+                                           clef_boundaries=clef_boundaries)
+    print(f"   Found {len(tuplet_markers)} tuplet markers")
+    for m in tuplet_markers:
+        print(f"      {m['n']} at x={m['x']}, y={m['y']} (pair {m['pair_idx']}, {m['clef']})")
 
     # ── 8. Track Stems ──
     print("8. Tracking stems...")
@@ -193,16 +224,25 @@ def main(image_path):
         treble_units = build_note_units(pair_treble, music_symbols, binary, dy)
         bass_units = build_note_units(pair_bass, music_symbols, binary, dy)
 
-        treble_units = merge_overlapping_note_units(treble_units, beats_per_measure=2.0, dy=dy)
-        bass_units = merge_overlapping_note_units(bass_units, beats_per_measure=2.0, dy=dy)
+        from config import CFG
+        bpm = CFG.duration.beats_per_measure
+
+        treble_units = merge_overlapping_note_units(treble_units, beats_per_measure=bpm, dy=dy)
+        bass_units = merge_overlapping_note_units(bass_units, beats_per_measure=bpm, dy=dy)
 
         is_first = (pair_idx == 0)
+        pair_treble_markers = [m for m in tuplet_markers
+                               if m['pair_idx'] == pair_idx and m['clef'] == 'treble']
+        pair_bass_markers = [m for m in tuplet_markers
+                             if m['pair_idx'] == pair_idx and m['clef'] == 'bass']
         treble_measures = segment_into_measures(treble_units, pair_t_rests, barlines, dy,
-                                                beats_per_measure=2.0,
-                                                is_first_system=is_first)
+                                                beats_per_measure=bpm,
+                                                is_first_system=is_first,
+                                                tuplet_markers=pair_treble_markers)
         bass_measures = segment_into_measures(bass_units, pair_b_rests, barlines, dy,
-                                              beats_per_measure=2.0,
-                                              is_first_system=is_first)
+                                              beats_per_measure=bpm,
+                                              is_first_system=is_first,
+                                              tuplet_markers=pair_bass_markers)
 
         # Strip leading empty measures for lines 2+ (clef/key-sig area before first barline)
         if pair_idx >= 1:
@@ -234,35 +274,659 @@ def main(image_path):
 
 
 # ============================================================
+# Single-staff mode (solo instrument)
+# ============================================================
+
+def _barline_consensus(barlines_per_system, dy, binary=None,
+                       systems=None, music_symbols=None):
+    """Rescue missing barlines using measure-width consistency.
+
+    If a staff has one measure much wider than others (>1.8× median),
+    there's likely a missing barline inside it. Search for a high-density
+    vertical line in the middle of the wide measure.
+    """
+    if binary is None or systems is None:
+        return barlines_per_system
+
+    # Compute reference median span from the staff with the most barlines.
+    # This staff has the most reliable detection, so its measure widths
+    # represent the expected pattern.
+    all_spans = []
+    best_staff_spans = []
+    best_count = 0
+    for bl_list in barlines_per_system:
+        sorted_bl = sorted(bl_list)
+        spans = [sorted_bl[i + 1] - sorted_bl[i] for i in range(len(sorted_bl) - 1)]
+        all_spans.extend(spans)
+        if len(bl_list) > best_count:
+            best_count = len(bl_list)
+            best_staff_spans = spans
+    ref_median = sorted(best_staff_spans)[len(best_staff_spans) // 2] if best_staff_spans else 300
+
+    result = []
+    for si, bl_list in enumerate(barlines_per_system):
+        augmented = list(bl_list)
+        if len(bl_list) < 2:
+            result.append(augmented)
+            continue
+
+        sorted_bl = sorted(bl_list)
+        spans = [sorted_bl[i + 1] - sorted_bl[i] for i in range(len(sorted_bl) - 1)]
+        if not spans:
+            result.append(augmented)
+            continue
+        median_span = ref_median  # use global reference
+        if median_span < dy * 5:
+            result.append(augmented)
+            continue
+
+        # Check for overly wide measures
+        for i in range(len(spans)):
+            if spans[i] > median_span * 1.8:
+                # This measure is too wide — search for a barline inside
+                left_x = sorted_bl[i]
+                right_x = sorted_bl[i + 1]
+                search_x1 = left_x + int(median_span * 0.4)
+                search_x2 = right_x - int(median_span * 0.4)
+                if search_x2 <= search_x1:
+                    continue
+
+                # Search for barline candidates that split the wide measure
+                # into sub-measures close to the median width.
+                sys_info = systems[si] if si < len(systems) else None
+                if sys_info is None:
+                    continue
+                top, bot = int(sys_info[0]), int(sys_info[4])
+                margin_y = int(dy * 0.3)
+                y1 = max(0, top - margin_y)
+                y2 = min(binary.shape[0], bot + margin_y)
+                src = music_symbols if music_symbols is not None else binary
+                roi = src[y1:y2, left_x:right_x]
+                col_max = float(y2 - y1)
+                if col_max < 1:
+                    continue
+                proj = np.sum(roi > 127, axis=0).astype(float) / col_max
+
+                # Find all narrow peaks above threshold
+                pk_threshold = 0.55
+                candidates = []
+                j = 0
+                while j < len(proj):
+                    if proj[j] > pk_threshold:
+                        pk_start = j
+                        while j < len(proj) and proj[j] > pk_threshold:
+                            j += 1
+                        pk_w = j - pk_start
+                        if pk_w < dy * 0.5:
+                            pk_cx = left_x + (pk_start + j) // 2
+                            pk_val = float(np.max(proj[pk_start:j]))
+                            candidates.append((pk_cx, pk_val))
+                    else:
+                        j += 1
+
+                # Pick candidates that best split the wide measure into
+                # sub-measures close to the median width. Try each candidate
+                # and score by how close the resulting sub-measures are.
+                best_additions = []
+                for cx, val in candidates:
+                    lg = cx - left_x
+                    rg = right_x - cx
+                    # Each sub-measure should be within 0.5-2× median
+                    if (median_span * 0.5 < lg < median_span * 2.0 and
+                            median_span * 0.5 < rg < median_span * 2.0):
+                        fit = abs(lg - median_span) + abs(rg - median_span)
+                        best_additions.append((fit, cx))
+
+                if best_additions:
+                    best_additions.sort()
+                    augmented.append(best_additions[0][1])
+
+        augmented.sort()
+        result.append(augmented)
+
+    return result
+
+
+def _detect_barlines_single_staff(binary, systems, dy,
+                                   notehead_xs_per_staff=None,
+                                   music_symbols=None,
+                                   clef_boundaries=None):
+    """Detect barlines for single-staff scores.
+
+    Uses vertical projection on music_symbols (staff lines removed) to find
+    columns with strong vertical ink spanning the full staff.  A barline is
+    an isolated thin vertical line; a stem is attached to a notehead.
+    """
+    from config import CFG
+    bc = CFG.barline
+    img_h, img_w = binary.shape
+    all_barlines = []
+
+    for si, sys_info in enumerate(systems):
+        top, bot = int(sys_info[0]), int(sys_info[4])
+        staff_h = bot - top
+
+        # --- Step 1: Vertical projection on music_symbols ---
+        src = music_symbols if music_symbols is not None else binary
+        margin = int(dy * 0.3)
+        y1 = max(0, top - margin)
+        y2 = min(img_h, bot + margin)
+        roi = src[y1:y2, :]
+        proj = np.sum(roi > 127, axis=0).astype(float)
+
+        col_max = float(y2 - y1)
+        if col_max < 1:
+            all_barlines.append([])
+            continue
+        proj_norm = proj / col_max
+
+        # --- Step 2: Find peaks in the projection ---
+        threshold = 0.40
+        peaks = []
+        in_peak = False
+        peak_start = 0
+        for x in range(len(proj_norm)):
+            if proj_norm[x] > threshold:
+                if not in_peak:
+                    peak_start = x
+                    in_peak = True
+            else:
+                if in_peak:
+                    peak_end = x
+                    peak_w = peak_end - peak_start
+                    if peak_w < dy * 0.5:
+                        center_x = (peak_start + peak_end) // 2
+                        max_val = float(np.max(proj_norm[peak_start:peak_end]))
+                        peaks.append((center_x, max_val, peak_w))
+                    in_peak = False
+
+        # --- Step 3: Score each peak ---
+        # Use overlap-based stem detection: a candidate that falls within
+        # a notehead bounding box is a stem, not a barline.
+        scored = []
+        nh_xs = notehead_xs_per_staff[si] if (notehead_xs_per_staff and
+                                               si < len(notehead_xs_per_staff)) else []
+        for cx, val, pw in peaks:
+            # Check if candidate overlaps any notehead bbox
+            on_notehead = False
+            for nx_left, nx_right in nh_xs:
+                if nx_left - 2 <= cx <= nx_right + 2:
+                    on_notehead = True
+                    break
+
+            half_score = _half_staff_score(binary, sys_info, cx)
+
+            score = val * 0.5 + half_score * 0.5
+            if on_notehead:
+                score *= 0.2  # heavy penalty for stems
+
+            scored.append((cx, score))
+
+        # --- Step 4: Filter by spacing and boundaries ---
+        scored.sort(key=lambda p: p[0])
+
+        if len(scored) >= 2:
+            min_gap = dy * 8
+            deduped = [scored[0]]
+            for cx, sc in scored[1:]:
+                if cx - deduped[-1][0] > min_gap:
+                    deduped.append((cx, sc))
+                elif sc > deduped[-1][1]:
+                    deduped[-1] = (cx, sc)
+            scored = deduped
+
+        scored = [(cx, sc) for cx, sc in scored if sc > 0.35]
+
+        # Use adaptive clef boundary if available, else config
+        clef_end = (clef_boundaries.get(si, int(img_w * bc.clef_end_ratio))
+                    if clef_boundaries else int(img_w * bc.clef_end_ratio))
+        right_bound = int(img_w * bc.right_boundary_ratio)
+        result_scored = [(int(cx), sc) for cx, sc in scored
+                         if clef_end < cx < right_bound]
+
+        # Spacing consistency: remove barlines that create gaps much
+        # shorter than the median gap.  Such barlines are usually stems
+        # that slipped through the notehead-overlap filter.
+        if len(result_scored) >= 3:
+            xs = [x for x, _ in result_scored]
+            gaps = [xs[i + 1] - xs[i] for i in range(len(xs) - 1)]
+            median_gap = float(sorted(gaps)[len(gaps) // 2])
+            min_gap_allowed = median_gap * bc.min_gap_median_ratio
+            # Try removing barlines that create two adjacent short gaps
+            keep = [True] * len(result_scored)
+            for i in range(1, len(result_scored) - 1):
+                left_gap = xs[i] - xs[i - 1]
+                right_gap = xs[i + 1] - xs[i]
+                if left_gap < min_gap_allowed and right_gap < min_gap_allowed:
+                    # Both adjacent gaps are short — remove this barline
+                    # if the merged gap is closer to the median
+                    merged = xs[i + 1] - xs[i - 1]
+                    if abs(merged - median_gap) < abs(left_gap - median_gap):
+                        keep[i] = False
+            result_scored = [rs for rs, k in zip(result_scored, keep) if k]
+
+        result = [x for x, _ in result_scored]
+
+        # Keep end-of-line barline — segment_into_measures merges
+        # content after the last barline into the final measure.
+
+        all_barlines.append(result)
+
+    return all_barlines
+
+
+def _main_single_staff(image_path, systems, staff_lines, music_symbols, binary, dy):
+    """Process a single-staff score (solo instrument like 二胡, 笛子, etc.)."""
+    from config import CFG
+    img_w = binary.shape[1]
+
+    # ── 3. Detect Noteheads (before barlines — needed for stem filtering) ──
+    print("3. Detecting noteheads...")
+    boxes, template, exclusion_zones = find_noteheads(
+        binary, dy, threshold=0.55, staff_systems=systems,
+        music_symbols=music_symbols, detect_hollow=True)
+
+    all_notes = [
+        {'x': x, 'y': y, 'w': w, 'h': h, 'y_center': y + h // 2, 'score': score}
+        for x, y, w, h, score in boxes
+    ]
+    print(f"   Detected {len(all_notes)} noteheads total")
+
+    # Filter clef area — use first system boundary for line 1, adaptive for rest
+    from template_matching import create_notehead_template
+    nh_template = create_notehead_template(dy)
+    th, tw = nh_template.shape
+
+    # Fixed clef boundary for single-staff scores.
+    # Use 17% for line 1 (clef + time sig), 15% for others (clef only).
+    # Minimum prevents the adaptive scan from going too low (clef matches).
+    clef_area_x = int(img_w * 0.17)
+    clef_min = int(img_w * 0.15)
+    clef_boundaries = {}
+    for si, sys_info in enumerate(systems):
+        if si == 0:
+            clef_boundaries[si] = clef_area_x
+            continue
+        boundary = clef_area_x
+        y1 = max(0, sys_info[0] - int(dy * 2))
+        y2 = min(binary.shape[0], sys_info[4] + int(dy * 2))
+        roi = binary[y1:y2, 200:500]
+        if tw < roi.shape[1] and th < roi.shape[0]:
+            res = cv2.matchTemplate(roi, nh_template, cv2.TM_CCOEFF_NORMED)
+            loc = np.where(res >= 0.55)
+            if len(loc[0]) > 0:
+                first_x = int(np.min(loc[1])) + 200
+                candidate = max(clef_min, first_x - int(dy))
+                boundary = min(boundary, candidate)
+        clef_boundaries[si] = boundary
+
+    # Filter notes by clef boundary
+    filtered_notes = []
+    for n in all_notes:
+        n_cy = n['y_center']
+        best_si = min(range(len(systems)),
+                      key=lambda i: abs(n_cy - (systems[i][0] + systems[i][4]) / 2.0))
+        boundary = clef_boundaries.get(best_si, clef_area_x)
+        if n['x'] > boundary:
+            filtered_notes.append(n)
+    all_notes = filtered_notes
+    print(f"   After clef area filtering: {len(all_notes)} notes")
+
+    # Build per-staff notehead x-ranges for barline filtering
+    notehead_xs_per_staff = [[] for _ in systems]
+    for n in all_notes:
+        n_cy = n['y_center']
+        best_si = min(range(len(systems)),
+                      key=lambda i: abs(n_cy - (systems[i][0] + systems[i][4]) / 2.0))
+        # Store (left_edge, right_edge) of notehead bbox
+        notehead_xs_per_staff[best_si].append((n['x'], n['x'] + n['w']))
+
+    # ── 4. Detect Barlines (using noteheads to filter stems) ──
+    print("4. Detecting barlines...")
+    barlines_per_system = _detect_barlines_single_staff(binary, systems, dy,
+                                                         notehead_xs_per_staff,
+                                                         music_symbols=music_symbols,
+                                                         clef_boundaries=clef_boundaries)
+    for si, bl in enumerate(barlines_per_system):
+        print(f"   Staff {si}: {len(bl)} barlines at x={bl}")
+
+    # ── 5. Assign Notes to Staves ──
+    print("5. Assigning notes to staves...")
+    notes_per_staff = [[] for _ in systems]
+    for n in all_notes:
+        n_cy = n['y_center']
+        best_si = min(range(len(systems)),
+                      key=lambda i: abs(n_cy - (systems[i][0] + systems[i][4]) / 2.0))
+        sys_info = systems[best_si]
+        # Only accept notes within reasonable range of staff
+        if abs(n_cy - (sys_info[0] + sys_info[4]) / 2.0) < dy * 8:
+            n['system'] = sys_info
+            n['pair_idx'] = best_si
+            n['clef'] = 'treble'
+            notes_per_staff[best_si].append(n)
+
+    # Filter false positives
+    for si in range(len(systems)):
+        before = len(notes_per_staff[si])
+        notes_per_staff[si] = filter_false_positive_notes(notes_per_staff[si], dy, clef='treble')
+        # Additional filter for single-staff: remove notes above the staff
+        # near the left edge (measure numbers, rehearsal marks).
+        sys_info = systems[si]
+        staff_top = sys_info[0]
+        boundary = clef_boundaries.get(si, clef_area_x)
+        clean = []
+        for n in notes_per_staff[si]:
+            # Notes in the immediate clef area that are above the staff
+            # AND small (< 0.5 score) are likely measure numbers.
+            if (n['x'] < boundary + dy * 1
+                    and n['y_center'] < staff_top - dy * 0.3
+                    and n['score'] < 0.70):
+                continue
+            # Filter notes far above the staff (> 2.5*dy) — these are tempo
+            # markings, rehearsal marks, or other text, not real notes.
+            if n['y_center'] < staff_top - dy * 2.5:
+                continue
+            clean.append(n)
+        notes_per_staff[si] = clean
+
+    # ── 5b. Single-staff deduplication ──
+    # Solo instruments can't play chords — if two noteheads are at nearly
+    # the same x, one is a false positive.  Keep the higher-scored one.
+    for si in range(len(systems)):
+        notes = notes_per_staff[si]
+        # Sort by x for pairwise comparison
+        notes.sort(key=lambda n: n['x'])
+        keep = [True] * len(notes)
+        for i in range(len(notes)):
+            if not keep[i]:
+                continue
+            for j in range(i + 1, len(notes)):
+                if notes[j]['x'] - notes[i]['x'] > dy * 1.0:
+                    break
+                if not keep[j]:
+                    continue
+                # Two notes within 1*dy in x — remove the lower-scored one
+                if notes[i]['score'] >= notes[j]['score']:
+                    keep[j] = False
+                else:
+                    keep[i] = False
+                    break
+        before = len(notes)
+        notes_per_staff[si] = [n for n, k in zip(notes, keep) if k]
+        removed = before - len(notes_per_staff[si])
+        if removed:
+            print(f"   Staff {si+1}: removed {removed} duplicate note(s)")
+
+    total = sum(len(ns) for ns in notes_per_staff)
+    print(f"   Total notes after filtering: {total}")
+
+    # ── 6. Detect Accidentals ──
+    print("6. Detecting accidentals...")
+    global_accs = detect_accidentals_global(binary, systems, dy,
+                                             clef_boundaries=clef_boundaries,
+                                             music_symbols=music_symbols)
+    all_detected_notes = [n for ns in notes_per_staff for n in ns]
+    accidentals_map = assign_accidentals_to_notes(global_accs, all_detected_notes, dy)
+    print(f"   Accidentals: {len(accidentals_map)}")
+
+    # ── 7. Detect Rests ──
+    print("7. Detecting rests...")
+    all_rests = detect_rests(binary, systems, dy)
+    all_rests = [r for r in all_rests if r['x'] > int(img_w * 0.10)]
+    # Filter rests near barlines and notes.
+    # For single-staff mode, system_idx IS the staff index (no grand staff pairing).
+    # _filter_rests uses system_idx // 2 for pair_idx, so we need to remap.
+    for r in all_rests:
+        r['pair_idx'] = r['system_idx']
+    # Create a version of _filter_rests that uses direct staff index
+    filtered_rests = []
+    for rest in all_rests:
+        si = rest['system_idx']
+        # Remove rests near barlines
+        if si < len(barlines_per_system):
+            barlines = barlines_per_system[si]
+            near_barline = any(abs(rest['x'] - bx) < dy * 3.0 for bx in barlines)
+            if barlines and rest['x'] < barlines[0]:
+                near_barline = True
+            if near_barline:
+                continue
+        # Remove rests overlapping with notes. Two checks:
+        # 1. Close in both x and y (standard overlap)
+        # 2. Close in x only (catches beam-area false rests between notes)
+        has_nearby = any(
+            note.get('pair_idx', -1) == si
+            and abs(rest['x'] - note['x']) < dy * 2.0
+            for note in all_detected_notes
+        )
+        if not has_nearby:
+            filtered_rests.append(rest)
+    all_rests = filtered_rests
+    print(f"   Found {len(all_rests)} rests")
+
+    rests_per_staff = [[] for _ in systems]
+    for r in all_rests:
+        si = r['system_idx']
+        if si < len(rests_per_staff):
+            r['pair_idx'] = si
+            rests_per_staff[si].append(r)
+
+    # ── 7b. Detect Tuplet Markers ──
+    print("7b. Detecting tuplet markers...")
+    original_gray = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+    # For single staff, create fake grand staff pairs for tuplet detection
+    fake_pairs = [(sys_info, sys_info) for sys_info in systems]
+    tuplet_markers = detect_tuplet_markers(original_gray, fake_pairs, dy,
+                                           clef_boundaries=clef_boundaries)
+    print(f"   Found {len(tuplet_markers)} tuplet markers")
+
+    # ── 8. Track Stems ──
+    print("8. Tracking stems...")
+    for ns in notes_per_staff:
+        for note in ns:
+            note['stem'] = track_stem(music_symbols, note, dy, binary=binary)
+
+    # ── 8b. Auto-detect time signature ──
+    time_sig = detect_time_signature(binary, systems[0], dy)
+    if time_sig:
+        num, den = time_sig
+        bpm_detected = num * (4.0 / den)
+        CFG.duration.beats_per_measure = bpm_detected
+        print(f"   Time signature: {num}/{den} → beats_per_measure={bpm_detected}")
+    else:
+        print(f"   Time signature: not detected, using default {CFG.duration.beats_per_measure}")
+
+    # ── 9. Build Note Units & Segment Measures ──
+    print("9. Building note units and segmenting measures...")
+    bpm = CFG.duration.beats_per_measure
+    staff_data = []
+
+    for si, sys_info in enumerate(systems):
+        notes = notes_per_staff[si]
+        rests = rests_per_staff[si]
+        barlines = barlines_per_system[si] if si < len(barlines_per_system) else []
+
+        units = build_note_units(notes, music_symbols, binary, dy, single_staff=True)
+        # No merge_overlapping for single-staff (no two-voice)
+
+        # Debug: uncomment to inspect a specific staff (0-indexed)
+        # if si == 3:
+        #     for ui, u in enumerate(units):
+        #         nn = u['notes']
+        #         print(f"   [DBG] u{ui}: x={u['x']:.0f} idur={[n.get('individual_duration') for n in nn]}")
+
+        is_first = (si == 0)
+        staff_tuplets = [m for m in tuplet_markers
+                         if m['pair_idx'] == si and m['clef'] == 'treble']
+        measures = segment_into_measures(units, rests, barlines, dy,
+                                          beats_per_measure=bpm,
+                                          is_first_system=is_first,
+                                          tuplet_markers=staff_tuplets)
+
+        # Strip leading empty measures for lines 2+
+        if si >= 1:
+            while measures and not measures[0]:
+                measures.pop(0)
+
+        staff_data.append({
+            'measures': measures,
+            'barlines': barlines,
+            'system': sys_info,
+            'staff_idx': si,
+        })
+        print(f"   Staff {si + 1}: {len(measures)} measures")
+
+    # ── 10. Format & Save Output ──
+    _print_and_save_single_staff_output(staff_data, accidentals_map, dy)
+
+    # ── 11. Visualization ──
+    print("\n11. Generating visualizations...")
+    _generate_single_staff_annotated(image_path, staff_data, accidentals_map, dy)
+
+
+def _print_and_save_single_staff_output(staff_data, accidentals_map, dy):
+    """Format, print, and save output for single-staff scores."""
+    all_lines = []
+    for sd in staff_data:
+        line = format_output(sd['measures'], accidentals_map, dy=dy)
+        all_lines.append(line)
+
+    print(f"\n{'=' * 60}")
+    print("JIANPU OUTPUT")
+    print(f"{'=' * 60}")
+
+    for i, line in enumerate(all_lines):
+        print(f"\n--- 第{i + 1}行 ---")
+        print(f"  {line}")
+
+    # Save to file
+    with open("output_jianpu.txt", "w", encoding="utf-8") as f:
+        f.write("简谱翻译结果\n")
+        f.write("=" * 60 + "\n\n")
+        for i, line in enumerate(all_lines):
+            f.write(f"--- 第{i + 1}行 ---\n")
+            f.write(f"{line}\n\n")
+        f.write("=" * 60 + "\n")
+    print("\n   Saved text: output_jianpu.txt")
+
+
+def _generate_single_staff_annotated(image_path, staff_data, accidentals_map, dy):
+    """Generate annotated image for single-staff scores."""
+    img_orig = cv2.imread(image_path)
+    if img_orig is None:
+        return
+    orig_h, orig_w = img_orig.shape[:2]
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    annotation_height = int(dy * 2.5)
+    num_staves = len(staff_data)
+
+    new_h = orig_h + num_staves * annotation_height
+    img_out = np.ones((new_h, orig_w, 3), dtype=np.uint8) * 255
+
+    y_offset = 0
+    prev_copy_end = 0
+
+    for si, sd in enumerate(staff_data):
+        sys_info = sd['system']
+        barlines = sd['barlines']
+        measures = sd['measures']
+
+        cut_y = sys_info[4] + int(dy * 1.5)
+        if si + 1 < num_staves:
+            next_top = staff_data[si + 1]['system'][0]
+            cut_y = min(cut_y, next_top - int(dy * 0.5))
+        else:
+            cut_y = min(cut_y, orig_h)
+
+        strip = img_orig[prev_copy_end:cut_y, :]
+        img_out[y_offset:y_offset + strip.shape[0], :strip.shape[1]] = strip
+        y_offset += strip.shape[0]
+
+        ann_y1 = y_offset
+        ann_y2 = y_offset + annotation_height
+        img_out[ann_y1:ann_y2, :] = (245, 245, 255)
+
+        text_y = ann_y1 + int(annotation_height * 0.6)
+        boundaries = [0] + list(barlines) + [orig_w]
+
+        for mi in range(len(measures)):
+            if mi >= len(boundaries) - 1:
+                break
+            left = boundaries[mi]
+            right = boundaries[mi + 1]
+            region_w = right - left
+
+            if mi > 0:
+                cv2.line(img_out, (left, ann_y1 + 2), (left, ann_y2 - 2), (150, 150, 150), 1)
+
+            text = format_measure(measures[mi], accidentals_map, measure_idx=mi, dy=dy)
+            if text:
+                scale = 0.35
+                (tw, _), _ = cv2.getTextSize(text, font, scale, 1)
+                if tw > region_w - 8:
+                    scale = max(0.2, scale * (region_w - 8) / tw)
+                (tw, _), _ = cv2.getTextSize(text, font, scale, 1)
+                tx = left + max(2, (region_w - tw) // 2)
+                cv2.putText(img_out, text, (tx, text_y), font, scale,
+                            (180, 0, 0), 1, cv2.LINE_AA)
+
+        y_offset += annotation_height
+        prev_copy_end = cut_y
+
+    if prev_copy_end < orig_h:
+        remaining = img_orig[prev_copy_end:, :]
+        end = min(y_offset + remaining.shape[0], img_out.shape[0])
+        h_to_copy = end - y_offset
+        img_out[y_offset:end, :remaining.shape[1]] = remaining[:h_to_copy]
+
+    cv2.imwrite("output_jianpu_on_staff.png", img_out)
+    print("   Saved: output_jianpu_on_staff.png")
+
+
+# ============================================================
 # Helper functions
 # ============================================================
 
+def _col_density(binary, y1, y2, bx, half_w=2):
+    """Max mean-column density in binary[y1:y2, bx-half_w:bx+half_w+1]."""
+    col = binary[y1:y2, max(0, bx - half_w):bx + half_w + 1]
+    if col.size == 0:
+        return 0.0
+    return float(np.max(np.mean(col, axis=0)) / 255)
+
+
+def _half_staff_score(binary, sys, bx, half_w=2):
+    """Score a vertical line by the MIN density of the two halves of a staff.
+    A real barline covers the full staff height → high min.
+    A note stem covers only part → low min.
+    """
+    col = binary[sys[0]:sys[4], max(0, bx - half_w):bx + half_w + 1]
+    if col.size == 0:
+        return 0.0
+    mid = col.shape[0] // 2
+    upper = np.max(np.mean(col[:mid], axis=0)) / 255 if mid > 0 else 0.0
+    lower = np.max(np.mean(col[mid:], axis=0)) / 255 if col.shape[0] - mid > 0 else 0.0
+    return float(min(upper, lower))
+
+
 def _merge_barlines(treble_bl, bass_bl, dy, binary=None,
                     treble_sys=None, bass_sys=None):
-    """Merge and verify barlines from treble and bass staves.
+    """Merge and verify barlines from treble and bass staves."""
+    from config import CFG
+    bc = CFG.barline
 
-    Strategy:
-    1. Match treble/bass barlines pairwise within tolerance
-    2. Use average position for matched pairs
-    3. Verify candidates with _is_real_barline (with ±5px search)
-    4. Scan for missed barlines with minimum spacing constraint
-    5. Fallback to averaged candidates if verification fails
-    """
     if not treble_bl and not bass_bl:
         return []
 
-    # Step 1: Match treble and bass barlines pairwise
-    match_tolerance = dy * 8  # ~170px
+    # Step 1: Match treble/bass barlines pairwise
+    match_tolerance = dy * bc.match_tolerance_dy
     t_sorted = sorted(treble_bl)
     b_sorted = sorted(bass_bl)
     t_used = [False] * len(t_sorted)
     b_used = [False] * len(b_sorted)
-    matched = []
-    unmatched = []
+    matched, unmatched = [], []
 
     for ti, tx in enumerate(t_sorted):
-        best_bi = -1
-        best_dist = match_tolerance
+        best_bi, best_dist = -1, match_tolerance
         for bi, bx in enumerate(b_sorted):
             if b_used[bi]:
                 continue
@@ -271,22 +935,17 @@ def _merge_barlines(treble_bl, bass_bl, dy, binary=None,
                 best_dist = dist
                 best_bi = bi
         if best_bi >= 0:
-            avg_x = int((tx + b_sorted[best_bi]) / 2)
-            matched.append(avg_x)
+            matched.append(int((tx + b_sorted[best_bi]) / 2))
             t_used[ti] = True
             b_used[best_bi] = True
         else:
             unmatched.append(int(tx))
             t_used[ti] = True
-
     for bi, bx in enumerate(b_sorted):
         if not b_used[bi]:
             unmatched.append(int(bx))
 
-    # Matched pairs are high confidence; unmatched are low confidence
     all_candidates = sorted(matched + unmatched)
-
-    # Deduplicate with dy tolerance
     deduped = []
     for bx in all_candidates:
         if not deduped or abs(bx - deduped[-1]) > dy:
@@ -297,84 +956,75 @@ def _merge_barlines(treble_bl, bass_bl, dy, binary=None,
     if binary is None or treble_sys is None or bass_sys is None:
         return deduped
 
-    # Step 2: Verify candidates — search in wider range around each
-    # The averaged position may be far from the actual barline (e.g., treble at 1154,
-    # bass at 1297, average 1225 — actual barline is at neither position).
-    # Search in a range proportional to the match tolerance.
-    search_radius = int(dy * 4)  # ~85px
+    # Step 2: Verify — search around each candidate using half-staff
+    # scoring so full-height barlines beat partial note stems.
+    base_radius = int(dy * bc.verify_base_radius_dy)
+    density_thr = bc.verify_density_threshold
     verified = set()
     for bx in deduped:
-        best_x = None
-        best_density = 0
-        for test_x in range(int(bx) - search_radius, int(bx) + search_radius + 1):
+        # Dynamic radius: bridge any treble/bass misalignment
+        t_dists = [abs(bx - tx) for tx in t_sorted] if t_sorted else [0]
+        b_dists = [abs(bx - bxx) for bxx in b_sorted] if b_sorted else [0]
+        max_dist = max(min(t_dists), min(b_dists))
+        radius = max(base_radius, int(max_dist + dy * bc.verify_extra_radius_dy))
+
+        best_x, best_score = None, 0.0
+        for test_x in range(int(bx) - radius, int(bx) + radius + 1):
             if test_x < 2 or test_x >= binary.shape[1] - 2:
                 continue
-            col_t = binary[treble_sys[0]:treble_sys[4], test_x-1:test_x+2]
-            col_b = binary[bass_sys[0]:bass_sys[4], test_x-1:test_x+2]
-            d_t = np.max(np.mean(col_t, axis=0)) / 255 if col_t.size > 0 else 0
-            d_b = np.max(np.mean(col_b, axis=0)) / 255 if col_b.size > 0 else 0
-            if d_t > 0.55 and d_b > 0.55:
-                total = d_t + d_b
-                if total > best_density:
-                    best_density = total
+            d_t = _col_density(binary, treble_sys[0], treble_sys[4], test_x)
+            d_b = _col_density(binary, bass_sys[0], bass_sys[4], test_x)
+            if d_t > density_thr and d_b > density_thr:
+                score = _half_staff_score(binary, treble_sys, test_x) + \
+                        _half_staff_score(binary, bass_sys, test_x)
+                if score > best_score:
+                    best_score = score
                     best_x = test_x
         if best_x is not None:
             verified.add(best_x)
 
-    # Step 3: Scan for missed barlines with minimum spacing
-    clef_end = int(binary.shape[1] * 0.25)
-    # Minimum spacing: use individual system spacings as reference
+    # Step 3: Scan for missed barlines
+    clef_end = int(binary.shape[1] * bc.clef_end_ratio)
     all_spacings = []
     for bl_list in [t_sorted, b_sorted]:
         if len(bl_list) >= 2:
             all_spacings.extend([bl_list[i+1]-bl_list[i] for i in range(len(bl_list)-1)])
-    min_gap = np.median(all_spacings) * 0.5 if all_spacings else dy * 15
+    min_gap = np.median(all_spacings) * bc.min_gap_median_ratio if all_spacings else dy * 15
 
-    for bx in range(clef_end, binary.shape[1], 3):
-        if _is_real_barline(binary, bx, treble_sys, bass_sys):
+    for bx in range(clef_end, binary.shape[1], bc.scan_step_px):
+        d_t = _col_density(binary, treble_sys[0], treble_sys[4], bx)
+        d_b = _col_density(binary, bass_sys[0], bass_sys[4], bx)
+        if d_t > density_thr and d_b > density_thr:
             if all(abs(bx - v) > min_gap for v in verified):
                 verified.add(bx)
 
-    # Step 4: Apply minimum spacing filter to remove false positives
+    # Step 4: Spacing filter — when two barlines are too close, keep the
+    # one with higher half-staff quality (real barline > note stem).
+    def _quality(bx):
+        return _half_staff_score(binary, treble_sys, bx) + \
+               _half_staff_score(binary, bass_sys, bx)
+
     if verified:
         sorted_v = sorted(verified)
         filtered = [sorted_v[0]]
         for bx in sorted_v[1:]:
             if bx - filtered[-1] > min_gap:
                 filtered.append(bx)
-        # Remove barlines too close to left edge or right edge
+            elif _quality(bx) > _quality(filtered[-1]):
+                filtered[-1] = bx
         filtered = [bx for bx in filtered
-                    if clef_end < bx < binary.shape[1] * 0.96]
+                    if clef_end < bx < binary.shape[1] * bc.right_boundary_ratio]
         if len(filtered) >= 2:
             return filtered
 
-    # Fallback: use averaged candidates with spacing filter
+    # Fallback
     filtered = [deduped[0]] if deduped else []
     for bx in deduped[1:]:
         if bx - filtered[-1] > min_gap:
             filtered.append(bx)
     filtered = [bx for bx in filtered
-                if clef_end < bx < binary.shape[1] * 0.96]
+                if clef_end < bx < binary.shape[1] * bc.right_boundary_ratio]
     return filtered
-
-
-def _is_real_barline(binary, bx, treble_sys, bass_sys):
-    """Check if position bx has a real barline present on both staves.
-
-    In piano grand staff notation, regular measure barlines span each
-    staff individually but do NOT always cross the gap between staves.
-    Only system barlines cross the gap. So we require high density on
-    BOTH staves but not necessarily in the gap.
-    """
-    if bx < 2 or bx >= binary.shape[1] - 2:
-        return False
-    # Check a 5-pixel-wide column (±2) for more robust detection
-    col_t = binary[treble_sys[0]:treble_sys[4], bx-2:bx+3]
-    col_b = binary[bass_sys[0]:bass_sys[4], bx-2:bx+3]
-    # Use max across columns (barline might be only 1-2px wide)
-    d_t = np.max(np.mean(col_t, axis=0)) / 255 if col_t.size > 0 else 0
-    d_b = np.max(np.mean(col_b, axis=0)) / 255 if col_b.size > 0 else 0
-    return d_t > 0.55 and d_b > 0.55
 
 
 def _filter_rests(all_rests, barlines_per_pair, all_notes, dy):
@@ -778,4 +1428,11 @@ def _generate_jianpu_cv2(pair_data, accidentals_map, dy):
 if __name__ == "__main__":
     import sys
     img_path = sys.argv[1] if len(sys.argv) > 1 else "../input_page1.png"
+    # Optional: --bpm N to override beats_per_measure
+    if '--bpm' in sys.argv:
+        idx = sys.argv.index('--bpm')
+        if idx + 1 < len(sys.argv):
+            from config import CFG
+            CFG.duration.beats_per_measure = float(sys.argv[idx + 1])
+            print(f"Override beats_per_measure = {CFG.duration.beats_per_measure}")
     main(img_path)

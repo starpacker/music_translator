@@ -60,10 +60,13 @@ def _load_all_templates_by_prefix(prefix, directory=None):
 # ============================================================
 # 1. BARLINE DETECTION
 # ============================================================
-def detect_barlines(binary_img, staff_systems, dy):
+def detect_barlines(binary_img, staff_systems, dy, min_spacing_dy=18.0):
     """
     Detect vertical barlines using template matching with the bar template.
     Returns list of barline x-positions for each staff system.
+
+    min_spacing_dy: minimum spacing between barlines in multiples of dy.
+                    Default 18.0 for grand staff; use ~8.0 for single-staff scores.
     """
     img_h, img_w = binary_img.shape
     
@@ -140,9 +143,28 @@ def detect_barlines(binary_img, staff_systems, dy):
                 if score > deduped[-1][1]:
                     deduped[-1] = (bx, score)
         
+        # Adaptive spacing: find natural threshold between stem gaps and
+        # barline gaps using the largest jump in the sorted gap distribution.
+        if len(deduped) >= 3 and min_spacing_dy <= 0:
+            cand_xs = [b[0] for b in deduped]
+            raw_gaps = sorted([cand_xs[i+1] - cand_xs[i]
+                               for i in range(len(cand_xs) - 1)])
+            # Find largest jump between consecutive sorted gaps
+            best_jump = 0
+            best_threshold = dy * 8  # fallback
+            for gi in range(len(raw_gaps) - 1):
+                jump = raw_gaps[gi + 1] - raw_gaps[gi]
+                if jump > best_jump:
+                    best_jump = jump
+                    best_threshold = (raw_gaps[gi] + raw_gaps[gi + 1]) / 2
+            # Ensure minimum threshold to avoid merging very close stems
+            adaptive_spacing = max(dy * 5, best_threshold)
+        else:
+            adaptive_spacing = dy * min_spacing_dy
+
         filtered = []
         for bx, score in deduped:
-            if not filtered or (bx - filtered[-1]) > dy * 18:
+            if not filtered or (bx - filtered[-1]) > adaptive_spacing:
                 filtered.append(bx)
         
         while filtered and filtered[0] < int(img_w * 0.20):
@@ -159,11 +181,15 @@ def detect_barlines(binary_img, staff_systems, dy):
 # ============================================================
 # 2. ACCIDENTAL DETECTION - GLOBAL APPROACH
 # ============================================================
-def detect_accidentals_global(binary_img, staff_systems, dy, clef_boundaries=None):
+def detect_accidentals_global(binary_img, staff_systems, dy, clef_boundaries=None,
+                              music_symbols=None):
     """
     Detect accidentals globally in each staff region using multi-scale template matching.
     Uses ALL available sharp/flat/natural templates from the new template/ folder.
-    
+
+    If music_symbols is provided, also searches it for naturals (catches signs
+    that overlap staff lines and are invisible on the binary image).
+
     Returns list of dicts: {'x': x, 'y': y, 'type': '#'/'b'/'n', 'score': score, 'system_idx': idx}
     Natural signs ('n') are used to cancel accidental persistence within a measure.
     """
@@ -229,7 +255,9 @@ def detect_accidentals_global(binary_img, staff_systems, dy, clef_boundaries=Non
                     resized = cv2.resize(template, (new_w, new_h), interpolation=cv2.INTER_AREA)
                     res = cv2.matchTemplate(roi, resized, cv2.TM_CCOEFF_NORMED)
                     
-                    threshold = 0.60
+                    from config import CFG
+                    ac = CFG.accidental
+                    threshold = ac.match_threshold_sharp if acc_char == '#' else ac.match_threshold_global
                     loc = np.where(res >= threshold)
                     
                     for pt in zip(*loc[::-1]):
@@ -247,6 +275,48 @@ def detect_accidentals_global(binary_img, staff_systems, dy, clef_boundaries=Non
                             'h': new_h,
                         })
     
+    # Supplemental pass: search music_symbols for naturals that overlap staff
+    # lines. Staff removal destroys the middle of the sign, but the vertical
+    # bars survive above/below the line, giving a weaker but valid match.
+    if music_symbols is not None and natural_templates:
+        ms_threshold = CFG.accidental.match_threshold_global - 0.05  # slightly lower
+        for sys_idx, system in enumerate(staff_systems):
+            y_top = system[0]
+            y_bot = system[4]
+            margin = int(dy * 5)
+            search_y1 = max(0, y_top - margin)
+            search_y2 = min(img_h, y_bot + margin)
+            if clef_boundaries and sys_idx in clef_boundaries:
+                search_x1 = max(0, clef_boundaries[sys_idx] - int(dy * 2))
+            else:
+                search_x1 = int(img_w * 0.18)
+            roi = music_symbols[search_y1:search_y2, search_x1:]
+            roi_h, roi_w = roi.shape
+            if roi_h < 10 or roi_w < 10:
+                continue
+            for tname, template in natural_templates:
+                th_orig, tw_orig = template.shape
+                if th_orig < 3 or tw_orig < 3:
+                    continue
+                ideal_scale = (dy * 2.0) / float(th_orig)
+                for scale_factor in np.linspace(ideal_scale * 0.7, ideal_scale * 1.35, 7):
+                    new_h = int(th_orig * scale_factor)
+                    new_w = int(tw_orig * scale_factor)
+                    if new_h < 5 or new_w < 3 or new_h >= roi_h or new_w >= roi_w:
+                        continue
+                    resized = cv2.resize(template, (new_w, new_h), interpolation=cv2.INTER_AREA)
+                    res = cv2.matchTemplate(roi, resized, cv2.TM_CCOEFF_NORMED)
+                    loc = np.where(res >= ms_threshold)
+                    for pt in zip(*loc[::-1]):
+                        score = float(res[pt[1], pt[0]])
+                        abs_x = search_x1 + pt[0] + new_w // 2
+                        abs_y = search_y1 + pt[1] + new_h // 2
+                        all_accidentals.append({
+                            'x': abs_x, 'y': abs_y, 'type': 'n',
+                            'score': score, 'system_idx': sys_idx,
+                            'w': new_w, 'h': new_h,
+                        })
+
     # NMS: remove duplicates (keep highest score within dy*0.8 radius)
     if all_accidentals:
         all_accidentals.sort(key=lambda a: a['score'], reverse=True)
@@ -260,14 +330,14 @@ def detect_accidentals_global(binary_img, staff_systems, dy, clef_boundaries=Non
             if not is_dup:
                 kept.append(acc)
         all_accidentals = kept
-    
+
     print(f"   Global accidental detection: {len(all_accidentals)} found "
           f"({sum(1 for a in all_accidentals if a['type']=='#')} sharps, "
           f"{sum(1 for a in all_accidentals if a['type']=='b')} flats, "
           f"{sum(1 for a in all_accidentals if a['type']=='n')} naturals)")
     for a in all_accidentals:
         print(f"     {a['type']} at ({a['x']}, {a['y']}) score={a['score']:.3f} sys={a['system_idx']}")
-    
+
     return all_accidentals
 
 
@@ -462,24 +532,25 @@ def detect_rests(binary_img, staff_systems, dy):
             
             th_orig, tw_orig = template.shape
             ideal_scale = (staff_height * 0.5) / float(th_orig) if th_orig > 0 else 0.5
-            
-            for scale_factor in [ideal_scale * 0.9, ideal_scale * 1.1]:
+
+            for scale_factor in [ideal_scale * 0.8, ideal_scale * 0.9,
+                                 ideal_scale, ideal_scale * 1.1, ideal_scale * 1.2]:
                 new_h = int(th_orig * scale_factor)
                 new_w = int(tw_orig * scale_factor)
-                
+
                 if new_h < 5 or new_w < 5:
                     continue
-                
+
                 roi = binary_img[search_y1:search_y2, :]
                 roi_h, roi_w = roi.shape
-                
+
                 if new_h >= roi_h or new_w >= roi_w:
                     continue
-                
+
                 resized = cv2.resize(template, (new_w, new_h), interpolation=cv2.INTER_AREA)
                 res = cv2.matchTemplate(roi, resized, cv2.TM_CCOEFF_NORMED)
-                
-                threshold = 0.55  # quarter rest threshold
+
+                threshold = 0.48  # quarter rest threshold
                 loc = np.where(res >= threshold)
                 
                 for pt in zip(*loc[::-1]):
@@ -548,9 +619,59 @@ def detect_rests(binary_img, staff_systems, dy):
                         'type': tname,
                     })
     
+    # Detect half rests (stop_2) and whole rests (stop_1).
+    # These templates include staff line context, so scale to match staff height.
+    for sys_idx, system in enumerate(staff_systems):
+        staff_height = system[4] - system[0]
+        margin = int(dy * 0.5)
+        search_y1 = max(0, system[0] - margin)
+        search_y2 = min(img_h, system[4] + margin)
+
+        for tname, duration, thresh in [('stop_2.jpg', 2.0, 0.55), ('stop_1.jpg', 4.0, 0.60)]:
+            template = None
+            for d in [TEMPLATE_DIR, PICTURE_EXPAND_DIR, PICTURE_DIR]:
+                template = _load_template(tname, d)
+                if template is not None:
+                    break
+            if template is None:
+                continue
+
+            th_orig, tw_orig = template.shape
+            # Scale template so its height matches the staff height
+            ideal_scale = staff_height / float(th_orig) if th_orig > 0 else 0.5
+
+            for scale_factor in [ideal_scale * 0.85, ideal_scale, ideal_scale * 1.15]:
+                new_h = int(th_orig * scale_factor)
+                new_w = int(tw_orig * scale_factor)
+                if new_h < 5 or new_w < 5:
+                    continue
+
+                roi = binary_img[search_y1:search_y2, :]
+                roi_h, roi_w = roi.shape
+                if new_h >= roi_h or new_w >= roi_w:
+                    continue
+
+                resized = cv2.resize(template, (new_w, new_h),
+                                     interpolation=cv2.INTER_AREA)
+                res = cv2.matchTemplate(roi, resized, cv2.TM_CCOEFF_NORMED)
+
+                loc = np.where(res >= thresh)
+                for pt in zip(*loc[::-1]):
+                    rx = pt[0] + new_w // 2
+                    ry = search_y1 + pt[1] + new_h // 2
+                    score = res[pt[1], pt[0]]
+                    rests.append({
+                        'x': rx,
+                        'y_center': ry,
+                        'system_idx': sys_idx,
+                        'duration': duration,
+                        'score': score,
+                        'type': tname,
+                    })
+
     if rests:
         rests = _nms_rests(rests, dy * 2.0)
-    
+
     return rests
 
 
@@ -569,5 +690,152 @@ def _nms_rests(rests, min_dist_x, min_dist_y=None):
         if not too_close:
             kept.append(r)
     return kept
+
+
+# ============================================================
+# 5. TUPLET MARKER DETECTION
+# ============================================================
+def detect_tuplet_markers(grayscale_img, grand_staff_pairs, dy, clef_boundaries=None):
+    """Detect tuplet number markers (3, 6) using template matching.
+
+    Tuplet markers are small digits placed below the staff (in the gap
+    between treble and bass, or below the bass staff) indicating that a
+    group of notes forms a tuplet.
+
+    Parameters
+    ----------
+    grayscale_img : ndarray, grayscale original image
+    grand_staff_pairs : list of (treble_sys, bass_sys) tuples
+    dy : float, staff line spacing
+    clef_boundaries : dict mapping system index to clef x boundary
+
+    Returns
+    -------
+    list of dicts: {'x', 'y', 'n' (tuplet number), 'pair_idx', 'clef'}
+    """
+    # Load tuplet digit templates
+    templates = []
+    for digit in [3, 6]:
+        t = _load_template(f"tuplet_{digit}.png")
+        if t is not None:
+            templates.append((digit, t))
+    if not templates:
+        return []
+
+    img_h, img_w = grayscale_img.shape[:2]
+    _, img_bin = cv2.threshold(grayscale_img, 128, 255, cv2.THRESH_BINARY_INV)
+
+    default_clef_x = int(img_w * 0.15)
+    raw_hits = []
+
+    for pair_idx, (treble_sys, bass_sys) in enumerate(grand_staff_pairs):
+        clef_x = default_clef_x
+        if clef_boundaries:
+            sys_idx = pair_idx * 2
+            clef_x = clef_boundaries.get(sys_idx, default_clef_x)
+
+        # Search regions: between staves, below bass staff
+        regions = [
+            ('treble', treble_sys[4], bass_sys[0]),          # between staves
+            ('bass', bass_sys[4], min(img_h, bass_sys[4] + int(dy * 5))),  # below bass
+        ]
+
+        for clef, ry1, ry2 in regions:
+            if ry2 <= ry1:
+                continue
+            roi = img_bin[ry1:ry2, :]
+
+            for digit, template in templates:
+                th, tw = template.shape
+                for scale in [0.7, 0.85, 1.0, 1.15, 1.3]:
+                    new_h = max(5, int(th * scale))
+                    new_w = max(5, int(tw * scale))
+                    if new_h >= roi.shape[0] or new_w >= roi.shape[1]:
+                        continue
+                    resized = cv2.resize(template, (new_w, new_h))
+                    res = cv2.matchTemplate(roi, resized, cv2.TM_CCOEFF_NORMED)
+                    loc = np.where(res >= 0.65)
+                    for py, px in zip(*loc):
+                        abs_x = px + new_w // 2
+                        abs_y = ry1 + py + new_h // 2
+                        # Skip clef area
+                        if abs_x < clef_x:
+                            continue
+                        score = res[py, px]
+                        raw_hits.append({
+                            'x': abs_x, 'y': abs_y, 'n': digit,
+                            'pair_idx': pair_idx, 'clef': clef,
+                            'score': score,
+                        })
+
+    # NMS: keep highest score within 15px radius
+    raw_hits.sort(key=lambda h: -h['score'])
+    kept = []
+    for h in raw_hits:
+        too_close = any(
+            abs(h['x'] - k['x']) < 15 and abs(h['y'] - k['y']) < 15
+            for k in kept
+        )
+        if not too_close:
+            kept.append(h)
+
+    return kept
+
+
+def detect_time_signature(binary_img, staff_system, dy):
+    """Auto-detect time signature from the first staff system.
+
+    Matches time-signature templates (number_N_D format) against the clef
+    area. Returns (numerator, denominator) or None if not detected.
+    """
+    staff_height = staff_system[4] - staff_system[0]
+    img_w = binary_img.shape[1]
+
+    roi_x1 = int(img_w * 0.08)
+    roi_x2 = int(img_w * 0.22)
+    roi = binary_img[staff_system[0]:staff_system[4], roi_x1:roi_x2]
+    if roi.size == 0:
+        return None
+
+    templates = {}
+    for ext in ['*.jpg', '*.png']:
+        for path in glob.glob(os.path.join(TEMPLATE_DIR, ext)):
+            fname = os.path.splitext(os.path.basename(path))[0]
+            if not fname.startswith('number_'):
+                continue
+            parts = fname.split('_')
+            if len(parts) >= 3:
+                try:
+                    num, den = int(parts[1]), int(parts[2])
+                except ValueError:
+                    continue
+                img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+                if img is not None:
+                    _, bimg = cv2.threshold(img, 128, 255,
+                                            cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
+                    templates[(num, den)] = bimg
+
+    if not templates:
+        return None
+
+    best_match = None
+    best_score = 0.45
+
+    for (num, den), template in templates.items():
+        th, tw = template.shape
+        ideal_scale = staff_height / th if th > 0 else 1.0
+        for f in [0.8, 0.9, 1.0, 1.1, 1.2]:
+            new_h = max(5, int(th * ideal_scale * f))
+            new_w = max(5, int(tw * ideal_scale * f))
+            if new_h >= roi.shape[0] or new_w >= roi.shape[1]:
+                continue
+            resized = cv2.resize(template, (new_w, new_h), interpolation=cv2.INTER_AREA)
+            res = cv2.matchTemplate(roi, resized, cv2.TM_CCOEFF_NORMED)
+            max_val = float(np.max(res)) if res.size > 0 else 0
+            if max_val > best_score:
+                best_score = max_val
+                best_match = (num, den)
+
+    return best_match
 
 

@@ -168,6 +168,25 @@ def create_notehead_template(dy):
     return template[y:y+bh, x:x+bw]
 
 
+def create_hollow_notehead_template(dy):
+    """
+    Synthesize a hollow (open) notehead template for whole/half notes.
+    An unfilled ellipse with thicker outline.
+    """
+    w = int(dy * 1.4)
+    h = int(dy * 0.9)
+    if w < 3: w = 3
+    if h < 3: h = 3
+    size = int(dy * 2.5)
+    if size < 7: size = 7
+    template = np.zeros((size, size), dtype=np.uint8)
+    center = (size // 2, size // 2)
+    thickness = max(2, int(dy * 0.15))
+    cv2.ellipse(template, center, (w // 2, h // 2), -20, 0, 360, 255, thickness)
+    x, y, bw, bh = cv2.boundingRect(template)
+    return template[y:y+bh, x:x+bw]
+
+
 def create_ledger_notehead_templates(dy):
     """
     Synthesize multiple notehead templates with ledger lines.
@@ -266,7 +285,8 @@ def _deduplicate_by_center(boxes, min_dist):
     return kept
 
 
-def find_noteheads(binary_img, dy, threshold=0.55, staff_systems=None, music_symbols=None):
+def find_noteheads(binary_img, dy, threshold=0.55, staff_systems=None, music_symbols=None,
+                   detect_hollow=False):
     """
     Find solid noteheads using a hybrid approach:
     1. Find exclusion zones (clefs, accidentals) using provided templates.
@@ -449,10 +469,183 @@ def find_noteheads(binary_img, dy, threshold=0.55, staff_systems=None, music_sym
                         
                         all_boxes.append((abs_x - nw//2, abs_y - nh//2, nw, nh, score))
             
-            # On-staff search disabled - causes too many false positives
-            # The morphological detection handles on-staff notes well enough
-            pass
-    
+    # Record count of regular detections before hollow stage
+    pre_hollow_count = len(all_boxes)
+
+    # --- Stage 2b: Hollow notehead detection (whole/half notes) ---
+    # Uses template matching on the binary image for accurate positioning.
+    # The hollow notehead template is matched at multiple scales, then
+    # center fill is verified (hollow = low fill).
+    if detect_hollow and staff_systems:
+        hollow_template = create_hollow_notehead_template(dy)
+        ht_h, ht_w = hollow_template.shape
+
+        for system in staff_systems:
+            top_line = system[0]
+            bot_line = system[4]
+            search_y1 = max(0, top_line - int(dy * 4))
+            search_y2 = min(binary_img.shape[0], bot_line + int(dy * 4))
+            roi = binary_img[search_y1:search_y2, :]
+
+            if roi.shape[0] < ht_h or roi.shape[1] < ht_w:
+                continue
+
+            for scale in [0.85, 1.0, 1.15]:
+                sh = max(5, int(ht_h * scale))
+                sw = max(5, int(ht_w * scale))
+                if sh >= roi.shape[0] or sw >= roi.shape[1]:
+                    continue
+                tmpl = cv2.resize(hollow_template, (sw, sh),
+                                  interpolation=cv2.INTER_AREA)
+                res = cv2.matchTemplate(roi, tmpl, cv2.TM_CCOEFF_NORMED)
+                loc = np.where(res >= 0.35)
+                for py, px in zip(*loc):
+                    cx_abs = px + sw // 2
+                    cy_abs = search_y1 + py + sh // 2
+                    match_score = float(res[py, px])
+
+                    # Low-score detections (0.35-0.42) are only accepted
+                    # at ledger line positions (above/below staff), where
+                    # the ledger line interference lowers the template score.
+                    # Within the staff, require score >= 0.42 to avoid
+                    # false positives from stems and beam artifacts.
+                    s_dy = (system[4] - system[0]) / 4.0
+                    dist_above = system[0] - cy_abs
+                    dist_below = cy_abs - system[4]
+                    # Notes in spaces just above/below staff (0.5-1.0*dy) are
+                    # valid positions but get lower template scores due to
+                    # nearby staff line interference. Use graduated threshold:
+                    # - On staff (dist <= 0): require 0.42
+                    # - Near staff (dist 0-0.5*dy): require 0.42
+                    # - Above/below staff (dist > 0.5*dy): allow 0.35+
+                    outside_staff = dist_above > s_dy * 0.5 or dist_below > s_dy * 0.5
+                    if match_score < 0.42 and not outside_staff:
+                        continue
+                    # For low-score ledger detections, verify ink presence
+                    # on music_symbols — a real notehead has significant ink.
+                    if match_score < 0.42 and outside_staff and music_symbols is not None:
+                        ink_r = max(5, int(s_dy * 0.5))
+                        iy1 = max(0, cy_abs - ink_r)
+                        iy2 = min(music_symbols.shape[0], cy_abs + ink_r)
+                        ix1 = max(0, cx_abs - ink_r)
+                        ix2 = min(music_symbols.shape[1], cx_abs + ink_r)
+                        ink_region = music_symbols[iy1:iy2, ix1:ix2]
+                        ink_fill = np.mean(ink_region > 127) if ink_region.size else 0
+                        if ink_fill < 0.20:
+                            continue
+
+                    if is_in_exclusion_zone(cx_abs, cy_abs, exclusion_zones,
+                                            margin=int(dy * 0.3)):
+                        continue
+
+                    # Verify: center must be hollow (low ink)
+                    r = max(2, int(dy * 0.15))
+                    ry1 = max(0, cy_abs - r)
+                    ry2 = min(binary_img.shape[0], cy_abs + r)
+                    rx1 = max(0, cx_abs - r)
+                    rx2 = min(binary_img.shape[1], cx_abs + r)
+                    center_roi = binary_img[ry1:ry2, rx1:rx2]
+                    if center_roi.size == 0:
+                        continue
+                    # On binary image, staff lines pass through center so
+                    # check a vertical stripe just off-center for fill
+                    vr = max(2, int(dy * 0.2))
+                    vx1 = max(0, cx_abs - vr)
+                    vx2 = min(binary_img.shape[1], cx_abs + vr)
+                    vy1 = max(0, cy_abs - int(dy * 0.3))
+                    vy2 = min(binary_img.shape[0], cy_abs + int(dy * 0.3))
+                    center_block = binary_img[vy1:vy2, vx1:vx2]
+                    fill = np.mean(center_block > 127) if center_block.size else 1.0
+
+                    # Hollow notehead + staff lines: fill should be moderate
+                    # (staff lines contribute some ink, but not as much as filled)
+                    # Filled notehead fill: >0.7; hollow+staff lines: 0.2-0.5
+                    if fill < 0.55:
+                        # Refine y position: find centroid of ink on
+                        # music_symbols near the detection. The contour
+                        # fragments approximate the hollow oval center.
+                        # Refine y: weighted centroid of ink on
+                        # music_symbols within ±1.0*dy of template match.
+                        # Uses ink count per row as weight → robust center.
+                        refined_cy = cy_abs
+                        if music_symbols is not None:
+                            s_dy = (system[4] - system[0]) / 4.0
+                            search_r = int(s_dy * 1.8)
+                            hw = int(s_dy * 0.9)
+                            ry1r = max(0, cy_abs - search_r)
+                            ry2r = min(music_symbols.shape[0], cy_abs + search_r)
+                            rx1r = max(0, cx_abs - hw)
+                            rx2r = min(music_symbols.shape[1], cx_abs + hw)
+                            patch = music_symbols[ry1r:ry2r, rx1r:rx2r]
+                            if patch.size > 0:
+                                row_ink = np.sum(patch > 127, axis=1).astype(float)
+                                # Find ink runs and merge those separated by
+                                # small gaps (staff/ledger line removal creates
+                                # gaps of ~2-4px in hollow notehead outlines).
+                                has_ink = (row_ink > 4).astype(np.uint8)
+                                runs = np.diff(np.concatenate([[0], has_ink, [0]]))
+                                starts = np.where(runs == 1)[0]
+                                ends = np.where(runs == -1)[0]
+                                if len(starts) > 0:
+                                    # Merge runs with gap < 0.25*dy
+                                    max_gap = max(3, int(s_dy * 0.25))
+                                    merged_starts = [starts[0]]
+                                    merged_ends = [ends[0]]
+                                    for ri in range(1, len(starts)):
+                                        gap = starts[ri] - merged_ends[-1]
+                                        if gap <= max_gap:
+                                            merged_ends[-1] = ends[ri]
+                                        else:
+                                            merged_starts.append(starts[ri])
+                                            merged_ends.append(ends[ri])
+                                    # Pick the longest merged run
+                                    merged_lengths = [e - s for s, e in zip(merged_starts, merged_ends)]
+                                    best_ri = int(np.argmax(merged_lengths))
+                                    rs = merged_starts[best_ri]
+                                    re = merged_ends[best_ri]
+                                    # Use ink from all rows (including gap
+                                    # rows which have 0 ink — this naturally
+                                    # weights the centroid toward the center)
+                                    seg_ink = row_ink[rs:re]
+                                    seg_total = np.sum(seg_ink)
+                                    if seg_total > 10:
+                                        ys = np.arange(len(seg_ink))
+                                        refined_cy = ry1r + rs + int(np.sum(ys * seg_ink) / seg_total)
+
+                        score = float(res[py, px])
+                        all_boxes.append((cx_abs - nw//2, refined_cy - nh//2,
+                                          nw, nh, max(0.80, score)))
+
+    # --- Stage 2c: Hollow notehead deduplication ---
+    # Hollow detections (score ≤ 0.85) may produce multiple hits from
+    # different template scales. Dedup with a wider radius (dy*1.0)
+    # before final NMS to prevent duplicates from corrupting chord grouping.
+    if detect_hollow:
+        regular_boxes = list(all_boxes[:pre_hollow_count])
+        hollow_boxes = all_boxes[pre_hollow_count:]
+        hollow_boxes = _deduplicate_by_center(hollow_boxes, dy * 1.3)
+        # When a hollow detection is near a regular detection, the hollow
+        # one has better y-position (from y-refinement on music_symbols).
+        # Replace the regular detection with the hollow one.
+        new_hollow = []
+        for hx, hy, hw, hh, hs in hollow_boxes:
+            hcx = hx + hw / 2.0
+            hcy = hy + hh / 2.0
+            replaced = False
+            for ri, (fx, fy, fw, fh, fs) in enumerate(regular_boxes):
+                fcx = fx + fw / 2.0
+                fcy = fy + fh / 2.0
+                if abs(hcx - fcx) < dy * 1.5 and abs(hcy - fcy) < dy * 1.5:
+                    # Replace regular with hollow (better y)
+                    regular_boxes[ri] = (hx, hy, hw, hh, hs)
+                    replaced = True
+                    break
+            if not replaced:
+                new_hollow.append((hx, hy, hw, hh, hs))
+        all_boxes = regular_boxes + new_hollow
+        # Final pass: dedup any pairs created by hollow replacements
+        all_boxes = _deduplicate_by_center(all_boxes, dy * 1.0)
+
     # --- Stage 3: NMS + center-distance deduplication ---
     picked_boxes = non_max_suppression(all_boxes, 0.3)
     picked_boxes = _deduplicate_by_center(picked_boxes, dy * 0.4)

@@ -51,13 +51,40 @@ def get_staff_systems(staff_lines_img):
     return systems
 
 
+def detect_staff_layout(systems):
+    """Detect whether the score uses grand staff (piano) or single staff (solo).
+
+    Returns 'grand' if consecutive staves form treble+bass pairs,
+    'single' if all staves are independent (solo instrument).
+    """
+    if len(systems) < 2:
+        return 'single'
+
+    gaps = []
+    for i in range(len(systems) - 1):
+        gap = systems[i + 1][0] - systems[i][4]
+        gaps.append(gap)
+
+    # Grand staff: bimodal gaps (small within pair, large between pairs).
+    # Single staff: uniform gaps.
+    if len(gaps) < 2:
+        return 'grand'  # only 2 staves → assume grand staff
+
+    sorted_gaps = sorted(gaps)
+    # Check uniformity: if max/min ratio < 1.6, gaps are uniform → single staff
+    if sorted_gaps[0] > 0 and sorted_gaps[-1] / sorted_gaps[0] < 1.6:
+        return 'single'
+
+    return 'grand'
+
+
 def pair_grand_staves(systems):
     """
     Pair consecutive staves into grand staff systems (treble + bass).
     In a piano grand staff, staves come in pairs:
       - even index (0, 2, 4, ...) = treble
       - odd index (1, 3, 5, ...) = bass
-    
+
     Returns list of tuples: [(treble_system, bass_system), ...]
     """
     pairs = []
@@ -65,16 +92,16 @@ def pair_grand_staves(systems):
     while i + 1 < len(systems):
         treble = systems[i]
         bass = systems[i + 1]
-        
+
         gap_within = bass[0] - treble[4]
         treble_height = treble[4] - treble[0]
-        
+
         if gap_within < treble_height * 4:
             pairs.append((treble, bass))
             i += 2
         else:
             i += 1
-    
+
     return pairs
 
 
