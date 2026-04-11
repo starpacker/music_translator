@@ -638,6 +638,35 @@ def build_note_units(notes, music_symbols, binary, dy, single_staff=False):
                 if ring_fill < ring_threshold:
                     continue
 
+            # Multi-measure rest block filter. A multi-measure rest is drawn
+            # as a thick horizontal bar sitting on the middle staff line with
+            # a numeral (usually 2-8) centered above it. The numeral itself
+            # can pass the notehead template at low-to-mid score. Reject any
+            # detection that sits ABOVE the staff when a thick horizontal bar
+            # is present on the middle staff line directly below, AND the
+            # detection has a weak score (<0.9) — real notes above staff have
+            # strong scores.
+            if sys is not None and n.get('score', 1.0) < 0.9:
+                above_staff = cy < sys[0] - dy * 0.3
+                if above_staff:
+                    mid_y = int((sys[1] + sys[3]) / 2)
+                    bar_y1 = max(0, mid_y - max(3, int(dy * 0.5)))
+                    bar_y2 = min(music_symbols.shape[0],
+                                 mid_y + max(3, int(dy * 0.5)))
+                    bar_x1 = max(0, cx - int(dy * 6))
+                    bar_x2 = min(music_symbols.shape[1], cx + int(dy * 6))
+                    # Use binary (pre-staff-line-removal) because a thick
+                    # rest bar can be partially stripped along with staff
+                    # lines, leaving a weaker signal in music_symbols.
+                    # Distinguish a multi-rest block (thick bar, many rows
+                    # filled) from a normal staff line (1-2 rows filled).
+                    bar_region = binary[bar_y1:bar_y2, bar_x1:bar_x2]
+                    if bar_region.size > 0:
+                        row_fills = np.mean(bar_region > 127, axis=1)
+                        thick_rows = int(np.sum(row_fills > 0.75))
+                        if thick_rows >= max(4, int(dy * 0.3)):
+                            continue  # on top of multi-measure rest block
+
             # Beam artifact filter: beams near staff lines look like noteheads
             # but extend horizontally much further than a real notehead (~1.3*dy).
             # Measure horizontal run-length of filled pixels at the note center;
