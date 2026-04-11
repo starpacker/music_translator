@@ -28,7 +28,49 @@ from symbol_detection import (
     detect_rests,
     detect_tuplet_markers,
     detect_time_signature,
+    detect_time_signatures_along_system,
 )
+
+
+def _timesig_to_bpm(num, den):
+    """Convert a detected (num, den) time signature to beats-per-measure
+    expressed in quarter-note units (1.0 = 1 quarter note).
+    """
+    return num * (4.0 / den)
+
+
+def _build_system_timesig_anchors(binary, system, barlines, dy, current_bpm,
+                                   clef_roi_x1=None, clef_roi_x2=None):
+    """Build time-signature anchors for one staff system.
+
+    Returns (anchors, new_current_bpm) where anchors is a list of
+    (x_threshold, bpm) pairs suitable for passing to segment_into_measures
+    via timesig_anchors, and new_current_bpm is the bpm in effect at the
+    end of this system (to be inherited by the next system).
+    """
+    detections = detect_time_signatures_along_system(
+        binary, system, barlines, dy,
+        clef_roi_x1=clef_roi_x1, clef_roi_x2=clef_roi_x2)
+
+    if detections:
+        print(f"   [timesig] raw detections: " + ", ".join(
+            f"{d['source']}@x={d['x']:.0f} {d['num']}/{d['den']} "
+            f"score={d['score']:.2f}" for d in detections))
+
+    anchors = []
+    bpm = current_bpm
+    anchors.append((0.0, bpm))
+
+    for d in detections:
+        new_bpm = _timesig_to_bpm(d['num'], d['den'])
+        if d['source'] == 'clef':
+            anchors[0] = (0.0, new_bpm)
+            bpm = new_bpm
+        else:
+            anchors.append((d['x'], new_bpm))
+            bpm = new_bpm
+
+    return anchors, bpm
 from note_assignment import assign_notes_to_staves, filter_false_positive_notes
 from stem_tracking import track_stem
 from note_unit import build_note_units, segment_into_measures, merge_overlapping_note_units
@@ -189,7 +231,8 @@ def main(image_path):
     print("7. Detecting rests...")
     all_rests = detect_rests(binary, systems, dy)
     all_rests = [r for r in all_rests if r['x'] > int(img_w * 0.10)]
-    all_rests = _filter_rests(all_rests, barlines_per_pair, treble_notes + bass_notes, dy)
+    all_rests = _filter_rests(all_rests, barlines_per_pair, treble_notes + bass_notes, dy,
+                              music_symbols=music_symbols)
     print(f"   Found {len(all_rests)} rests (after filtering)")
 
     treble_rests, bass_rests = _split_rests_by_clef(all_rests, grand_staff_pairs)
@@ -213,6 +256,11 @@ def main(image_path):
     print("9. Grouping notes and formatting output...")
     pair_data = []
 
+    # Running bpm state — inherited across systems unless a new clef-area
+    # time sig is detected.
+    from config import CFG as _CFG
+    current_bpm = _CFG.duration.beats_per_measure
+
     for pair_idx, (treble_sys, bass_sys) in enumerate(grand_staff_pairs):
         pair_treble = [n for n in treble_notes if n.get('pair_idx') == pair_idx]
         pair_bass = [n for n in bass_notes if n.get('pair_idx') == pair_idx]
@@ -224,8 +272,15 @@ def main(image_path):
         treble_units = build_note_units(pair_treble, music_symbols, binary, dy)
         bass_units = build_note_units(pair_bass, music_symbols, binary, dy)
 
-        from config import CFG
-        bpm = CFG.duration.beats_per_measure
+        # Build per-system time-signature anchors. Scan treble (time sig
+        # is shared with bass in grand staff), and inherit current_bpm
+        # across systems.
+        anchors, current_bpm = _build_system_timesig_anchors(
+            binary, treble_sys, barlines, dy, current_bpm)
+        bpm = anchors[0][1]  # bpm at start of this system, for merge heuristics
+        if len(anchors) > 1 or anchors[0][1] != _CFG.duration.beats_per_measure:
+            print(f"   Grand staff {pair_idx}: timesig anchors = "
+                  f"{[(round(x,1), b) for x, b in anchors]}")
 
         treble_units = merge_overlapping_note_units(treble_units, beats_per_measure=bpm, dy=dy)
         bass_units = merge_overlapping_note_units(bass_units, beats_per_measure=bpm, dy=dy)
@@ -238,11 +293,13 @@ def main(image_path):
         treble_measures = segment_into_measures(treble_units, pair_t_rests, barlines, dy,
                                                 beats_per_measure=bpm,
                                                 is_first_system=is_first,
-                                                tuplet_markers=pair_treble_markers)
+                                                tuplet_markers=pair_treble_markers,
+                                                timesig_anchors=anchors)
         bass_measures = segment_into_measures(bass_units, pair_b_rests, barlines, dy,
                                               beats_per_measure=bpm,
                                               is_first_system=is_first,
-                                              tuplet_markers=pair_bass_markers)
+                                              tuplet_markers=pair_bass_markers,
+                                              timesig_anchors=anchors)
 
         # Strip leading empty measures for lines 2+ (clef/key-sig area before first barline)
         if pair_idx >= 1:
@@ -258,6 +315,7 @@ def main(image_path):
             'treble_sys': treble_sys,
             'bass_sys': bass_sys,
             'pair_idx': pair_idx,
+            'timesig_anchors': anchors,
         })
         print(f"   Grand staff {pair_idx + 1}: "
               f"{len(treble_measures)} treble measures, {len(bass_measures)} bass measures")
@@ -700,6 +758,11 @@ def _main_single_staff(image_path, systems, staff_lines, music_symbols, binary, 
         )
         if not has_nearby:
             filtered_rests.append(rest)
+    # Block-rest validation: stop_1/stop_2 templates include staff lines, so
+    # verify each match actually has a rest block on the staff-lines-removed
+    # image.
+    filtered_rests = [r for r in filtered_rests
+                      if _validate_block_rest(music_symbols, r, dy)]
     all_rests = filtered_rests
     print(f"   Found {len(all_rests)} rests")
 
@@ -737,7 +800,7 @@ def _main_single_staff(image_path, systems, staff_lines, music_symbols, binary, 
 
     # ── 9. Build Note Units & Segment Measures ──
     print("9. Building note units and segmenting measures...")
-    bpm = CFG.duration.beats_per_measure
+    current_bpm = CFG.duration.beats_per_measure
     staff_data = []
 
     for si, sys_info in enumerate(systems):
@@ -748,11 +811,12 @@ def _main_single_staff(image_path, systems, staff_lines, music_symbols, binary, 
         units = build_note_units(notes, music_symbols, binary, dy, single_staff=True)
         # No merge_overlapping for single-staff (no two-voice)
 
-        # Debug: uncomment to inspect a specific staff (0-indexed)
-        # if si == 3:
-        #     for ui, u in enumerate(units):
-        #         nn = u['notes']
-        #         print(f"   [DBG] u{ui}: x={u['x']:.0f} idur={[n.get('individual_duration') for n in nn]}")
+        anchors, current_bpm = _build_system_timesig_anchors(
+            binary, sys_info, barlines, dy, current_bpm)
+        bpm = anchors[0][1]
+        if len(anchors) > 1 or anchors[0][1] != CFG.duration.beats_per_measure:
+            print(f"   Staff {si + 1}: timesig anchors = "
+                  f"{[(round(x,1), b) for x, b in anchors]}")
 
         is_first = (si == 0)
         staff_tuplets = [m for m in tuplet_markers
@@ -760,7 +824,8 @@ def _main_single_staff(image_path, systems, staff_lines, music_symbols, binary, 
         measures = segment_into_measures(units, rests, barlines, dy,
                                           beats_per_measure=bpm,
                                           is_first_system=is_first,
-                                          tuplet_markers=staff_tuplets)
+                                          tuplet_markers=staff_tuplets,
+                                          timesig_anchors=anchors)
 
         # Strip leading empty measures for lines 2+
         if si >= 1:
@@ -772,6 +837,7 @@ def _main_single_staff(image_path, systems, staff_lines, music_symbols, binary, 
             'barlines': barlines,
             'system': sys_info,
             'staff_idx': si,
+            'timesig_anchors': anchors,
         })
         print(f"   Staff {si + 1}: {len(measures)} measures")
 
@@ -807,6 +873,20 @@ def _print_and_save_single_staff_output(staff_data, accidentals_map, dy):
             f.write(f"{line}\n\n")
         f.write("=" * 60 + "\n")
     print("\n   Saved text: output_jianpu.txt")
+
+    # Confidence report
+    from confidence import format_confidence_report
+    from config import CFG
+    staff_measures = [(f"第{i + 1}行", sd['measures'])
+                      for i, sd in enumerate(staff_data)]
+    staff_anchors = [sd.get('timesig_anchors') for sd in staff_data]
+    report = format_confidence_report(staff_measures, accidentals_map,
+                                      beats_per_measure=CFG.duration.beats_per_measure,
+                                      dy=dy,
+                                      staff_anchors=staff_anchors)
+    with open("output_confidence.txt", "w", encoding="utf-8") as f:
+        f.write(report)
+    print("   Saved confidence: output_confidence.txt")
 
 
 def _generate_single_staff_annotated(image_path, staff_data, accidentals_map, dy):
@@ -1027,7 +1107,44 @@ def _merge_barlines(treble_bl, bass_bl, dy, binary=None,
     return filtered
 
 
-def _filter_rests(all_rests, barlines_per_pair, all_notes, dy):
+def _validate_block_rest(music_symbols, rest, dy):
+    """Verify a half/whole rest match actually contains a rest block.
+
+    The stop_1/stop_2 templates include surrounding staff lines, so template
+    matching can score high anywhere along the middle staff line. We confirm
+    a real match by sampling the expected rest-block position in the
+    staff-lines-removed image: a genuine block is an opaque rectangle, a
+    false positive shows nothing.
+    """
+    # Block y-offset from match center (the template center aligns with the
+    # staff middle line). stop_2 (half) sits on the middle line; stop_1
+    # (whole) hangs above it, farther from center.
+    if rest['type'] == 'stop_2.jpg':
+        block_dy_offset = -0.15
+    elif rest['type'] == 'stop_1.jpg':
+        block_dy_offset = -0.55
+    else:
+        return True
+
+    cx = int(rest['x'])
+    cy = int(rest['y_center'] + block_dy_offset * dy)
+    half_h = max(2, int(0.25 * dy))
+    half_w = max(3, int(0.55 * dy))
+
+    h, w = music_symbols.shape
+    y1 = max(0, cy - half_h)
+    y2 = min(h, cy + half_h)
+    x1 = max(0, cx - half_w)
+    x2 = min(w, cx + half_w)
+    if y2 <= y1 or x2 <= x1:
+        return False
+
+    roi = music_symbols[y1:y2, x1:x2]
+    fill = float((roi > 127).sum()) / float(roi.size)
+    return fill >= 0.35
+
+
+def _filter_rests(all_rests, barlines_per_pair, all_notes, dy, music_symbols=None):
     """Filter rests near barlines and overlapping with notes."""
     # Remove rests near barlines
     filtered = []
@@ -1042,18 +1159,26 @@ def _filter_rests(all_rests, barlines_per_pair, all_notes, dy):
                 continue
         filtered.append(rest)
 
-    # Remove rests overlapping with notes
+    # Remove rests overlapping with notes. Dense beamed runs (e.g. eight
+    # 16ths in one measure) leave narrow gaps between noteheads where rest
+    # templates can false-match; the wider x-proximity catches those.
     result = []
     for rest in filtered:
         rest_pair_idx = rest['system_idx'] // 2
         has_nearby = any(
             note.get('pair_idx', -1) == rest_pair_idx
-            and abs(rest['x'] - note['x']) < dy * 1.5
-            and abs(rest['y_center'] - note['y_center']) < dy * 2.0
+            and abs(rest['x'] - note['x']) < dy * 2.5
+            and abs(rest['y_center'] - note['y_center']) < dy * 2.5
             for note in all_notes
         )
         if not has_nearby:
             result.append(rest)
+
+    # Block-rest validation: stop_1/stop_2 templates include staff lines and
+    # match along the middle line even without a block. Verify on the
+    # staff-lines-removed image.
+    if music_symbols is not None:
+        result = [r for r in result if _validate_block_rest(music_symbols, r, dy)]
 
     return result
 
@@ -1118,6 +1243,24 @@ def _print_and_save_output(pair_data, accidentals_map, dy):
         for line in all_bass_lines:
             f.write(line + "\n")
     print("\n   Saved text: output_jianpu.txt")
+
+    # Confidence report
+    from confidence import format_confidence_report
+    from config import CFG
+    staff_measures = []
+    staff_anchors = []
+    for pi, pd in enumerate(pair_data):
+        staff_measures.append((f"第{pi + 1}行 高音", pd['treble_measures']))
+        staff_measures.append((f"第{pi + 1}行 低音", pd['bass_measures']))
+        staff_anchors.append(pd.get('timesig_anchors'))
+        staff_anchors.append(pd.get('timesig_anchors'))
+    report = format_confidence_report(staff_measures, accidentals_map,
+                                      beats_per_measure=CFG.duration.beats_per_measure,
+                                      dy=dy,
+                                      staff_anchors=staff_anchors)
+    with open("output_confidence.txt", "w", encoding="utf-8") as f:
+        f.write(report)
+    print("   Saved confidence: output_confidence.txt")
 
 
 # ============================================================

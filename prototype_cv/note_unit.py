@@ -785,6 +785,7 @@ def build_note_units(notes, music_symbols, binary, dy, single_staff=False):
                 'stem_dir': n['stem']['stem_dir'],
                 'beam_count': n.get('beam_count', -1),
                 'has_flag': n.get('has_flag', False),
+                'score': n.get('score', 0.0),
             })
 
         # Detect duration
@@ -921,9 +922,30 @@ def merge_overlapping_note_units(note_units, beats_per_measure=2.0, dy=21.0):
     return units
 
 
+def _resolve_measure_bpm(measure, default_bpm, timesig_anchors):
+    """Pick the applicable bpm for a measure based on its leftmost event x.
+
+    timesig_anchors: list of (x_threshold, bpm) sorted by x. The anchor
+    with the largest x_threshold <= measure's min_x applies. If no anchor
+    applies, falls back to default_bpm.
+    """
+    if not timesig_anchors:
+        return default_bpm
+    if not measure:
+        return default_bpm
+    min_x = min(e['x'] for e in measure)
+    applicable = default_bpm
+    for x_thr, bpm in timesig_anchors:
+        if x_thr <= min_x + 1:
+            applicable = bpm
+        else:
+            break
+    return applicable
+
+
 def segment_into_measures(note_units, rests, barline_xs, dy,
                           beats_per_measure=2.0, is_first_system=True,
-                          tuplet_markers=None):
+                          tuplet_markers=None, timesig_anchors=None):
     """
     Segment NoteUnits and rests into measures by barline x-positions.
 
@@ -1023,16 +1045,23 @@ def segment_into_measures(note_units, rests, barline_xs, dy,
     while measures and not measures[-1]:
         measures.pop()
 
+    # Resolve per-measure bpm from time-signature anchors
+    measure_bpms = [
+        _resolve_measure_bpm(m, beats_per_measure, timesig_anchors)
+        for m in measures
+    ]
+
     # Estimate durations using proportional spacing
     for mi, measure in enumerate(measures):
-        _estimate_durations_in_measure(measure, beats_per_measure=beats_per_measure,
+        _estimate_durations_in_measure(measure, beats_per_measure=measure_bpms[mi],
                                        measure_idx=mi, barline_xs=sorted_barlines,
                                        is_first_system=is_first_system)
 
     # Apply tuplet markers: each marker indicates N notes near its x-position
     # should have duration 1/6 (tuplet subdivision).
     if tuplet_markers:
-        _apply_tuplet_markers(measures, tuplet_markers, beats_per_measure, dy=dy)
+        _apply_tuplet_markers(measures, tuplet_markers, measure_bpms, dy=dy,
+                              barline_xs=sorted_barlines)
 
     # Post-processing: if a measure has a whole note (duration >= 3.5),
     # remove all rests — the whole note fills the measure.
@@ -1050,13 +1079,14 @@ def segment_into_measures(note_units, rests, barline_xs, dy,
     #    individual rests to fill the gap exactly.
     # 2. If that fails, try distributing remaining beats equally.
     # 3. Keep whichever approach is closest to beats_per_measure.
-    for measure in measures:
+    for mi_r, measure in enumerate(measures):
+        m_bpm = measure_bpms[mi_r] if mi_r < len(measure_bpms) else beats_per_measure
         note_events = [e for e in measure if e['type'] == 'note_unit']
         rest_events = [e for e in measure if e['type'] == 'rest']
         if not rest_events:
             continue
         note_beats = sum(e['unit']['duration'] for e in note_events)
-        remaining = beats_per_measure - note_beats
+        remaining = m_bpm - note_beats
         if remaining <= 0:
             continue
 
@@ -1070,17 +1100,26 @@ def segment_into_measures(note_units, rests, barline_xs, dy,
         # spacing heuristic: longer rests occupy more x-distance).
         gap = remaining - detected_total
         best_durs = list(detected_durs)
-        if 0 < gap <= 2.0:
-            # Compute x-span for each rest: distance to next event
+        if 0 < gap <= 3.5:
+            # Compute x-span for each rest: distance to next event.
+            # For the rightmost rest in a measure, the next "event" is
+            # the right barline — so include barline_xs fallback.
+            right_bl = None
+            if sorted_barlines:
+                for bx in sorted_barlines:
+                    if bx > max(e['x'] for e in measure):
+                        right_bl = bx
+                        break
             rest_spans = []
             for ri, re_ in enumerate(rest_events):
                 rx = re_['x']
-                # Find next event after this rest in the full measure
                 next_x = None
                 for e in measure:
                     if e['x'] > rx + 1:
                         next_x = e['x']
                         break
+                if next_x is None and right_bl is not None:
+                    next_x = right_bl
                 span = (next_x - rx) if next_x else 0
                 rest_spans.append(span)
             # Sort by (duration, -span): smallest duration first,
@@ -1092,8 +1131,15 @@ def segment_into_measures(note_units, rests, barline_xs, dy,
             for idx in indices:
                 if gap_left <= 0.01:
                     break
-                upgrade = min(gap_left, trial[idx])  # at most double
-                trial[idx] = _snap_duration(trial[idx] + upgrade)
+                # Upgrade to the largest standard duration that fits the
+                # remaining gap. Allows 0.5 → 2.0 jumps when one rest was
+                # detected as eighth but is actually a half rest.
+                target = trial[idx] + gap_left
+                candidates = [d for d in STANDARD_DURATIONS
+                              if trial[idx] < d <= target + 0.01]
+                if not candidates:
+                    continue
+                trial[idx] = max(candidates)
                 gap_left = remaining - sum(trial)
             if abs(sum(trial) - remaining) < abs(detected_total - remaining):
                 best_durs = trial
@@ -1114,7 +1160,8 @@ def segment_into_measures(note_units, rests, barline_xs, dy,
     return measures
 
 
-def _apply_tuplet_markers(measures, tuplet_markers, beats_per_measure, dy=21.0):
+def _apply_tuplet_markers(measures, tuplet_markers, beats_per_measure_or_list,
+                          dy=21.0, barline_xs=None):
     """Apply detected tuplet markers to override note durations.
 
     The actual tuplet duration = base_duration × 2/3, where base_duration
@@ -1128,59 +1175,94 @@ def _apply_tuplet_markers(measures, tuplet_markers, beats_per_measure, dy=21.0):
     """
     search_margin = dy * 2.5
 
+    # Precompute each measure's note-x range once.
+    measure_ranges = []
+    for measure in measures:
+        note_events = [e for e in measure if e['type'] == 'note_unit']
+        if not note_events:
+            measure_ranges.append(None)
+            continue
+        xs = [e['x'] for e in note_events]
+        measure_ranges.append((min(xs), max(xs)))
+
+    # Derive per-measure [left, right] boundaries from note spans.
+    # Between adjacent non-empty measures i, i+1 the boundary is the
+    # midpoint of (max_xs_i, min_xs_{i+1}). This handles marker positions
+    # that sit visually between measures (beyond the last note of M_i
+    # but before the first note of M_{i+1}), which the raw min-max
+    # containment test binds incorrectly.
+    boundaries = []
+    prev_max = -float('inf')
+    for i, rng in enumerate(measure_ranges):
+        if rng is None:
+            boundaries.append(None)
+            continue
+        # Find next non-None
+        nxt = None
+        for j in range(i + 1, len(measure_ranges)):
+            if measure_ranges[j] is not None:
+                nxt = measure_ranges[j]
+                break
+        left = (prev_max + rng[0]) / 2.0 if prev_max > -float('inf') else -float('inf')
+        right = (rng[1] + nxt[0]) / 2.0 if nxt is not None else float('inf')
+        boundaries.append((left, right))
+        prev_max = rng[1]
+
+    # Group markers by best_mi so multiple markers within one measure
+    # are applied collectively — otherwise later markers' leftover pass
+    # overwrites earlier markers' tuplet assignments.
+    from collections import defaultdict
+    markers_by_measure = defaultdict(list)
     for marker in tuplet_markers:
         mx = marker['x']
-        n = marker['n']
-
-        # Find which measure this marker belongs to (by x position)
         best_mi = None
-        for mi, measure in enumerate(measures):
-            note_events = [e for e in measure if e['type'] == 'note_unit']
-            if not note_events:
+        for mi, bnd in enumerate(boundaries):
+            if bnd is None:
                 continue
-            xs = [e['x'] for e in note_events]
-            if min(xs) - search_margin <= mx <= max(xs) + search_margin:
+            lo, hi = bnd
+            if lo <= mx < hi:
                 best_mi = mi
                 break
-
         if best_mi is None:
             continue
+        markers_by_measure[best_mi].append(marker)
 
-        measure = measures[best_mi]
-        note_events = [e for e in measure if e['type'] == 'note_unit']
-
-        # Find N contiguous events nearest to the marker x.
-        # First find the anchor (closest event), then expand to N contiguous.
-        candidates = [e for e in note_events if len(e['unit']['notes']) == 1]
-        if len(candidates) < n:
-            candidates = list(note_events)
-        candidates.sort(key=lambda e: e['x'])
-
-        if len(candidates) <= n:
-            tuplet_group = candidates
-        else:
-            # Find anchor index (closest to marker x)
-            anchor = min(range(len(candidates)),
-                         key=lambda i: abs(candidates[i]['x'] - mx))
-            # Expand window around anchor to pick N contiguous events
+    def _build_tuplet_union(m_markers, pool):
+        """Given a list of markers and an event pool, return union of each
+        marker's local N-note contiguous group (anchored nearest mx)."""
+        pool = sorted(pool, key=lambda e: e['x'])
+        ids = set()
+        for mk in m_markers:
+            n = mk['n']
+            mx = mk['x']
+            if len(pool) <= n:
+                for e in pool:
+                    ids.add(id(e))
+                continue
+            anchor = min(range(len(pool)), key=lambda i: abs(pool[i]['x'] - mx))
             best_start = max(0, anchor - n + 1)
-            best_end = min(len(candidates), best_start + n)
+            best_end = min(len(pool), best_start + n)
             if best_end - best_start < n:
                 best_start = best_end - n
-            # Among all valid windows containing the anchor, pick the one
-            # whose center is closest to marker x
             best_dist = float('inf')
-            for s in range(max(0, anchor - n + 1), min(anchor + 1, len(candidates) - n + 1)):
-                window = candidates[s:s + n]
+            for s in range(max(0, anchor - n + 1),
+                           min(anchor + 1, len(pool) - n + 1)):
+                window = pool[s:s + n]
                 center = sum(e['x'] for e in window) / n
                 d = abs(center - mx)
                 if d < best_dist:
                     best_dist = d
                     best_start = s
-            tuplet_group = candidates[best_start:best_start + n]
+            for e in pool[best_start:best_start + n]:
+                ids.add(id(e))
+        return ids
 
-        # Determine base duration from beam detection.
-        # Use the mode (most common) individual_duration across the group.
+    def _apply_interpretation(measure, note_events, tuplet_ids, beats_per_measure):
+        """Apply a tuplet_ids interpretation. Returns resulting beat sum."""
+        tuplet_group = [e for e in note_events if id(e) in tuplet_ids]
+        if not tuplet_group:
+            return None
+        n_total = len(tuplet_group)
         idurs = []
         for e in tuplet_group:
             for note in e['unit']['notes']:
@@ -1190,30 +1272,22 @@ def _apply_tuplet_markers(measures, tuplet_markers, beats_per_measure, dy=21.0):
             base_dur = Counter(idurs).most_common(1)[0][0]
         else:
             base_dur = 0.25
-
-        # Tuplet actual duration = base × 2/3
         tuplet_dur = base_dur * 2.0 / 3.0
 
-        # Validate: tuplet + remaining notes must fit in the measure.
-        # Each remaining note needs at least 0.25 beats (sixteenth).
-        # If beam detection over-estimated the base, halve and retry.
-        tuplet_ids = {id(e) for e in tuplet_group}
         remaining = [e for e in note_events if id(e) not in tuplet_ids]
         rest_beats = sum(e.get('duration', 1.0) for e in measure if e['type'] == 'rest')
         min_remaining = len(remaining) * 0.25
 
-        while (tuplet_dur * n + min_remaining + rest_beats
+        while (tuplet_dur * n_total + min_remaining + rest_beats
                > beats_per_measure + 0.1 and base_dur > 0.125):
             base_dur *= 0.5
             tuplet_dur = base_dur * 2.0 / 3.0
 
         for e in tuplet_group:
             e['unit']['duration'] = tuplet_dur
+            e['duration_source'] = 'tuplet'
 
-        # Re-estimate durations for remaining (non-tuplet) events.
-        # Equal division: spacing-based proportions are unreliable here since
-        # tuplet notes' spacing was mixed in during the initial estimate.
-        tuplet_beats_total = tuplet_dur * n
+        tuplet_beats_total = tuplet_dur * n_total
         leftover = max(0.25, beats_per_measure - tuplet_beats_total - rest_beats)
 
         if remaining:
@@ -1221,6 +1295,64 @@ def _apply_tuplet_markers(measures, tuplet_markers, beats_per_measure, dy=21.0):
             snapped = _snap_duration(per_note)
             for e in remaining:
                 e['unit']['duration'] = snapped
+                e['duration_source'] = 'tuplet_leftover'
+        total = sum(e['unit']['duration'] for e in note_events) + rest_beats
+        return total
+
+    for best_mi, m_markers in markers_by_measure.items():
+        if isinstance(beats_per_measure_or_list, (list, tuple)):
+            beats_per_measure = (beats_per_measure_or_list[best_mi]
+                                 if best_mi < len(beats_per_measure_or_list)
+                                 else 2.0)
+        else:
+            beats_per_measure = beats_per_measure_or_list
+        measure = measures[best_mi]
+        note_events = [e for e in measure if e['type'] == 'note_unit']
+        if not note_events:
+            continue
+
+        singles_pool = [e for e in note_events if len(e['unit']['notes']) == 1]
+        full_pool = list(note_events)
+
+        # Interpretation A: tuplet covers only single-note events.
+        # Interpretation B: tuplet covers all events (singles + chords).
+        # Pick whichever yields a beat sum closer to beats_per_measure.
+        saved = [(e, e['unit'].get('duration'), e.get('duration_source'))
+                 for e in note_events]
+
+        interp_results = []
+        for label, pool in (('singles', singles_pool), ('full', full_pool)):
+            if not pool:
+                continue
+            # Restore baseline
+            for e, d, src in saved:
+                e['unit']['duration'] = d
+                if src is None:
+                    e.pop('duration_source', None)
+                else:
+                    e['duration_source'] = src
+            ids = _build_tuplet_union(m_markers, pool)
+            if not ids:
+                continue
+            total = _apply_interpretation(measure, note_events, ids,
+                                          beats_per_measure)
+            if total is None:
+                continue
+            interp_results.append((abs(total - beats_per_measure), label, ids, total))
+
+        if not interp_results:
+            continue
+        interp_results.sort(key=lambda t: t[0])
+        _, _, winning_ids, _ = interp_results[0]
+        # Restore and re-apply winning interpretation
+        for e, d, src in saved:
+            e['unit']['duration'] = d
+            if src is None:
+                e.pop('duration_source', None)
+            else:
+                e['duration_source'] = src
+        _apply_interpretation(measure, note_events, winning_ids,
+                              beats_per_measure)
 
 
 # ============================================================
@@ -1257,7 +1389,8 @@ def _estimate_durations_in_measure(measure, beats_per_measure=2.0, measure_idx=0
         if first_barline > 0 and all(x > first_barline * 0.4 for x in event_xs):
             for e in note_events:
                 e['unit']['duration'] = 0.5
-            measure.insert(0, {'type': 'rest', 'x': 0, 'duration': 1.0})
+                e['duration_source'] = 'pickup'
+            measure.insert(0, {'type': 'rest', 'x': 0, 'duration': 1.0, 'duration_source': 'pickup'})
             return
 
     rest_beats = sum(e.get('duration', 1.0) for e in rest_events)
@@ -1272,9 +1405,11 @@ def _estimate_durations_in_measure(measure, beats_per_measure=2.0, measure_idx=0
         if idur >= 2.0 or (idur < 1.0 and rest_beats > 0):
             # Trust beam detection: whole/half notes, or short notes with rests
             note_events[0]['unit']['duration'] = idur
+            note_events[0]['duration_source'] = 'whole' if idur >= 2.0 else 'beam'
         else:
             dur = _snap_duration(remaining)
             note_events[0]['unit']['duration'] = dur
+            note_events[0]['duration_source'] = 'single_fill'
         return
 
     # --- Beam-first approach (for longer measures where spacing is unreliable) ---
@@ -1299,6 +1434,22 @@ def _estimate_durations_in_measure(measure, beats_per_measure=2.0, measure_idx=0
     # (due to missing notes or wrong barlines).
     # For 2/4 time, proportional spacing is well-tuned, so keep it.
     if beats_per_measure > 2.5:
+        beam_durs_original = list(beam_durs)
+
+        # Uniform-upgrade rescue: if every short note can be lifted so the
+        # measure sums cleanly to a standard per-note target, do that
+        # before the gap-based heuristics. Handles the common case where
+        # a whole group was mis-detected shorter (e.g. 3 quarters all
+        # read as eighths in 3/4, or mix quarter/eighth read where all
+        # should be quarters in 4/4).
+        if beam_note_total + rest_beats < beats_per_measure - 0.1 and n >= 2:
+            target_per_note = (beats_per_measure - rest_beats) / n
+            if target_per_note in STANDARD_DURATIONS:
+                if all(d <= target_per_note + 1e-6 for d in beam_durs) and \
+                        any(d < target_per_note - 1e-6 for d in beam_durs):
+                    beam_durs = [target_per_note] * n
+                    beam_note_total = sum(beam_durs)
+
         # If beam total < beats_per_measure, some notes may need longer
         # durations. Use proportional spacing to identify which notes
         # have wider gaps (= longer duration).
@@ -1336,6 +1487,19 @@ def _estimate_durations_in_measure(measure, beats_per_measure=2.0, measure_idx=0
                         old = beam_durs[idx]
                         beam_durs[idx] = min(old * 2, 1.0)
                         deficit -= (beam_durs[idx] - old)
+
+                # Final fallback: deficit ~ 0.5 and eighths remain. Upgrade
+                # the eighth with the widest gap to a quarter. Catches
+                # patterns where one eighth is actually a quarter but
+                # all gaps are near-uniform so 1.25× median doesn't fire.
+                if 0.4 <= deficit <= 0.6:
+                    e_cands = [(i, gaps[i]) for i in range(n)
+                               if beam_durs[i] == 0.5]
+                    if e_cands:
+                        e_cands.sort(key=lambda t: -t[1])
+                        idx = e_cands[0][0]
+                        beam_durs[idx] = 1.0
+                        deficit -= 0.5
 
         # If beam total > beats_per_measure, some notes may have been
         # mis-detected as quarter when they should be eighth (beam not
@@ -1384,8 +1548,44 @@ def _estimate_durations_in_measure(measure, beats_per_measure=2.0, measure_idx=0
                     beam_durs[si] = 0.5
                     surplus -= 0.25
 
+            # Lone-sixteenth pair: if surplus ≈ 0.25 and there's exactly
+            # one sixteenth plus an adjacent eighth, demote the adjacent
+            # eighth to sixteenth so the pair reads as two beamed
+            # sixteenths (net -0.25). Happens when one note in a
+            # sixteenth pair was under-counted as an eighth.
+            if 0.2 <= surplus <= 0.3:
+                s_idxs = [i for i in range(n) if beam_durs[i] == 0.25]
+                e_idxs = [i for i in range(n) if beam_durs[i] == 0.5]
+                if len(s_idxs) == 1 and e_idxs:
+                    si = s_idxs[0]
+                    neighbors = [i for i in (si - 1, si + 1)
+                                 if 0 <= i < n and beam_durs[i] == 0.5]
+                    if neighbors:
+                        # Prefer neighbor with narrower gap to the sixteenth
+                        def _gap_to_s(i):
+                            return abs(xs[i] - xs[si])
+                        ni = min(neighbors, key=_gap_to_s)
+                        beam_durs[ni] = 0.25
+                        surplus -= 0.25
+
+            # Dot-removal: if surplus ≈ 0.25 and a dotted-eighth (0.75) exists,
+            # undot it to 0.5. Handles false-positive dot detection on a
+            # measure that is otherwise correct.
+            if 0.2 <= surplus <= 0.3:
+                de_idxs = [i for i in range(n) if beam_durs[i] == 0.75]
+                if de_idxs:
+                    # Prefer the dotted-eighth with the narrowest gap
+                    # (least evidence for the dot extension)
+                    di = min(de_idxs, key=lambda i: gaps_r[i])
+                    beam_durs[di] = 0.5
+                    surplus -= 0.25
+
         for i, e in enumerate(note_events):
             e['unit']['duration'] = beam_durs[i]
+            if beam_durs[i] != beam_durs_original[i]:
+                e['duration_source'] = 'beam_rescue'
+            else:
+                e['duration_source'] = 'beam'
         return
 
     # --- Fallback: proportional spacing ---
@@ -1396,6 +1596,7 @@ def _estimate_durations_in_measure(measure, beats_per_measure=2.0, measure_idx=0
         dur = _snap_duration(remaining / n)
         for e in note_events:
             e['unit']['duration'] = dur
+            e['duration_source'] = 'proportional_uniform'
         return
 
     last_x = xs[-1]
@@ -1419,5 +1620,64 @@ def _estimate_durations_in_measure(measure, beats_per_measure=2.0, measure_idx=0
         max_idx = max(range(n), key=lambda i: gaps[i])
         snapped[max_idx] = _snap_duration(snapped[max_idx] + diff)
 
+    # Post-process: when proportional spacing yields dotted values (0.75,
+    # 1.5, 3.0) for 2/4 time, try to decompose into non-dotted standard
+    # durations using beam-detection idurs as a tiebreaker. A dotted run
+    # like [0.75, 0.75] is almost always a quarter+eighth or eighth+quarter
+    # pair — the gap spacing alone can't tell which, so we defer to beam
+    # evidence (which notehead's stem reports a plain quarter reading).
+    if any(d in (0.75, 1.5, 3.0) for d in snapped) and abs(sum(snapped) - remaining) < 0.1:
+        non_dotted = [0.25, 0.5, 1.0, 2.0]
+        # Collect beam evidence: for each note, what idurs does it report?
+        idurs_per_note = []
+        for e in note_events:
+            idurs = [ne.get('individual_duration', 1.0)
+                     for ne in e['unit']['notes']]
+            idurs_per_note.append(idurs)
+
+        def _combo_score(combo):
+            # Lower = better. Error vs raw + beam-mismatch penalty.
+            err = sum((combo[i] - raw[i]) ** 2 for i in range(n))
+            penalty = 0.0
+            for i, d in enumerate(combo):
+                if idurs_per_note[i] and d not in idurs_per_note[i]:
+                    # Combo assigns a duration not supported by this note's
+                    # beam detection — small penalty.
+                    penalty += 0.05
+            return err + penalty
+
+        # Enumerate combinations of non-dotted values summing to remaining
+        best_combo = None
+        best_score = float('inf')
+
+        def _search(idx, current, acc):
+            nonlocal best_combo, best_score
+            if idx == n:
+                if abs(acc - remaining) < 0.01:
+                    s = _combo_score(current)
+                    if s < best_score:
+                        best_score = s
+                        best_combo = list(current)
+                return
+            for v in non_dotted:
+                if acc + v > remaining + 0.01:
+                    continue
+                current.append(v)
+                _search(idx + 1, current, acc + v)
+                current.pop()
+
+        _search(0, [], 0.0)
+        if best_combo is not None:
+            snapped = best_combo
+            _dotted_decomposed = True
+        else:
+            _dotted_decomposed = False
+    else:
+        _dotted_decomposed = False
+
     for i, e in enumerate(note_events):
         e['unit']['duration'] = snapped[i]
+        if _dotted_decomposed:
+            e['duration_source'] = 'proportional_dotted_decomposed'
+        else:
+            e['duration_source'] = 'proportional'

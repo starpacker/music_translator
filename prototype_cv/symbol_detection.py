@@ -676,10 +676,22 @@ def detect_rests(binary_img, staff_systems, dy):
 
 
 def _nms_rests(rests, min_dist_x, min_dist_y=None):
-    """Remove duplicate rest detections."""
+    """Remove duplicate rest detections.
+
+    stop_1/stop_2 templates include staff-line context, inflating their
+    correlation scores. Give priority to stop_4/stop_8 (block-only
+    templates): in type-priority tier first, then by score.
+    """
     if min_dist_y is None:
         min_dist_y = min_dist_x * 4
-    sorted_rests = sorted(rests, key=lambda r: r['score'], reverse=True)
+
+    def _priority(r):
+        t = r.get('type', '')
+        if t in ('stop_4.jpg', 'stop_8.jpg'):
+            return 0  # higher priority
+        return 1  # stop_1/stop_2 — lower priority due to staff-line inflation
+
+    sorted_rests = sorted(rests, key=lambda r: (_priority(r), -r['score']))
     kept = []
     for r in sorted_rests:
         too_close = False
@@ -782,20 +794,14 @@ def detect_tuplet_markers(grayscale_img, grand_staff_pairs, dy, clef_boundaries=
     return kept
 
 
-def detect_time_signature(binary_img, staff_system, dy):
-    """Auto-detect time signature from the first staff system.
+_TIMESIG_TEMPLATE_CACHE = None
 
-    Matches time-signature templates (number_N_D format) against the clef
-    area. Returns (numerator, denominator) or None if not detected.
-    """
-    staff_height = staff_system[4] - staff_system[0]
-    img_w = binary_img.shape[1]
 
-    roi_x1 = int(img_w * 0.08)
-    roi_x2 = int(img_w * 0.22)
-    roi = binary_img[staff_system[0]:staff_system[4], roi_x1:roi_x2]
-    if roi.size == 0:
-        return None
+def _load_timesig_templates():
+    """Load and cache binarized time-signature templates keyed by (num, den)."""
+    global _TIMESIG_TEMPLATE_CACHE
+    if _TIMESIG_TEMPLATE_CACHE is not None:
+        return _TIMESIG_TEMPLATE_CACHE
 
     templates = {}
     for ext in ['*.jpg', '*.png']:
@@ -811,15 +817,28 @@ def detect_time_signature(binary_img, staff_system, dy):
                     continue
                 img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
                 if img is not None:
-                    _, bimg = cv2.threshold(img, 128, 255,
-                                            cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
+                    _, bimg = cv2.threshold(
+                        img, 128, 255,
+                        cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
                     templates[(num, den)] = bimg
+    _TIMESIG_TEMPLATE_CACHE = templates
+    return templates
 
+
+def _match_timesig_in_roi(roi, staff_height, min_score=0.50):
+    """Match timesig templates against ROI. Return ((num, den), score) or None.
+
+    min_score is the floor — anything below is rejected. Returns the
+    best-scoring template above the floor.
+    """
+    if roi is None or roi.size == 0:
+        return None
+    templates = _load_timesig_templates()
     if not templates:
         return None
 
     best_match = None
-    best_score = 0.45
+    best_score = min_score
 
     for (num, den), template in templates.items():
         th, tw = template.shape
@@ -829,13 +848,169 @@ def detect_time_signature(binary_img, staff_system, dy):
             new_w = max(5, int(tw * ideal_scale * f))
             if new_h >= roi.shape[0] or new_w >= roi.shape[1]:
                 continue
-            resized = cv2.resize(template, (new_w, new_h), interpolation=cv2.INTER_AREA)
+            resized = cv2.resize(template, (new_w, new_h),
+                                 interpolation=cv2.INTER_AREA)
             res = cv2.matchTemplate(roi, resized, cv2.TM_CCOEFF_NORMED)
             max_val = float(np.max(res)) if res.size > 0 else 0
             if max_val > best_score:
                 best_score = max_val
                 best_match = (num, den)
 
-    return best_match
+    if best_match is None:
+        return None
+    return (best_match, best_score)
+
+
+def _scan_timesigs_full_line(binary_img, staff_system, dy, x1, x2,
+                             min_score=0.70, nms_dy=1.5):
+    """Scan a horizontal range of one staff for time-signature matches.
+
+    Returns list of dicts [{'x': abs_x_of_match_left, 'num': n, 'den': d,
+    'score': s}, ...] sorted by x, with NMS applied so nearby hits are
+    collapsed to the single best.
+
+    Unlike the per-ROI matcher, this one reports the x-position of each
+    match so callers can snap to the nearest barline.
+    """
+    templates = _load_timesig_templates()
+    if not templates:
+        return []
+
+    staff_height = staff_system[4] - staff_system[0]
+    y1 = max(0, staff_system[0] - int(dy * 0.5))
+    y2 = min(binary_img.shape[0], staff_system[4] + int(dy * 0.5))
+    x1 = max(0, int(x1))
+    x2 = min(binary_img.shape[1], int(x2))
+    if x2 - x1 < 10:
+        return []
+    roi = binary_img[y1:y2, x1:x2]
+    roi_h, roi_w = roi.shape
+
+    raw = []  # (abs_x, num, den, score)
+    for (num, den), template in templates.items():
+        th, tw = template.shape
+        ideal_scale = staff_height / th if th > 0 else 1.0
+        for f in [0.8, 0.9, 1.0, 1.1, 1.2]:
+            new_h = max(5, int(th * ideal_scale * f))
+            new_w = max(5, int(tw * ideal_scale * f))
+            if new_h >= roi_h or new_w >= roi_w:
+                continue
+            resized = cv2.resize(template, (new_w, new_h),
+                                 interpolation=cv2.INTER_AREA)
+            res = cv2.matchTemplate(roi, resized, cv2.TM_CCOEFF_NORMED)
+            if res.size == 0:
+                continue
+            locs = np.where(res >= min_score)
+            for (py, px) in zip(locs[0], locs[1]):
+                raw.append((x1 + int(px) + new_w // 2,
+                            num, den, float(res[py, px])))
+
+    if not raw:
+        return []
+
+    # NMS: sort by score desc, greedily keep non-overlapping
+    raw.sort(key=lambda t: -t[3])
+    kept = []
+    for cand in raw:
+        cx, cn, cd, cs = cand
+        if any(abs(cx - k[0]) < dy * nms_dy for k in kept):
+            continue
+        kept.append(cand)
+
+    kept.sort(key=lambda t: t[0])
+    return [{'x': float(cx), 'num': cn, 'den': cd, 'score': cs}
+            for cx, cn, cd, cs in kept]
+
+
+def detect_time_signature(binary_img, staff_system, dy):
+    """Auto-detect time signature from a staff system's clef area.
+
+    Matches time-signature templates (number_N_D format). Returns
+    (numerator, denominator) or None if not detected.
+    """
+    staff_height = staff_system[4] - staff_system[0]
+    img_w = binary_img.shape[1]
+
+    roi_x1 = int(img_w * 0.08)
+    roi_x2 = int(img_w * 0.22)
+    roi = binary_img[staff_system[0]:staff_system[4], roi_x1:roi_x2]
+    match = _match_timesig_in_roi(roi, staff_height, min_score=0.45)
+    if match is None:
+        return None
+    return match[0]
+
+
+def detect_time_signatures_along_system(binary_img, staff_system, barlines, dy,
+                                        clef_roi_x1=None, clef_roi_x2=None):
+    """Scan a staff system for time signatures.
+
+    Two-phase approach:
+    1. Scan the clef area for an initial time sig (keyed x=0, source='clef').
+    2. Scan the full staff width beyond the clef for additional matches,
+       apply NMS, then snap each match to the nearest barline and emit one
+       anchor per snapped position (source='barline').
+
+    Why full-line scan instead of per-barline ROI: barline positions are
+    noisy and time-sig digits can sit slightly before or after the barline
+    visually. A full-line scan finds every match robustly; snapping to the
+    nearest barline then yields clean per-measure anchors.
+
+    Returns
+    -------
+    list of dicts [{'x': x_pos, 'num': N, 'den': D, 'score': s,
+                    'source': 'clef'|'barline'}]
+        where x_pos is the anchor x at which this time signature takes
+        effect. Sorted by x. At most one anchor per (barline x).
+    """
+    img_w = binary_img.shape[1]
+
+    if clef_roi_x1 is None:
+        clef_roi_x1 = int(img_w * 0.08)
+    if clef_roi_x2 is None:
+        clef_roi_x2 = int(img_w * 0.22)
+
+    results = []
+
+    # --- Phase 1: clef area ---
+    staff_height = staff_system[4] - staff_system[0]
+    y1 = max(0, staff_system[0] - int(dy * 0.5))
+    y2 = min(binary_img.shape[0], staff_system[4] + int(dy * 0.5))
+    clef_roi = binary_img[y1:y2, clef_roi_x1:clef_roi_x2]
+    clef_match = _match_timesig_in_roi(clef_roi, staff_height, min_score=0.55)
+    if clef_match is not None:
+        (num, den), score = clef_match
+        results.append({'x': 0.0, 'num': num, 'den': den,
+                        'score': score, 'source': 'clef'})
+
+    # --- Phase 2: full-line scan for mid-line changes ---
+    # Start just after clef_roi_x2; scan all the way to the right edge.
+    # A mid-line time sig change is rare but always announced with clear
+    # stacked digits; threshold 0.70 keeps false positives from notes low.
+    mid_matches = _scan_timesigs_full_line(
+        binary_img, staff_system, dy,
+        x1=clef_roi_x2, x2=img_w,
+        min_score=0.70, nms_dy=2.0)
+
+    # Snap each mid-line match to the nearest barline. A match with no
+    # barline within 3*dy is dropped (likely a false positive).
+    sorted_barlines = sorted(barlines) if barlines else []
+    snap_tol = dy * 3.5
+    snapped_by_bl = {}  # barline_x -> best match dict
+    for m in mid_matches:
+        mx = m['x']
+        if not sorted_barlines:
+            continue
+        nearest = min(sorted_barlines, key=lambda b: abs(b - mx))
+        if abs(nearest - mx) > snap_tol:
+            continue
+        prior = snapped_by_bl.get(nearest)
+        if prior is None or m['score'] > prior['score']:
+            snapped_by_bl[nearest] = {
+                'x': float(nearest), 'num': m['num'], 'den': m['den'],
+                'score': m['score'], 'source': 'barline'}
+
+    results.extend(snapped_by_bl.values())
+    results.sort(key=lambda r: r['x'])
+    return results
 
 
