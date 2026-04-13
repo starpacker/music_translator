@@ -406,53 +406,68 @@ def _detect_individual_duration(beam_count=0, has_flag=False, is_hollow=False):
     return 1.0  # quarter (default)
 
 
-def _detect_dot(binary, note, dy, all_notes=None):
+def _detect_dot(binary, note, dy, all_notes=None, music_symbols=None):
     """Detect augmentation dot to the right of a notehead.
 
     Augmentation dots are small filled circles (~0.3*dy diameter) placed
     in the space to the right of the notehead. They multiply the note
     duration by 1.5.
 
-    Uses the full binary image (not music_symbols) and strict filtering
-    to avoid false positives from staccato dots, accidentals, etc.
+    Prefers music_symbols (staff-removed) when available so the dot is
+    not connected to staff lines or slur arcs in the search ROI; falls
+    back to binary otherwise. The clip-to-next-notehead logic and the
+    strict size/shape filters keep false positives from staccato marks
+    and accidentals out.
 
     Parameters
     ----------
-    binary : ndarray, binary image
+    binary : ndarray, binary image (fallback)
     note : dict with x, y_center, w, h
     dy : float, staff line spacing
     all_notes : list of note dicts, for overlap checking
+    music_symbols : ndarray, staff-line-removed binary (preferred)
 
     Returns True if a dot is found.
     """
     cx = note['x'] + note['w'] // 2
     cy = note['y_center']
-    h_img, w_img = binary.shape[:2]
+    img = music_symbols if music_symbols is not None else binary
+    h_img, w_img = img.shape[:2]
 
-    # Search region: to the right of the notehead, with padding for
-    # dots at the edge. Dot diameter is ~0.35*dy, so add 0.5*dy padding.
+    # Search region: to the right of the notehead. In tightly engraved
+    # passages the dot sits at ~0.7*dy from notehead center; in widely
+    # spaced beamed dotted-8+16 groups the dot can be at ~2.5*dy because
+    # the full-beat slot is stretched horizontally. Allow up to 3.0*dy.
     x_start = cx + int(dy * 0.6)
-    x_end = min(w_img, cx + int(dy * 2.0))
-    # Vertical: dots are placed in the nearest space, so ±0.4*dy
-    y_start = max(0, cy - int(dy * 0.5))
-    y_end = min(h_img, cy + int(dy * 0.5))
+    x_end = min(w_img, cx + int(dy * 3.0))
+    # Vertical: dot sits in the adjacent space, ±~0.7*dy.
+    y_start = max(0, cy - int(dy * 0.7))
+    y_end = min(h_img, cy + int(dy * 0.7))
 
     if x_end <= x_start or y_end <= y_start:
         return False
 
-    # If another notehead overlaps the search area, skip
-    # (the "dot" might be part of the next note's edge)
+    # If another notehead intrudes into the search area, clip x_end to
+    # just before it rather than bailing out. In dotted-8+16 beamed
+    # patterns the next notehead sits ~1.0-1.5*dy from the dotted note,
+    # but the dot itself is at ~0.7*dy — so there is almost always room
+    # to find the dot BEFORE the next notehead's left edge.
     if all_notes is not None:
         for other in all_notes:
             if other is note:
                 continue
-            # Use left edge of other notehead (not center)
             o_left = other['x']
             oy = other['y_center']
-            if o_left <= x_end and o_left + other['w'] >= x_start and abs(oy - cy) < dy * 1.5:
-                return False
+            if abs(oy - cy) >= dy * 1.5:
+                continue
+            if o_left + other['w'] < x_start:
+                continue
+            if o_left < x_end:
+                x_end = o_left - max(1, int(dy * 0.1))
+        if x_end <= x_start:
+            return False
 
-    roi = binary[y_start:y_end, x_start:x_end]
+    roi = img[y_start:y_end, x_start:x_end]
     if roi.size == 0:
         return False
 
@@ -477,22 +492,15 @@ def _detect_dot(binary, note, dy, all_notes=None):
         if aspect > 1.6:
             continue
 
-        # Compactness: dot is filled circle → high fill ratio
+        # Compactness: dot is a filled circle → high fill ratio.
+        # Slightly relaxed (0.40) since music_symbols can clip 1-2
+        # boundary pixels when the dot grazes a staff line.
         bbox_area = bw * bh
-        if bbox_area > 0 and area / bbox_area < 0.50:
+        if bbox_area > 0 and area / bbox_area < 0.40:
             continue
 
         # Size upper bound
         if area > dy * dy * 0.15:
-            continue
-
-        # Reject blobs touching the RIGHT or BOTTOM boundary of the ROI —
-        # they're likely clipped noteheads from adjacent notes.
-        # Top/left boundaries are OK (dot can be above notehead center).
-        blob_left = stats[label_id, cv2.CC_STAT_LEFT]
-        blob_top = stats[label_id, cv2.CC_STAT_TOP]
-        roi_h, roi_w = roi_bin.shape
-        if blob_left + bw >= roi_w - 1 or blob_top + bh >= roi_h - 1:
             continue
 
         return True
@@ -560,7 +568,8 @@ def detect_duration_per_note(note, binary, dy, music_symbols=None, all_notes=Non
     dur = _detect_individual_duration(beam_count, has_flag, is_hollow)
 
     # Check for augmentation dot (multiplies duration by 1.5)
-    if _detect_dot(binary, note, dy, all_notes=all_notes):
+    if _detect_dot(binary, note, dy, all_notes=all_notes,
+                   music_symbols=music_symbols):
         dur *= 1.5
 
     return dur

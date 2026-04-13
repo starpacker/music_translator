@@ -595,27 +595,46 @@ def _main_single_staff(image_path, systems, staff_lines, music_symbols, binary, 
     nh_template = create_notehead_template(dy)
     th, tw = nh_template.shape
 
-    # Fixed clef boundary for single-staff scores.
-    # Use 17% for line 1 (clef + time sig), 15% for others (clef only).
-    # Minimum prevents the adaptive scan from going too low (clef matches).
+    # Clef boundary for single-staff scores.
+    # Line 1 always uses the wide 17% (clef + key sig + time sig).
+    # Lines 2+ use the leftmost high-confidence notehead from all_notes
+    # to set the boundary just before the first real note. Using the
+    # already-detected list (instead of a second matchTemplate pass) is
+    # more reliable because it sees the actual hollow/filled noteheads.
     clef_area_x = int(img_w * 0.17)
-    clef_min = int(img_w * 0.15)
     clef_boundaries = {}
     for si, sys_info in enumerate(systems):
         if si == 0:
             clef_boundaries[si] = clef_area_x
             continue
-        boundary = clef_area_x
-        y1 = max(0, sys_info[0] - int(dy * 2))
-        y2 = min(binary.shape[0], sys_info[4] + int(dy * 2))
-        roi = binary[y1:y2, 200:500]
-        if tw < roi.shape[1] and th < roi.shape[0]:
-            res = cv2.matchTemplate(roi, nh_template, cv2.TM_CCOEFF_NORMED)
-            loc = np.where(res >= 0.55)
-            if len(loc[0]) > 0:
-                first_x = int(np.min(loc[1])) + 200
-                candidate = max(clef_min, first_x - int(dy))
-                boundary = min(boundary, candidate)
+        sys_top, sys_bot = sys_info[0], sys_info[4]
+        sys_mid = (sys_top + sys_bot) / 2.0
+        # High-confidence notes belonging to this staff, after the clef
+        # itself (x > 4*dy) and within reasonable vertical range.
+        raw = [
+            n for n in all_notes
+            if abs(n['y_center'] - sys_mid) < dy * 5
+            and n.get('score', 1.0) >= 0.70
+            and n['x'] > int(dy * 4)
+        ]
+        # Reject treble-clef interior matches: those come as vertical
+        # stacks at the same x (±2 px) but with widely different cy.
+        # A real monophonic notehead has no such sibling.
+        candidates = []
+        for n in raw:
+            has_vertical_sibling = any(
+                m is not n
+                and abs(m['x'] - n['x']) <= 2
+                and abs(m['y_center'] - n['y_center']) > dy * 2
+                for m in raw
+            )
+            if not has_vertical_sibling:
+                candidates.append(n)
+        if candidates:
+            first_x = min(n['x'] for n in candidates)
+            boundary = max(int(dy * 4), first_x - int(dy))
+        else:
+            boundary = clef_area_x
         clef_boundaries[si] = boundary
 
     # Filter notes by clef boundary
