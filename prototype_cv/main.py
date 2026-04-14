@@ -719,6 +719,9 @@ def _main_single_staff(image_path, systems, staff_lines, music_symbols, binary, 
     # ── 5b. Single-staff deduplication ──
     # Solo instruments can't play chords — if two noteheads are at nearly
     # the same x, one is a false positive.  Keep the higher-scored one.
+    # Exception: when both notes have equal scores and different y-positions,
+    # they are likely real sequential notes in a dense beam group (e.g.,
+    # sixteenths 5-7 px apart), not duplicates.
     for si in range(len(systems)):
         notes = notes_per_staff[si]
         # Sort by x for pairwise comparison
@@ -731,6 +734,11 @@ def _main_single_staff(image_path, systems, staff_lines, music_symbols, binary, 
                 if notes[j]['x'] - notes[i]['x'] > dy * 1.0:
                     break
                 if not keep[j]:
+                    continue
+                # If both notes have equal scores and different y-positions,
+                # they are likely different notes in a dense beam group.
+                y_diff = abs(notes[i]['y_center'] - notes[j]['y_center'])
+                if abs(notes[i]['score'] - notes[j]['score']) < 0.01 and y_diff > dy * 0.5:
                     continue
                 # Two notes within 1*dy in x — remove the lower-scored one
                 if notes[i]['score'] >= notes[j]['score']:
@@ -746,6 +754,31 @@ def _main_single_staff(image_path, systems, staff_lines, music_symbols, binary, 
 
     total = sum(len(ns) for ns in notes_per_staff)
     print(f"   Total notes after filtering: {total}")
+
+    # ── 5c. Reject hollow notehead false positives at mid-staff time-sigs ──
+    # A "2"/"3" numeral inside a mid-line time signature (e.g. 2/4, 3/4) has
+    # a rounded interior curve that the hollow oval template matches at raw
+    # score ~0.35. These are stored with score floor 0.80. Reject any
+    # floor-score hollow detection whose x is within 1.5*dy of a detected
+    # mid-staff time-signature anchor.
+    for si, sys_info in enumerate(systems):
+        bl = barlines_per_system[si] if si < len(barlines_per_system) else []
+        ts_dets = detect_time_signatures_along_system(binary, sys_info, bl, dy)
+        ts_xs = [d['x'] for d in ts_dets if d.get('source') != 'clef']
+        if not ts_xs:
+            continue
+        before = len(notes_per_staff[si])
+        kept = []
+        for n in notes_per_staff[si]:
+            if (n.get('score', 1.0) <= 0.81
+                    and any(abs(n['x'] - tx) < dy * 1.5 for tx in ts_xs)):
+                continue
+            kept.append(n)
+        removed = before - len(kept)
+        if removed:
+            notes_per_staff[si] = kept
+            print(f"   Staff {si+1}: removed {removed} hollow notehead(s) "
+                  f"near mid-staff time-sig")
 
     # ── 6. Detect Accidentals ──
     print("6. Detecting accidentals...")

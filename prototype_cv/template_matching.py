@@ -522,12 +522,17 @@ def find_noteheads(binary_img, dy, threshold=0.55, staff_systems=None, music_sym
                     #   like "p","f" match the oval shape at ~0.33)
                     outside_staff = dist_above > s_dy * 0.5 or dist_below > s_dy * 0.5
                     far_outside = dist_above > s_dy * 1.5 or dist_below > s_dy * 1.5
+                    very_far = dist_above > s_dy * 2.5 or dist_below > s_dy * 2.5
                     if match_score < 0.42 and not outside_staff:
                         continue
-                    if match_score < 0.42 and far_outside:
+                    if match_score < 0.42 and very_far:
                         continue
-                    # For low-score ledger detections, verify ink presence
-                    # on music_symbols — a real notehead has significant ink.
+                    # Outside-staff low-score candidates: ink + slur-arc check.
+                    # Far-outside (1.5-2.5*dy) candidates skip the slur-arc
+                    # check — tremolo bars near whole notes on high ledger
+                    # lines inflate column counts and cause false rejections.
+                    # Slurs at >1.5*dy are extremely rare (most sit <1*dy
+                    # from staff) and the ink-fill check alone is sufficient.
                     if match_score < 0.42 and outside_staff and music_symbols is not None:
                         ink_r = max(5, int(s_dy * 0.5))
                         iy1 = max(0, cy_abs - ink_r)
@@ -538,23 +543,19 @@ def find_noteheads(binary_img, dy, threshold=0.55, staff_systems=None, music_sym
                         ink_fill = np.mean(ink_region > 127) if ink_region.size else 0
                         if ink_fill < 0.20:
                             continue
-                        # Slur-arc rejection: a hollow notehead is a
-                        # compact oval — its total ink within a 3*dy wide
-                        # × 1.5*dy tall strip should fit in ≈1*dy columns.
-                        # A slur arc diagonally crossing the strip covers
-                        # a much wider column range.
-                        strip_h = max(3, int(s_dy * 0.75))
-                        sy1 = max(0, cy_abs - strip_h)
-                        sy2 = min(music_symbols.shape[0], cy_abs + strip_h)
-                        wide_r = int(s_dy * 1.5)
-                        sx1 = max(0, cx_abs - wide_r)
-                        sx2 = min(music_symbols.shape[1], cx_abs + wide_r)
-                        wide_strip = music_symbols[sy1:sy2, sx1:sx2]
-                        if wide_strip.size > 0:
-                            col_has_ink = np.any(wide_strip > 127, axis=0)
-                            ink_col_count = int(col_has_ink.sum())
-                            if ink_col_count > s_dy * 1.8:
-                                continue
+                        if not far_outside:
+                            strip_h = max(3, int(s_dy * 0.75))
+                            sy1 = max(0, cy_abs - strip_h)
+                            sy2 = min(music_symbols.shape[0], cy_abs + strip_h)
+                            wide_r = int(s_dy * 1.5)
+                            sx1 = max(0, cx_abs - wide_r)
+                            sx2 = min(music_symbols.shape[1], cx_abs + wide_r)
+                            wide_strip = music_symbols[sy1:sy2, sx1:sx2]
+                            if wide_strip.size > 0:
+                                col_has_ink = np.any(wide_strip > 127, axis=0)
+                                ink_col_count = int(col_has_ink.sum())
+                                if ink_col_count > s_dy * 1.8:
+                                    continue
 
                     if is_in_exclusion_zone(cx_abs, cy_abs, exclusion_zones,
                                             margin=int(dy * 0.3)):

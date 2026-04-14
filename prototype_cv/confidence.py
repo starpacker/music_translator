@@ -23,21 +23,24 @@ DURATION_SOURCE_CONF = {
     'whole':                         1.00,
     'tuplet':                        0.95,
     'pickup':                        0.90,
-    'single_fill':                   0.85,
-    'tuplet_leftover':               0.82,
-    'proportional':                  0.80,
-    'proportional_dotted_decomposed':0.80,
-    'proportional_uniform':          0.65,
+    'rest_detected':                 0.90,
+    'single_fill':                   0.80,
+    'tuplet_leftover':               0.78,
+    'proportional':                  0.70,
+    'proportional_dotted_decomposed':0.72,
+    'proportional_uniform':          0.60,
     'beam_rescue':                   0.78,
-    'unknown':                       0.85,
+    'unknown':                       0.55,
 }
 
 
 def _notehead_conf(score):
     """Linear rescale of OpenCV template match score to confidence [0,1].
 
-    Detection threshold is ~0.55, clean prints typically score ~0.85-0.95.
-    Map 0.55 → 0.60, 0.90+ → 1.00.
+    Hollow noteheads are stored with a 0.80 floor regardless of raw score,
+    so this value can't discriminate real whole notes from artefacts. Keep
+    the mapping gentle and rely on duration-source and structural signals
+    to catch errors.
     """
     if score <= 0.55:
         return 0.60
@@ -59,14 +62,14 @@ def score_note_entry(note):
 def score_event(event):
     """Return (confidence, reasons_list) for a measure event (note_unit or rest)."""
     if event['type'] == 'rest':
-        # Rests are post-adjusted to make measures sum correctly; they
-        # carry little independent evidence. Default to high confidence
-        # unless an explicit low-confidence source was set.
+        # Rests with no source tag are suspicious — the rest detector tags
+        # its output, so an untagged rest is typically an artefact that was
+        # injected downstream (e.g. to pad a short measure).
         dsource = event.get('duration_source', None)
         if dsource is None:
-            return 0.95, []
-        dur_conf = DURATION_SOURCE_CONF.get(dsource, 0.85)
-        return dur_conf, ([] if dur_conf >= 0.9 else [f"rest dur: {dsource}"])
+            return 0.55, ["untagged rest (likely injected)"]
+        dur_conf = DURATION_SOURCE_CONF.get(dsource, 0.70)
+        return dur_conf, ([] if dur_conf >= 0.90 else [f"rest dur: {dsource}"])
 
     unit = event['unit']
     notes = unit.get('notes', [])

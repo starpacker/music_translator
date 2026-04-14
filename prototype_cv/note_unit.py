@@ -1010,19 +1010,30 @@ def segment_into_measures(note_units, rests, barline_xs, dy,
     for unit in note_units:
         events.append({'type': 'note_unit', 'x': unit['x'], 'unit': unit})
     for rest in rests:
-        events.append({'type': 'rest', 'x': rest['x'], 'duration': rest.get('duration', 1.0)})
+        events.append({'type': 'rest', 'x': rest['x'],
+                       'duration': rest.get('duration', 1.0),
+                       'duration_source': 'rest_detected'})
 
     # Sort by x
     events.sort(key=lambda e: e['x'])
 
-    # Clean rests: remove rests within dy*1.5 of any note_unit x
-    note_unit_xs = [e['x'] for e in events if e['type'] == 'note_unit']
+    # Clean rests: remove rests within dy*1.5 of any note_unit, or
+    # sandwiched between two notes with total gap < dy*5 (likely a
+    # false template match in a beamed group — e.g. dotted-eighth gap).
+    note_unit_xs = sorted(e['x'] for e in events if e['type'] == 'note_unit')
     cleaned = []
     for e in events:
         if e['type'] == 'rest':
             too_close = any(abs(e['x'] - nx) < dy * 1.5 for nx in note_unit_xs)
             if too_close:
                 continue
+            # Reject rests sandwiched between close notes
+            left = [nx for nx in note_unit_xs if nx < e['x']]
+            right = [nx for nx in note_unit_xs if nx > e['x']]
+            if left and right:
+                total_gap = min(right) - max(left)
+                if total_gap < dy * 5.0:
+                    continue
         cleaned.append(e)
 
     # Deduplicate rests within dy*2.0 of each other
@@ -1466,12 +1477,12 @@ def _estimate_durations_in_measure(measure, beats_per_measure=2.0, measure_idx=0
     beam_note_total = sum(beam_durs)
     beam_total = beam_note_total + rest_beats
 
-    # For longer measures (4/4+), beam detection is more reliable than
-    # proportional spacing. Use beam durations directly — they give correct
-    # note-level durations even when the measure total doesn't match
-    # (due to missing notes or wrong barlines).
-    # For 2/4 time, proportional spacing is well-tuned, so keep it.
-    if beats_per_measure > 2.5:
+    # Beam-first approach: use beam detection when it sums correctly,
+    # or for longer measures (3/4+) where proportional spacing is unreliable.
+    # For 2/4 with matching beam total, beam detection preserves dots and
+    # sixteenths that proportional spacing would flatten to equal eighths.
+    beam_total_matches = abs(beam_total - beats_per_measure) < 0.1
+    if beats_per_measure > 2.5 or beam_total_matches:
         beam_durs_original = list(beam_durs)
 
         # Uniform-upgrade rescue: if every short note can be lifted so the
@@ -1560,6 +1571,24 @@ def _estimate_durations_in_measure(measure, beats_per_measure=2.0, measure_idx=0
                                 right_bl = bx
                                 break
                     gaps_r.append(right_bl - xs[-1] if right_bl < float('inf') else 0)
+            # Eighth→sixteenth rescue: when confirmed sixteenths exist
+            # and surplus >= 0.45, some eighths are under-detected
+            # sixteenths (second beam missed). Downgrade eighths with
+            # the narrowest gaps first (densely packed = likely in a
+            # sixteenth beam group). Run BEFORE quarter→eighth to avoid
+            # wrongly downgrading a genuine quarter.
+            if surplus >= 0.45:
+                n_confirmed_16 = sum(1 for i in range(n) if beam_durs[i] == 0.25)
+                if n_confirmed_16 >= 2:
+                    e_cands = [(i, gaps_r[i]) for i in range(n)
+                               if beam_durs[i] == 0.5]
+                    e_cands.sort(key=lambda t: t[1])  # narrowest gap first
+                    for idx, _ in e_cands:
+                        if surplus < 0.2:
+                            break
+                        beam_durs[idx] = 0.25
+                        surplus -= 0.25
+
             # Sort quarter notes by gap (smallest gap = most likely eighth)
             candidates = [(i, gaps_r[i]) for i in range(n)
                           if beam_durs[i] == 1.0]
