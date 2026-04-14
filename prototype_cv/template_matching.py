@@ -517,9 +517,14 @@ def find_noteheads(binary_img, dy, threshold=0.55, staff_systems=None, music_sym
                     # nearby staff line interference. Use graduated threshold:
                     # - On staff (dist <= 0): require 0.42
                     # - Near staff (dist 0-0.5*dy): require 0.42
-                    # - Above/below staff (dist > 0.5*dy): allow 0.35+
+                    # - Ledger region (0.5-1.5*dy): allow 0.35+
+                    # - Far outside (>1.5*dy): require 0.42 (slurs/dynamics
+                    #   like "p","f" match the oval shape at ~0.33)
                     outside_staff = dist_above > s_dy * 0.5 or dist_below > s_dy * 0.5
+                    far_outside = dist_above > s_dy * 1.5 or dist_below > s_dy * 1.5
                     if match_score < 0.42 and not outside_staff:
+                        continue
+                    if match_score < 0.42 and far_outside:
                         continue
                     # For low-score ledger detections, verify ink presence
                     # on music_symbols — a real notehead has significant ink.
@@ -533,6 +538,23 @@ def find_noteheads(binary_img, dy, threshold=0.55, staff_systems=None, music_sym
                         ink_fill = np.mean(ink_region > 127) if ink_region.size else 0
                         if ink_fill < 0.20:
                             continue
+                        # Slur-arc rejection: a hollow notehead is a
+                        # compact oval — its total ink within a 3*dy wide
+                        # × 1.5*dy tall strip should fit in ≈1*dy columns.
+                        # A slur arc diagonally crossing the strip covers
+                        # a much wider column range.
+                        strip_h = max(3, int(s_dy * 0.75))
+                        sy1 = max(0, cy_abs - strip_h)
+                        sy2 = min(music_symbols.shape[0], cy_abs + strip_h)
+                        wide_r = int(s_dy * 1.5)
+                        sx1 = max(0, cx_abs - wide_r)
+                        sx2 = min(music_symbols.shape[1], cx_abs + wide_r)
+                        wide_strip = music_symbols[sy1:sy2, sx1:sx2]
+                        if wide_strip.size > 0:
+                            col_has_ink = np.any(wide_strip > 127, axis=0)
+                            ink_col_count = int(col_has_ink.sum())
+                            if ink_col_count > s_dy * 1.8:
+                                continue
 
                     if is_in_exclusion_zone(cx_abs, cy_abs, exclusion_zones,
                                             margin=int(dy * 0.3)):

@@ -35,19 +35,45 @@ def get_staff_systems(staff_lines_img):
     systems = []
     if len(clustered_peaks) < 5:
         return []
-    
-    i = 0
-    while i <= len(clustered_peaks) - 5:
-        y1, y2, y3, y4, y5 = clustered_peaks[i:i+5]
-        dy1, dy2, dy3, dy4 = y2 - y1, y3 - y2, y4 - y3, y5 - y4
-        avg_dy = (dy1 + dy2 + dy3 + dy4) / 4.0
-        
-        if max(dy1, dy2, dy3, dy4) - min(dy1, dy2, dy3, dy4) < avg_dy * 0.8:
-            systems.append([y1, y2, y3, y4, y5])
-            i += 5
+
+    # First split clustered_peaks into contiguous "line runs" separated
+    # by large gaps (inter-staff spaces). Within each run we then pick
+    # the most uniform 5-peak window — important when a run contains 6+
+    # peaks (e.g., a spurious cross-staff line above the real top line).
+    avg_gap_all = float(np.median(np.diff(clustered_peaks)))
+
+    runs = []
+    cur = [clustered_peaks[0]]
+    for p in clustered_peaks[1:]:
+        gap = p - cur[-1]
+        if gap > avg_gap_all * 3.0:
+            runs.append(cur)
+            cur = [p]
         else:
-            i += 1
-            
+            cur.append(p)
+    runs.append(cur)
+
+    for run in runs:
+        if len(run) < 5:
+            continue
+        # Score every 5-peak window by gap-spread; pick the tightest.
+        best = None
+        best_spread = None
+        for j in range(len(run) - 4):
+            y1, y2, y3, y4, y5 = run[j:j + 5]
+            gaps = [y2 - y1, y3 - y2, y4 - y3, y5 - y4]
+            avg_dy = sum(gaps) / 4.0
+            if avg_dy <= 0:
+                continue
+            spread = (max(gaps) - min(gaps)) / avg_dy
+            if spread >= 0.8:
+                continue
+            if best_spread is None or spread < best_spread:
+                best = [y1, y2, y3, y4, y5]
+                best_spread = spread
+        if best is not None:
+            systems.append(best)
+
     return systems
 
 

@@ -479,10 +479,17 @@ def _detect_barlines_single_staff(binary, systems, dy,
         proj_norm = proj / col_max
 
         # --- Step 2: Find peaks in the projection ---
-        # Real barlines span nearly the full staff (≈0.79 fill). Flats and
-        # other accidentals have a left vertical bar that reaches only
-        # ~0.48 fill. 0.60 cleanly separates them.
-        threshold = 0.60
+        # Adaptive threshold: barlines+stems are the highest peaks on
+        # the staff, so scale by per-staff max fill. This handles
+        # staves whose top/bottom line was mis-detected, inflating
+        # the ROI and depressing absolute fill ratios.
+        # Empirically:
+        #   Clean staff  — max≈0.88, barline≈0.79, stem≈0.88
+        #   Warped staff — max≈0.79, barline≈0.55, stem≈0.79
+        #   Flat symbol  — ≈0.48 in both regimes
+        # 0.60 * max separates barlines from flats in both cases.
+        max_fill = float(proj_norm.max()) if len(proj_norm) else 0.0
+        threshold = max_fill * 0.60
         peaks = []
         in_peak = False
         peak_start = 0
