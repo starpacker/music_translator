@@ -1606,9 +1606,23 @@ def _estimate_durations_in_measure(measure, beats_per_measure=2.0, measure_idx=0
                         beam_durs[ni] = 0.25
                         surplus -= 0.25
 
-            # Dot-removal: if surplus ≈ 0.25 and a dotted-eighth (0.75) exists,
-            # undot it to 0.5. Handles false-positive dot detection on a
-            # measure that is otherwise correct.
+            # Dotted-eighth companion: if surplus ≈ 0.25 AND a dotted-eighth
+            # (0.75) exists AND its right neighbor is an eighth (0.5), demote
+            # the neighbor to a sixteenth. This is the standard dotted-8+16
+            # beamed pattern — the beam detector can miss the second beam
+            # on the sixteenth, making it look like an eighth. Preferring
+            # this over dot-removal preserves the verified dot detection.
+            if 0.2 <= surplus <= 0.3:
+                de_idxs = [i for i in range(n) if beam_durs[i] == 0.75]
+                for di in de_idxs:
+                    ni = di + 1
+                    if ni < n and beam_durs[ni] == 0.5:
+                        beam_durs[ni] = 0.25
+                        surplus -= 0.25
+                        break
+
+            # Dot-removal: if surplus ≈ 0.25 and a dotted-eighth (0.75) exists
+            # with no eligible companion above, undot it as a last resort.
             if 0.2 <= surplus <= 0.3:
                 de_idxs = [i for i in range(n) if beam_durs[i] == 0.75]
                 if de_idxs:

@@ -479,7 +479,10 @@ def _detect_barlines_single_staff(binary, systems, dy,
         proj_norm = proj / col_max
 
         # --- Step 2: Find peaks in the projection ---
-        threshold = 0.40
+        # Real barlines span nearly the full staff (≈0.79 fill). Flats and
+        # other accidentals have a left vertical bar that reaches only
+        # ~0.48 fill. 0.60 cleanly separates them.
+        threshold = 0.60
         peaks = []
         in_peak = False
         peak_start = 0
