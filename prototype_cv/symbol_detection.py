@@ -601,10 +601,10 @@ def detect_rests(binary_img, staff_systems, dy):
                 
                 resized = cv2.resize(template, (new_w, new_h), interpolation=cv2.INTER_AREA)
                 res = cv2.matchTemplate(roi, resized, cv2.TM_CCOEFF_NORMED)
-                
-                threshold = 0.50
+
+                threshold = 0.60
                 loc = np.where(res >= threshold)
-                
+
                 for pt in zip(*loc[::-1]):
                     rx = pt[0] + new_w // 2
                     ry = search_y1 + pt[1] + new_h // 2
@@ -687,9 +687,15 @@ def _nms_rests(rests, min_dist_x, min_dist_y=None):
 
     def _priority(r):
         t = r.get('type', '')
-        if t in ('stop_4.jpg', 'stop_8.jpg'):
-            return 0  # higher priority
-        return 1  # stop_1/stop_2 — lower priority due to staff-line inflation
+        # stop_4 has the most distinctive shape and fires reliably on
+        # quarter rests. stop_8 over-fires on slurs/chords and on
+        # quarter rests themselves (where it competes with stop_4).
+        # When the two overlap, prefer the quarter-rest interpretation.
+        if t == 'stop_4.jpg':
+            return 0
+        if t == 'stop_8.jpg':
+            return 1
+        return 2  # stop_1/stop_2 — lowest priority due to staff-line inflation
 
     sorted_rests = sorted(rests, key=lambda r: (_priority(r), -r['score']))
     kept = []
@@ -826,10 +832,12 @@ def _load_timesig_templates():
 
 
 def _match_timesig_in_roi(roi, staff_height, min_score=0.50):
-    """Match timesig templates against ROI. Return ((num, den), score) or None.
+    """Match timesig templates against ROI.
 
-    min_score is the floor — anything below is rejected. Returns the
-    best-scoring template above the floor.
+    Returns ``((num, den), score, match_x_in_roi, match_w)`` or ``None``.
+    ``match_x_in_roi`` is the center x of the best match relative to the
+    ROI's left edge; callers add the ROI offset to recover absolute x.
+    ``match_w`` is the resized template width for that match.
     """
     if roi is None or roi.size == 0:
         return None
@@ -839,6 +847,8 @@ def _match_timesig_in_roi(roi, staff_height, min_score=0.50):
 
     best_match = None
     best_score = min_score
+    best_x = None
+    best_w = None
 
     for (num, den), template in templates.items():
         th, tw = template.shape
@@ -851,14 +861,19 @@ def _match_timesig_in_roi(roi, staff_height, min_score=0.50):
             resized = cv2.resize(template, (new_w, new_h),
                                  interpolation=cv2.INTER_AREA)
             res = cv2.matchTemplate(roi, resized, cv2.TM_CCOEFF_NORMED)
-            max_val = float(np.max(res)) if res.size > 0 else 0
+            if res.size == 0:
+                continue
+            max_val = float(np.max(res))
             if max_val > best_score:
                 best_score = max_val
                 best_match = (num, den)
+                py, px = np.unravel_index(int(np.argmax(res)), res.shape)
+                best_x = int(px) + new_w // 2
+                best_w = new_w
 
     if best_match is None:
         return None
-    return (best_match, best_score)
+    return (best_match, best_score, best_x, best_w)
 
 
 def _scan_timesigs_full_line(binary_img, staff_system, dy, x1, x2,
@@ -978,9 +993,14 @@ def detect_time_signatures_along_system(binary_img, staff_system, barlines, dy,
     clef_roi = binary_img[y1:y2, clef_roi_x1:clef_roi_x2]
     clef_match = _match_timesig_in_roi(clef_roi, staff_height, min_score=0.55)
     if clef_match is not None:
-        (num, den), score = clef_match
+        (num, den), score, mx_in_roi, mw = clef_match
+        # Absolute x of the time-sig digit center in the source image.
+        # Used by the hollow-notehead time-sig filter to suppress false
+        # positives on the digit shapes ("5" of 5/4, etc.).
+        abs_match_x = clef_roi_x1 + mx_in_roi if mx_in_roi is not None else None
         results.append({'x': 0.0, 'num': num, 'den': den,
-                        'score': score, 'source': 'clef'})
+                        'score': score, 'source': 'clef',
+                        'match_x': abs_match_x, 'match_w': mw})
 
     # --- Phase 2: full-line scan for mid-line changes ---
     # Start just after clef_roi_x2; scan all the way to the right edge.
@@ -1012,5 +1032,154 @@ def detect_time_signatures_along_system(binary_img, staff_system, barlines, dy,
     results.extend(snapped_by_bl.values())
     results.sort(key=lambda r: r['x'])
     return results
+
+
+_DIGIT_TEMPLATE_CACHE = None
+
+
+def _load_digit_templates():
+    """Load and cache binarized single-digit templates (digit_<N>.png).
+
+    Returns dict {digit_int: binarized_template_array}.
+    Currently we ship templates for 2 and 4 (sufficient for qudi page 1
+    multi-rests "2", "2", "4", "42"). Adding more digits is just a matter
+    of dropping digit_<N>.png into the template directory.
+    """
+    global _DIGIT_TEMPLATE_CACHE
+    if _DIGIT_TEMPLATE_CACHE is not None:
+        return _DIGIT_TEMPLATE_CACHE
+
+    templates = {}
+    for ext in ['*.png', '*.jpg']:
+        for path in glob.glob(os.path.join(TEMPLATE_DIR, ext)):
+            fname = os.path.splitext(os.path.basename(path))[0]
+            if not fname.startswith('digit_'):
+                continue
+            parts = fname.split('_')
+            if len(parts) != 2:
+                continue
+            try:
+                d = int(parts[1])
+            except ValueError:
+                continue
+            img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+            if img is None:
+                continue
+            _, bimg = cv2.threshold(img, 128, 255,
+                                    cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
+            templates[d] = bimg
+    _DIGIT_TEMPLATE_CACHE = templates
+    return templates
+
+
+def detect_multi_rest_count(binary_img, staff_system, seg_x1, seg_x2, dy):
+    """Detect a multi-measure-rest numeral above a staff segment.
+
+    A multi-measure rest in this engraving style is drawn as a thick
+    horizontal bar centered on the middle staff line, with an Arabic
+    numeral (typically 2-9, sometimes multi-digit) directly ABOVE the
+    staff. The numeral indicates how many empty measures the bar
+    represents.
+
+    Parameters
+    ----------
+    binary_img : ndarray, full-page inverted binary image
+        (notation = 255, background = 0)
+    staff_system : tuple, the 5 staff-line y-coordinates for this staff
+    seg_x1, seg_x2 : int, x-bounds of the segment to inspect
+    dy : float, staff line spacing
+
+    Returns
+    -------
+    int or None: number of measures the bar represents (>= 2),
+        or None if no multi-measure rest is detected.
+    """
+    # 1. Confirm a thick horizontal bar on the middle staff line.
+    sys = staff_system
+    img_h, img_w = binary_img.shape
+    mid_y = int((sys[1] + sys[3]) / 2)
+    bar_y1 = max(0, mid_y - max(3, int(dy * 0.5)))
+    bar_y2 = min(img_h, mid_y + max(3, int(dy * 0.5)))
+    seg_x1 = max(0, int(seg_x1))
+    seg_x2 = min(img_w, int(seg_x2))
+    if seg_x2 - seg_x1 < dy * 3:
+        return None
+    bar_region = binary_img[bar_y1:bar_y2, seg_x1:seg_x2]
+    if bar_region.size == 0:
+        return None
+    row_fills = np.mean(bar_region > 127, axis=1)
+    thick_rows = int(np.sum(row_fills > 0.5))
+    if thick_rows < max(4, int(dy * 0.3)):
+        return None  # no multi-rest bar in this segment
+
+    # 2. Find connected components above the staff (where the numeral sits).
+    digit_y1 = max(0, sys[0] - int(dy * 4))
+    digit_y2 = max(0, sys[0] - int(dy * 0.2))
+    if digit_y2 <= digit_y1:
+        return None
+    pad = int(dy * 1.0)
+    digit_x1 = max(0, seg_x1 - pad)
+    digit_x2 = min(img_w, seg_x2 + pad)
+    crop = binary_img[digit_y1:digit_y2, digit_x1:digit_x2]
+    if crop.size == 0:
+        return None
+
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+        crop, connectivity=8)
+    comps = []
+    min_area = (dy * 0.5) ** 2
+    min_h = dy * 0.8
+    for li in range(1, num_labels):
+        x, y, w, h, area = stats[li]
+        if area < min_area or h < min_h:
+            continue
+        comps.append((x, y, w, h))
+    if not comps:
+        return None
+    comps.sort(key=lambda c: c[0])  # left-to-right
+
+    # 3. Match each component against single-digit templates.
+    templates = _load_digit_templates()
+    if not templates:
+        return None
+
+    digits = []
+    for cx, cy, cw, ch in comps:
+        comp_crop = crop[cy:cy + ch, cx:cx + cw]
+        best_d = None
+        best_score = 0.55  # floor
+        for d, tmpl in templates.items():
+            th, tw = tmpl.shape
+            # Resize template to match component height
+            scale = ch / th if th > 0 else 1.0
+            new_h = max(5, int(th * scale))
+            new_w = max(5, int(tw * scale))
+            if new_h > comp_crop.shape[0] or new_w > comp_crop.shape[1]:
+                # template larger than component crop after rescale: use
+                # single-pixel match by resizing template down
+                new_h = min(new_h, comp_crop.shape[0])
+                new_w = min(new_w, comp_crop.shape[1])
+                if new_h < 5 or new_w < 5:
+                    continue
+            resized = cv2.resize(tmpl, (new_w, new_h),
+                                 interpolation=cv2.INTER_AREA)
+            res = cv2.matchTemplate(comp_crop, resized, cv2.TM_CCOEFF_NORMED)
+            if res.size == 0:
+                continue
+            mv = float(np.max(res))
+            if mv > best_score:
+                best_score = mv
+                best_d = d
+        if best_d is None:
+            return None  # unrecognized component → bail
+        digits.append(best_d)
+
+    # 4. Combine digits left-to-right into integer
+    n = 0
+    for d in digits:
+        n = n * 10 + d
+    if n < 2:
+        return None  # multi-rest must represent >= 2 measures
+    return n
 
 

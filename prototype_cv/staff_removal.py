@@ -8,7 +8,7 @@ def extract_staff_lines(image_path):
     img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
     if img is None:
         print(f"Error: Could not load image {image_path}")
-        return None, None
+        return None, None, None
     
     # Binarize (invert so text/lines are white, background is black)
     _, binary = cv2.threshold(img, 128, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)

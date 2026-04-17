@@ -127,7 +127,7 @@ class BeamConfig:
     flag_y_extent_dy: float = 1.5           # flag search y range
     flag_y_narrow_dy: float = 0.2           # narrow flag bound
     flag_y_default_dy: float = 0.6          # default flag y range
-    flag_density_threshold: float = 0.12    # flag presence threshold
+    flag_density_threshold: float = 0.14    # flag presence threshold
     # Wide ROI for chords
     wide_roi_width_dy: float = 3.0          # chord beam ROI half-width
     wide_pad_dy: float = 0.5                # y-extent padding for chord beams

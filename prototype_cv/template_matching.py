@@ -659,6 +659,13 @@ def find_noteheads(binary_img, dy, threshold=0.55, staff_systems=None, music_sym
                 fcx = fx + fw / 2.0
                 fcy = fy + fh / 2.0
                 if abs(hcx - fcx) < dy * 1.5 and abs(hcy - fcy) < dy * 1.5:
+                    # Only replace if the regular detection isn't high-
+                    # confidence filled. A score >= 0.95 means a strong
+                    # filled-notehead match — replacing it with a hollow
+                    # detection would lose a real note.
+                    if fs >= 0.95:
+                        replaced = True  # suppress hollow, keep regular
+                        break
                     # Replace regular with hollow (better y)
                     regular_boxes[ri] = (hx, hy, hw, hh, hs)
                     replaced = True

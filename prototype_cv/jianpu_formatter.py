@@ -1,25 +1,28 @@
 """
 jianpu_formatter.py
-Format NoteUnit events into Jianpu (简谱) notation strings.
+Format NoteUnit events into Jianpu (简谱) text strings.
 
-Handles:
-- NoteUnit → jianpu number with octave suffix
-- Accidental prefix (#, b) with measure-level persistence
-- Natural sign (n) cancels persistence
-- Chord brackets [note1 note2 ...]
-- Duration suffix (/2, /4)
-- Rest formatting (0, 0/2, 0/4)
+This module produces the text representation written to
+``output_jianpu.txt``. It uses ASCII-only suffixes so the file
+renders identically in any terminal/editor and so the strings can
+be drawn with cv2.putText. The visual jianpu (with proper 减时线
+underlines and octave dots) is rendered separately by
+``jianpu_visual.py``.
+
+Suffix table:
+    eighth         /2
+    sixteenth      /4
+    dotted eighth  /2.
+    dotted quarter .
+    half           -
+    dotted half    --
+    whole          ---
+    triplet etc.   /3, /6, /12, /3*2
 """
 
 
 def duration_to_suffix(duration):
-    """Convert numeric duration to Jianpu suffix.
-
-    Tuplet durations from base × 2/3:
-      /6  = 1/6 (sixteenth triplet: /4 × 2/3)
-      /3  = 1/3 (eighth triplet: /2 × 2/3)
-      /12 = 1/12 (thirty-second triplet: /4 ÷ 2 × 2/3, rare)
-    """
+    """Convert numeric duration to Jianpu ASCII suffix."""
     if abs(duration - 1.0 / 12.0) < 0.01:
         return "/12"
     if abs(duration - 1.0 / 6.0) < 0.02:
@@ -37,28 +40,20 @@ def duration_to_suffix(duration):
     if abs(duration - 1.5) < 0.1:
         return "."       # dotted quarter
     if abs(duration - 2.0) < 0.1:
-        return "-"       # half note (2 beats)
+        return "-"       # half note
     if abs(duration - 3.0) < 0.1:
-        return "--"      # dotted half note (3 beats)
+        return "--"      # dotted half note
     if abs(duration - 4.0) < 0.1:
-        return "---"     # whole note (4 beats)
+        return "---"     # whole note
     return ""
 
 
 def format_note(note, accidentals_map, persistent_accs=None, dy=21.0):
-    """
-    Format a single note from a NoteUnit as Jianpu string.
-
-    note: dict with 'pitch' (str like "3'"), 'accidental' (str or None),
-          'x', 'y_center', 'w' (optional)
-    accidentals_map: {(cx, cy): '#'/'b'/'n'} from global detection
-    persistent_accs: mutable dict for measure-level accidental persistence
-    """
+    """Format a single note from a NoteUnit as Jianpu string."""
     pitch = note['pitch']
     base = pitch[0]
     suffix = pitch[1:]
 
-    # Look up accidental from the global map
     cx = note['x'] + note.get('w', 0) // 2
     cy = note['y_center']
     key = (cx, cy)
@@ -66,11 +61,6 @@ def format_note(note, accidentals_map, persistent_accs=None, dy=21.0):
     note_x = note['x']
 
     pitch_key = base + suffix
-
-    # Accidental persistence within a measure (persistent_accs is reset per
-    # measure in format_measure). Distance limit kept as heuristic guard
-    # until key-signature detection is implemented — without it, accidentals
-    # from the key-sig area can over-propagate across the whole measure.
     max_persist_gap = dy * 5.0
 
     if acc == 'n':
@@ -109,13 +99,19 @@ def format_note_unit(unit, accidentals_map, persistent_accs=None, dy=21.0):
 def format_rest(event):
     """Format a rest event."""
     dur = event.get('duration', 1.0)
-    if dur == 4.0:
+    if abs(dur - 4.0) < 0.05:
         return "0---"
-    elif dur == 2.0:
+    if abs(dur - 3.0) < 0.05:
+        return "0--"
+    if abs(dur - 2.0) < 0.05:
         return "0-"
-    elif dur == 0.5:
+    if abs(dur - 1.5) < 0.05:
+        return "0."
+    if abs(dur - 0.75) < 0.05:
+        return "0/2."
+    if abs(dur - 0.5) < 0.05:
         return "0/2"
-    elif dur == 0.25:
+    if abs(dur - 0.25) < 0.05:
         return "0/4"
     return "0"
 
@@ -138,11 +134,16 @@ def format_measure(measure, accidentals_map, measure_idx=0, dy=21.0):
     return " ".join(parts)
 
 
-def format_output(measures, accidentals_map, dy=21.0):
+def format_output(measures, accidentals_map, dy=21.0,
+                   skip_empty=False):
     """Format all measures into the final Jianpu output string."""
     lines = []
     for i, measure in enumerate(measures):
+        if skip_empty and not measure:
+            continue
         measure_str = format_measure(measure, accidentals_map,
                                      measure_idx=i, dy=dy)
+        if skip_empty and measure_str == "0 0":
+            continue
         lines.append("|" + measure_str + "|")
     return "\n".join(lines)

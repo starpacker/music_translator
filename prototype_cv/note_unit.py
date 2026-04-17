@@ -265,7 +265,7 @@ def _count_beams(binary, tip_y, stem_x, dy, staff_lines=None, stem_dir=None,
             flag_y1 = max(0, int(tip_y - dy * 0.2))
             flag_y2 = min(h_img, int(tip_y + dy * 1.5))
         elif stem_dir == 'down':
-            flag_y1 = max(0, int(tip_y - dy * 1.5))
+            flag_y1 = max(0, int(tip_y - dy * 0.5))
             flag_y2 = min(h_img, int(tip_y + dy * 0.2))
         else:
             flag_y1 = max(0, int(tip_y - dy * 0.6))
@@ -283,6 +283,22 @@ def _count_beams(binary, tip_y, stem_x, dy, staff_lines=None, stem_dir=None,
                 if total_pixels > 0:
                     density = np.count_nonzero(flag_roi > 127) / total_pixels
                     from config import CFG
+                    # Mask all known noteheads from flag ROI to avoid
+                    # notehead fragments inflating flag density.
+                    if other_noteheads:
+                        nh_pad_y = max(4, int(dy * 0.4))
+                        nh_pad_x = max(2, int(dy * 0.15))
+                        for nhx, nhy, nhw, nhh in other_noteheads:
+                            ly1 = max(0, nhy - nh_pad_y - flag_y1)
+                            ly2 = min(flag_roi.shape[0], nhy + nhh + nh_pad_y - flag_y1)
+                            lx1 = max(0, nhx - nh_pad_x - flag_x1)
+                            lx2 = min(flag_roi.shape[1], nhx + nhw + nh_pad_x - flag_x1)
+                            if ly1 < ly2 and lx1 < lx2:
+                                flag_roi[ly1:ly2, lx1:lx2] = 0
+                        # Recount after masking
+                        total_pixels = flag_roi.size - flag_roi.shape[0] * (s_col2 - s_col1)
+                        if total_pixels > 0:
+                            density = np.count_nonzero(flag_roi > 127) / total_pixels
                     has_flag = density > CFG.beam.flag_density_threshold
 
     return beam_count, has_flag
@@ -453,6 +469,7 @@ def _detect_dot(binary, note, dy, all_notes=None, music_symbols=None):
     # but the dot itself is at ~0.7*dy — so there is almost always room
     # to find the dot BEFORE the next notehead's left edge.
     if all_notes is not None:
+        note_right = note['x'] + note['w']
         for other in all_notes:
             if other is note:
                 continue
@@ -461,6 +478,12 @@ def _detect_dot(binary, note, dy, all_notes=None, music_symbols=None):
             if abs(oy - cy) >= dy * 1.5:
                 continue
             if o_left + other['w'] < x_start:
+                continue
+            # Skip chord-mates: a note at (or before) the current
+            # notehead's right edge is stacked vertically, not a
+            # "next event". Without this guard, a chord-mate within
+            # dy*1.5 vertically collapses the dot ROI to zero width.
+            if o_left < note_right:
                 continue
             if o_left < x_end:
                 x_end = o_left - max(1, int(dy * 0.1))
@@ -798,10 +821,10 @@ def build_note_units(notes, music_symbols, binary, dy, single_staff=False):
         # Sort by y_center descending (low pitch first = higher y value first)
         group.sort(key=lambda n: -n['y_center'])
 
-        # Build list of OTHER noteheads (not in this group) for beam masking
-        group_ids = {id(n) for n in group}
-        other_noteheads = [(n['x'], n['y'], n['w'], n['h'])
-                           for n in notes if id(n) not in group_ids]
+        # Build list of ALL noteheads for beam masking — include the
+        # current group's own noteheads so the projection doesn't
+        # confuse a notehead's bottom/top edge with a beam band.
+        all_noteheads = [(n['x'], n['y'], n['w'], n['h']) for n in notes]
 
         # Build pitch for each note
         note_entries = []
@@ -809,7 +832,7 @@ def build_note_units(notes, music_symbols, binary, dy, single_staff=False):
             base_str, suffix_str = y_to_jianpu(n['y_center'], n['system'], n.get('clef', 'treble'))
             pitch = base_str + suffix_str
             ind_dur = detect_duration_per_note(n, binary, dy, music_symbols=music_symbols,
-                                                all_notes=notes, other_noteheads=other_noteheads)
+                                                all_notes=notes, other_noteheads=all_noteheads)
             note_entries.append({
                 'pitch': pitch,
                 'accidental': n.get('accidental', None),
@@ -983,7 +1006,8 @@ def _resolve_measure_bpm(measure, default_bpm, timesig_anchors):
 
 def segment_into_measures(note_units, rests, barline_xs, dy,
                           beats_per_measure=2.0, is_first_system=True,
-                          tuplet_markers=None, timesig_anchors=None):
+                          tuplet_markers=None, timesig_anchors=None,
+                          fill_to_measure=False):
     """
     Segment NoteUnits and rests into measures by barline x-positions.
 
@@ -1206,6 +1230,55 @@ def segment_into_measures(note_units, rests, barline_xs, dy,
             for i, e in enumerate(rest_events):
                 e['duration'] = best_durs[i]
 
+    # Post-processing: fill empty/under-filled measures with rests so each
+    # measure totals beats_per_measure. Only enabled for single-staff
+    # scores where empty measures (e.g., qudi 空一拍/空两拍) are
+    # legitimate musical content rather than false-barline artifacts.
+    #
+    # For empty measures, only fill if the segment is wide enough to be
+    # a legitimate measure. Narrow empty segments are likely false
+    # barlines (stem artifacts) — leave them unfilled so format_output's
+    # skip_empty pass can drop them as "0 0".
+    if fill_to_measure:
+        sorted_bls = sorted(barline_xs)
+        # Min legitimate measure width: ~3 dy per beat.
+        for mi_f, measure in enumerate(measures):
+            m_bpm = (measure_bpms[mi_f] if mi_f < len(measure_bpms)
+                     else beats_per_measure)
+            note_events = [e for e in measure if e['type'] == 'note_unit']
+            rest_events = [e for e in measure if e['type'] == 'rest']
+            note_beats = sum(e['unit']['duration'] for e in note_events)
+            rest_beats = sum(e.get('duration', 1.0) for e in rest_events)
+            gap = m_bpm - note_beats - rest_beats
+            if gap < 0.2:
+                continue
+            # Determine where the fill should go and the start position
+            # within the measure (for beat-aware splitting).
+            if measure:
+                last_event = max(measure, key=lambda e: e['x'])
+                anchor_x = last_event['x'] + 1
+                start_pos = note_beats + rest_beats
+            else:
+                # Empty measure: only fill if segment is wide enough to
+                # be a real measure (false barlines create narrow segs).
+                left_bl = (sorted_bls[mi_f - 1]
+                           if 0 < mi_f <= len(sorted_bls) else 0)
+                right_bl = (sorted_bls[mi_f]
+                            if mi_f < len(sorted_bls) else float('inf'))
+                seg_w = right_bl - left_bl if right_bl < float('inf') else float('inf')
+                min_legit_width = m_bpm * dy * 3
+                if seg_w < min_legit_width:
+                    continue  # narrow segment: false barline, don't fill
+                anchor_x = left_bl + 1
+                start_pos = 0.0
+            fills = _fill_rests_for_gap(start_pos, gap)
+            for j, fdur in enumerate(fills):
+                measure.append({
+                    'type': 'rest', 'x': anchor_x + j,
+                    'duration': fdur, 'duration_source': 'fill_to_measure',
+                })
+            measure.sort(key=lambda e: e['x'])
+
     return measures
 
 
@@ -1410,6 +1483,35 @@ def _apply_tuplet_markers(measures, tuplet_markers, beats_per_measure_or_list,
 STANDARD_DURATIONS = [0.25, 0.5, 0.75, 1.0, 1.5, 2.0, 3.0, 4.0]
 
 
+def _fill_rests_for_gap(start_pos, gap):
+    """Split a `gap` of beats into a sequence of standard rest durations.
+
+    `start_pos` is the position within the measure where the fill begins
+    (used so the first chunk completes the current beat instead of
+    spilling across barriers). Output is a list of rest durations whose
+    sum approximates `gap` and renders cleanly as `0/2`/`0`/`0-` etc.
+    """
+    rests = []
+    pos = float(start_pos)
+    remaining = float(gap)
+    while remaining > 0.2:
+        beat_pos = pos - int(pos)
+        dist_to_beat = (1.0 - beat_pos) if beat_pos > 0.01 else 1.0
+        chunk = min(dist_to_beat, 1.0, remaining)
+        # Snap chunk down to a standard rest duration
+        snapped = None
+        for d in (1.0, 0.5, 0.25):
+            if d <= chunk + 0.01:
+                snapped = d
+                break
+        if snapped is None:
+            break
+        rests.append(snapped)
+        pos += snapped
+        remaining -= snapped
+    return rests
+
+
 def _snap_duration(dur):
     """Snap a duration value to the nearest standard duration."""
     return min(STANDARD_DURATIONS, key=lambda d: abs(d - dur))
@@ -1451,8 +1553,14 @@ def _estimate_durations_in_measure(measure, beats_per_measure=2.0, measure_idx=0
         # For beamed notes, idur reflects the actual beam count.
         # Only fall back to remaining-beats fill when no beam info exists.
         idur = note_events[0]['unit']['notes'][0].get('individual_duration', 1.0)
-        if idur >= 2.0 or (idur < 1.0 and rest_beats > 0):
-            # Trust beam detection: whole/half notes, or short notes with rests
+        # Check if beam/flag evidence exists (concrete short-duration proof)
+        unit_notes = note_events[0]['unit']['notes']
+        has_beam_evidence = any(
+            ne.get('has_flag', False) or ne.get('beam_count', 0) > 0
+            for ne in unit_notes)
+        if idur >= 2.0 or (idur < 1.0 and (rest_beats > 0 or has_beam_evidence)):
+            # Trust beam detection: whole/half notes, or short notes with
+            # concrete beam/flag evidence (rests may be undetected)
             note_events[0]['unit']['duration'] = idur
             note_events[0]['duration_source'] = 'whole' if idur >= 2.0 else 'beam'
         else:
@@ -1493,7 +1601,24 @@ def _estimate_durations_in_measure(measure, beats_per_measure=2.0, measure_idx=0
         # should be quarters in 4/4).
         if beam_note_total + rest_beats < beats_per_measure - 0.1 and n >= 2:
             target_per_note = (beats_per_measure - rest_beats) / n
-            if target_per_note in STANDARD_DURATIONS:
+            # Skip dotted targets (0.75, 1.5, 3.0) when rests already
+            # account for the gap — rests indicate the short-note+rest
+            # pattern, not dotted notes spread across the measure.
+            is_dotted_target = target_per_note in (0.75, 1.5, 3.0)
+            # Skip uniform-upgrade when ALL notes have concrete beam/flag
+            # evidence AND rests are already present.  The rests confirm
+            # a short-note+rest pattern; the deficit comes from undetected
+            # rests, not under-detected note durations.  Without rests,
+            # the beam evidence may be false (accent marks, etc.) and the
+            # upgrade is more likely correct.
+            all_have_beam_evidence = all(
+                any(ne.get('has_flag', False) or ne.get('beam_count', 0) > 0
+                    for ne in e['unit']['notes'])
+                for e in note_events)
+            beam_with_rests = all_have_beam_evidence and rest_beats > 0.1
+            if target_per_note in STANDARD_DURATIONS and \
+                    not (is_dotted_target and rest_beats > 0.1) and \
+                    not beam_with_rests:
                 if all(d <= target_per_note + 1e-6 for d in beam_durs) and \
                         any(d < target_per_note - 1e-6 for d in beam_durs):
                     beam_durs = [target_per_note] * n

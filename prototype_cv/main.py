@@ -17,6 +17,16 @@ Pipeline:
 import cv2
 import numpy as np
 import os
+import sys
+
+# Combining low-line marks used by jianpu_formatter (U+0332 / U+0333) and
+# the middle dot (U+00B7) need a Unicode-capable stdout. On Windows the
+# default GBK console will raise UnicodeEncodeError when printing them.
+try:
+    sys.stdout.reconfigure(encoding='utf-8')
+    sys.stderr.reconfigure(encoding='utf-8')
+except (AttributeError, Exception):
+    pass
 
 from staff_removal import extract_staff_lines
 from pitch_detection import get_staff_systems, pair_grand_staves, detect_staff_layout
@@ -29,6 +39,7 @@ from symbol_detection import (
     detect_tuplet_markers,
     detect_time_signature,
     detect_time_signatures_along_system,
+    detect_multi_rest_count,
 )
 
 
@@ -73,7 +84,8 @@ def _build_system_timesig_anchors(binary, system, barlines, dy, current_bpm,
     return anchors, bpm
 from note_assignment import assign_notes_to_staves, filter_false_positive_notes
 from stem_tracking import track_stem
-from note_unit import build_note_units, segment_into_measures, merge_overlapping_note_units
+from note_unit import (build_note_units, segment_into_measures,
+                        merge_overlapping_note_units, _fill_rests_for_gap)
 from jianpu_formatter import format_measure, format_output
 
 
@@ -555,22 +567,32 @@ def _detect_barlines_single_staff(binary, systems, dy,
         # Spacing consistency: remove barlines that create gaps much
         # shorter than the median gap.  Such barlines are usually stems
         # that slipped through the notehead-overlap filter.
+        #
+        # Guard: only remove if the candidate is also notably WEAKER
+        # than its neighbors. A real barline has a score comparable to
+        # other barlines; a stem-leftover scores ~0.2× due to the
+        # notehead-overlap penalty. Without this guard we would remove
+        # legitimate barlines whenever a staff has a bimodal measure
+        # layout (e.g. short whole-note measures next to dense ones).
         if len(result_scored) >= 3:
             xs = [x for x, _ in result_scored]
+            scs = [s for _, s in result_scored]
             gaps = [xs[i + 1] - xs[i] for i in range(len(xs) - 1)]
             median_gap = float(sorted(gaps)[len(gaps) // 2])
             min_gap_allowed = median_gap * bc.min_gap_median_ratio
-            # Try removing barlines that create two adjacent short gaps
             keep = [True] * len(result_scored)
             for i in range(1, len(result_scored) - 1):
                 left_gap = xs[i] - xs[i - 1]
                 right_gap = xs[i + 1] - xs[i]
                 if left_gap < min_gap_allowed and right_gap < min_gap_allowed:
-                    # Both adjacent gaps are short — remove this barline
-                    # if the merged gap is closer to the median
                     merged = xs[i + 1] - xs[i - 1]
                     if abs(merged - median_gap) < abs(left_gap - median_gap):
-                        keep[i] = False
+                        # Only remove if this candidate is clearly
+                        # weaker than both neighbors — real barlines
+                        # cluster in score; stems sit much lower.
+                        nbr_min = min(scs[i - 1], scs[i + 1])
+                        if scs[i] < nbr_min * 0.7:
+                            keep[i] = False
             result_scored = [rs for rs, k in zip(result_scored, keep) if k]
 
         result = [x for x, _ in result_scored]
@@ -606,17 +628,13 @@ def _main_single_staff(image_path, systems, staff_lines, music_symbols, binary, 
     th, tw = nh_template.shape
 
     # Clef boundary for single-staff scores.
-    # Line 1 always uses the wide 17% (clef + key sig + time sig).
-    # Lines 2+ use the leftmost high-confidence notehead from all_notes
-    # to set the boundary just before the first real note. Using the
-    # already-detected list (instead of a second matchTemplate pass) is
-    # more reliable because it sees the actual hollow/filled noteheads.
+    # All lines use adaptive boundary: the leftmost high-confidence
+    # notehead sets the boundary just before the first real note.
+    # The sibling-reject filter only fires near the clef itself
+    # (x < 8*dy) so that real chords further right are kept.
     clef_area_x = int(img_w * 0.17)
     clef_boundaries = {}
     for si, sys_info in enumerate(systems):
-        if si == 0:
-            clef_boundaries[si] = clef_area_x
-            continue
         sys_top, sys_bot = sys_info[0], sys_info[4]
         sys_mid = (sys_top + sys_bot) / 2.0
         # High-confidence notes belonging to this staff, after the clef
@@ -629,17 +647,21 @@ def _main_single_staff(image_path, systems, staff_lines, music_symbols, binary, 
         ]
         # Reject treble-clef interior matches: those come as vertical
         # stacks at the same x (±2 px) but with widely different cy.
-        # A real monophonic notehead has no such sibling.
+        # Only apply near the clef (x < 8*dy) — further right, vertical
+        # stacks are real chords, not clef artifacts.
+        clef_vicinity = int(dy * 8)
         candidates = []
         for n in raw:
-            has_vertical_sibling = any(
-                m is not n
-                and abs(m['x'] - n['x']) <= 2
-                and abs(m['y_center'] - n['y_center']) > dy * 2
-                for m in raw
-            )
-            if not has_vertical_sibling:
-                candidates.append(n)
+            if n['x'] < clef_vicinity:
+                has_vertical_sibling = any(
+                    m is not n
+                    and abs(m['x'] - n['x']) <= 2
+                    and abs(m['y_center'] - n['y_center']) > dy * 2
+                    for m in raw
+                )
+                if has_vertical_sibling:
+                    continue
+            candidates.append(n)
         if candidates:
             first_x = min(n['x'] for n in candidates)
             boundary = max(int(dy * 4), first_x - int(dy))
@@ -755,16 +777,25 @@ def _main_single_staff(image_path, systems, staff_lines, music_symbols, binary, 
     total = sum(len(ns) for ns in notes_per_staff)
     print(f"   Total notes after filtering: {total}")
 
-    # ── 5c. Reject hollow notehead false positives at mid-staff time-sigs ──
-    # A "2"/"3" numeral inside a mid-line time signature (e.g. 2/4, 3/4) has
-    # a rounded interior curve that the hollow oval template matches at raw
-    # score ~0.35. These are stored with score floor 0.80. Reject any
-    # floor-score hollow detection whose x is within 1.5*dy of a detected
-    # mid-staff time-signature anchor.
+    # ── 5c. Reject hollow notehead false positives at time-sig digits ──
+    # A "2"/"3"/"5" numeral in a time signature has rounded curves that
+    # the hollow oval template matches at raw score ~0.35; these are
+    # stored with score floor 0.80. Reject any floor-score hollow
+    # detection whose x is within 1.5*dy of a detected time-signature
+    # digit position. This covers BOTH mid-staff TS changes (where d['x']
+    # is the snapped-barline anchor) AND the clef-area TS (where d['x']=0
+    # is the anchor and d['match_x'] holds the actual digit position).
     for si, sys_info in enumerate(systems):
         bl = barlines_per_system[si] if si < len(barlines_per_system) else []
         ts_dets = detect_time_signatures_along_system(binary, sys_info, bl, dy)
-        ts_xs = [d['x'] for d in ts_dets if d.get('source') != 'clef']
+        ts_xs = []
+        for d in ts_dets:
+            if d.get('source') == 'clef':
+                mx = d.get('match_x')
+                if mx is not None:
+                    ts_xs.append(mx)
+            else:
+                ts_xs.append(d['x'])
         if not ts_xs:
             continue
         before = len(notes_per_staff[si])
@@ -778,7 +809,177 @@ def _main_single_staff(image_path, systems, staff_lines, music_symbols, binary, 
         if removed:
             notes_per_staff[si] = kept
             print(f"   Staff {si+1}: removed {removed} hollow notehead(s) "
-                  f"near mid-staff time-sig")
+                  f"near time-sig")
+
+    # ── 5d. Hollow chord companion scan ──
+    # For confirmed hollow noteheads (score ≈ 0.80), search the same x on
+    # music_symbols for additional notehead outlines. Only runs when
+    # filled-note chords exist (multi-voice evidence after all filtering).
+    has_chords = False
+    for ns in notes_per_staff:
+        xs_sorted = sorted(n['x'] for n in ns)
+        for xi in range(len(xs_sorted) - 1):
+            if xs_sorted[xi + 1] - xs_sorted[xi] < dy * 0.8:
+                pair = [n for n in ns if abs(n['x'] - xs_sorted[xi]) < dy * 0.8]
+                ys = [n['y_center'] for n in pair]
+                if len(ys) >= 2 and max(ys) - min(ys) > dy * 0.8:
+                    has_chords = True
+                    break
+        if has_chords:
+            break
+    if has_chords:
+        added_total = 0
+        for si in range(len(systems)):
+            sys_info = systems[si]
+            s_dy = (sys_info[4] - sys_info[0]) / 4.0
+            hollow_notes = [n for n in notes_per_staff[si]
+                            if n.get('score', 1.0) <= 0.81]
+            new_notes = []
+            for hn in hollow_notes:
+                # Skip if this anchor already has a chord partner
+                has_partner = any(
+                    abs(n['x'] - hn['x']) < dy * 0.8
+                    and abs(n['y_center'] - hn['y_center']) > dy * 0.8
+                    for n in notes_per_staff[si] if n is not hn
+                )
+                if has_partner:
+                    continue
+                cx = hn['x'] + hn.get('w', 0) // 2
+                cy = hn['y_center']
+                search_r = int(s_dy * 4.0)
+                hw = int(s_dy * 0.7)
+                ry1 = max(0, int(cy - search_r))
+                ry2 = min(music_symbols.shape[0], int(cy + search_r))
+                rx1 = max(0, int(cx - hw))
+                rx2 = min(music_symbols.shape[1], int(cx + hw))
+                patch = music_symbols[ry1:ry2, rx1:rx2]
+                if patch.size == 0:
+                    continue
+                row_ink = np.sum(patch > 127, axis=1).astype(float)
+                has_ink_arr = (row_ink > 4).astype(np.uint8)
+                runs = np.diff(np.concatenate([[0], has_ink_arr, [0]]))
+                starts = np.where(runs == 1)[0]
+                ends = np.where(runs == -1)[0]
+                if len(starts) == 0:
+                    continue
+                max_gap = max(3, int(s_dy * 0.25))
+                ms_list, me_list = [starts[0]], [ends[0]]
+                for ri in range(1, len(starts)):
+                    if starts[ri] - me_list[-1] <= max_gap:
+                        me_list[-1] = ends[ri]
+                    else:
+                        ms_list.append(starts[ri])
+                        me_list.append(ends[ri])
+                for mi in range(len(ms_list)):
+                    rs, re_ = ms_list[mi], me_list[mi]
+                    seg_ink = row_ink[rs:re_]
+                    seg_total = np.sum(seg_ink)
+                    run_len = re_ - rs
+                    if seg_total <= 30 or run_len < s_dy * 0.3 or run_len > s_dy * 1.5:
+                        continue
+                    ys_arr = np.arange(len(seg_ink))
+                    comp_cy = ry1 + rs + int(np.sum(ys_arr * seg_ink) / seg_total)
+                    if abs(comp_cy - cy) < s_dy * 0.8:
+                        continue
+                    # Verify hollow on music_symbols (staff lines removed)
+                    vr = max(2, int(s_dy * 0.2))
+                    vy1 = max(0, int(comp_cy - s_dy * 0.3))
+                    vy2 = min(music_symbols.shape[0], int(comp_cy + s_dy * 0.3))
+                    vx1, vx2 = max(0, cx - vr), min(music_symbols.shape[1], cx + vr)
+                    cfill = np.mean(music_symbols[vy1:vy2, vx1:vx2] > 127) if (vy2 > vy1 and vx2 > vx1) else 1.0
+                    if cfill >= 0.80:
+                        continue
+                    check_list = list(notes_per_staff[si]) + new_notes
+                    already = any(abs(n['x'] - hn['x']) < dy * 0.5
+                                  and abs(n['y_center'] - comp_cy) < dy * 0.5
+                                  for n in check_list)
+                    if already:
+                        continue
+                    new_notes.append({
+                        'x': hn['x'], 'y': int(comp_cy - hn.get('h', int(dy)) // 2),
+                        'w': hn.get('w', int(dy)), 'h': hn.get('h', int(dy)),
+                        'y_center': comp_cy, 'score': 0.80,
+                        'pair_idx': si, 'system': sys_info,
+                        'companion': True
+                    })
+            if new_notes:
+                notes_per_staff[si].extend(new_notes)
+                added_total += len(new_notes)
+        if added_total:
+            print(f"   Added {added_total} hollow chord companion(s)")
+
+    # ── 5e. Remove barlines that create empty measures ──
+    # Only for multi-voice scores where false barlines are more common
+    removed_barlines_total = 0
+    if not has_chords:
+        pass  # skip for single-voice scores
+    for si in range(len(systems)) if has_chords else []:
+        blines = barlines_per_system[si]
+        if len(blines) < 2:
+            continue
+        notes_xs = sorted(n['x'] for n in notes_per_staff[si])
+        if not notes_xs:
+            continue
+        clef_end = clef_boundaries.get(si, 0) if clef_boundaries else 0
+        boundaries = [clef_end] + blines
+        # Compute median barline gap for this staff
+        all_gaps = [blines[i+1] - blines[i] for i in range(len(blines)-1)]
+        if clef_end > 0 and blines:
+            all_gaps.insert(0, blines[0] - clef_end)
+        median_gap = float(sorted(all_gaps)[len(all_gaps)//2]) if all_gaps else 0
+
+        to_remove = set()
+        for bi in range(1, len(boundaries)):
+            seg_left = boundaries[bi - 1]
+            seg_right = boundaries[bi]
+            seg_w = seg_right - seg_left
+            notes_in = [n for n in notes_per_staff[si]
+                        if seg_left < n['x'] < seg_right]
+            # A lone hollow note (score=0.80) in a narrow segment is
+            # likely a false detection; don't let it block barline removal
+            non_hollow = [n for n in notes_in
+                          if n.get('score', 1.0) != 0.80]
+            real_notes = non_hollow if non_hollow else []
+            if not non_hollow and len(notes_in) >= 2:
+                real_notes = notes_in
+            has_notes = len(real_notes) > 0
+            if has_notes or bi >= len(boundaries) - 1:
+                continue
+            # Case 1: segment has lone hollow note(s) only — likely
+            # a false hollow detection (score=0.80 baseline)
+            has_only_hollow = (len(notes_in) > 0 and len(real_notes) == 0)
+            # Case 2: TRULY narrow segment (false barline from stem
+            # artifact). Real empty rest measures occupy ~75-100% of the
+            # median gap, so threshold must be well below that. Stems
+            # create segments < 50% of median.
+            is_narrow = (median_gap > 0 and seg_w < median_gap * 0.50)
+            if is_narrow:
+                # narrow → false barline regardless of contents
+                to_remove.add(boundaries[bi])
+            elif has_only_hollow:
+                # measure-sized segment with only an isolated hollow
+                # detection → legitimate empty measure with a false
+                # hollow positive. Keep barline; drop the false note.
+                fp_xs = {(n['x'], n['y_center']) for n in notes_in}
+                notes_per_staff[si] = [
+                    n for n in notes_per_staff[si]
+                    if (n['x'], n['y_center']) not in fp_xs
+                ]
+        if to_remove:
+            barlines_per_system[si] = [b for b in blines if b not in to_remove]
+            removed_barlines_total += len(to_remove)
+            # Remove companion notes that were alone in removed segments
+            empty_segs = []
+            for bi2 in range(1, len(boundaries)):
+                if boundaries[bi2] in to_remove:
+                    empty_segs.append((boundaries[bi2 - 1], boundaries[bi2]))
+            notes_per_staff[si] = [
+                n for n in notes_per_staff[si]
+                if not (n.get('companion', False)
+                        and any(sl < n['x'] < sr for sl, sr in empty_segs))
+            ]
+    if removed_barlines_total:
+        print(f"   Removed {removed_barlines_total} barline(s) creating empty measures")
 
     # ── 6. Detect Accidentals ──
     print("6. Detecting accidentals...")
@@ -805,8 +1006,13 @@ def _main_single_staff(image_path, systems, staff_lines, music_symbols, binary, 
         # Remove rests near barlines
         if si < len(barlines_per_system):
             barlines = barlines_per_system[si]
-            near_barline = any(abs(rest['x'] - bx) < dy * 3.0 for bx in barlines)
-            if barlines and rest['x'] < barlines[0]:
+            near_barline = any(abs(rest['x'] - bx) < dy * 3.5 for bx in barlines)
+            # Drop rests sitting in the clef/key-sig area only — NOT
+            # all rests before the first barline. M1 starts AFTER the
+            # clef and can legitimately begin with a rest.
+            clef_x = (clef_boundaries.get(si, int(img_w * 0.17))
+                      if clef_boundaries else int(img_w * 0.17))
+            if rest['x'] < clef_x:
                 near_barline = True
             if near_barline:
                 continue
@@ -825,6 +1031,10 @@ def _main_single_staff(image_path, systems, staff_lines, music_symbols, binary, 
     # image.
     filtered_rests = [r for r in filtered_rests
                       if _validate_block_rest(music_symbols, r, dy)]
+    # Small-rest validation: stop_4/stop_8 fire on slur arcs and chord
+    # noise; verify a real symbol body exists at the match center.
+    filtered_rests = [r for r in filtered_rests
+                      if _validate_small_rest(music_symbols, r, dy)]
     all_rests = filtered_rests
     print(f"   Found {len(all_rests)} rests")
 
@@ -887,7 +1097,42 @@ def _main_single_staff(image_path, systems, staff_lines, music_symbols, binary, 
                                           beats_per_measure=bpm,
                                           is_first_system=is_first,
                                           tuplet_markers=staff_tuplets,
-                                          timesig_anchors=anchors)
+                                          timesig_anchors=anchors,
+                                          fill_to_measure=True)
+
+        # Multi-measure rest expansion. A segment whose physical width
+        # represents N empty measures (drawn as a thick bar with an
+        # Arabic numeral above) is detected here and expanded into N
+        # beat-filled empty measures so downstream formatting matches
+        # the engraver's intent.
+        sorted_bls = sorted(barlines)
+        expanded = []
+        for mi_x, m in enumerate(measures):
+            left = sorted_bls[mi_x - 1] if 0 < mi_x <= len(sorted_bls) else 0
+            right = (sorted_bls[mi_x] if mi_x < len(sorted_bls)
+                     else (sorted_bls[-1] if sorted_bls else 0))
+            n_rest = detect_multi_rest_count(binary, sys_info, left, right, dy)
+            # When a clear multi-rest pattern (thick bar + numeral) is
+            # detected we trust it: any note_units inside the segment are
+            # almost certainly false positives from the bar / numeral
+            # tripping the notehead matcher. Drop them via the expansion.
+            if n_rest is not None and n_rest >= 2:
+                fills = _fill_rests_for_gap(0.0, bpm)
+                for k in range(n_rest):
+                    proto = []
+                    for j, fdur in enumerate(fills):
+                        proto.append({
+                            'type': 'rest',
+                            'x': float(left) + 1 + k * 1000 + j,
+                            'duration': fdur,
+                            'duration_source': 'multi_rest',
+                        })
+                    expanded.append(proto)
+                print(f"   Staff {si + 1}: multi-rest at measure {mi_x}"
+                      f" → expanded to {n_rest} measures")
+                continue
+            expanded.append(m)
+        measures = expanded
 
         # Strip leading empty measures for lines 2+
         if si >= 1:
@@ -904,18 +1149,30 @@ def _main_single_staff(image_path, systems, staff_lines, music_symbols, binary, 
         print(f"   Staff {si + 1}: {len(measures)} measures")
 
     # ── 10. Format & Save Output ──
-    _print_and_save_single_staff_output(staff_data, accidentals_map, dy)
+    # skip_empty=True: legitimate empty measures are filled with rests
+    # by fill_to_measure (so they format as "0 0 0 0" and pass through),
+    # while false-barline narrow empties remain as "0 0" and get dropped.
+    _print_and_save_single_staff_output(staff_data, accidentals_map, dy,
+                                        skip_empty=has_chords)
 
     # ── 11. Visualization ──
     print("\n11. Generating visualizations...")
     _generate_single_staff_annotated(image_path, staff_data, accidentals_map, dy)
+    # Visual jianpu (matches reference repo's PIL-rendered style:
+    # red digits + 减时线 + octave dots + dashes for half/whole)
+    from jianpu_visual import render_full_image
+    render_full_image(image_path, staff_data, accidentals_map, dy,
+                      "output_jianpu_visual.png")
+    print("   Saved: output_jianpu_visual.png")
 
 
-def _print_and_save_single_staff_output(staff_data, accidentals_map, dy):
+def _print_and_save_single_staff_output(staff_data, accidentals_map, dy,
+                                         skip_empty=False):
     """Format, print, and save output for single-staff scores."""
     all_lines = []
     for sd in staff_data:
-        line = format_output(sd['measures'], accidentals_map, dy=dy)
+        line = format_output(sd['measures'], accidentals_map, dy=dy,
+                              skip_empty=skip_empty)
         all_lines.append(line)
 
     print(f"\n{'=' * 60}")
@@ -1206,6 +1463,39 @@ def _validate_block_rest(music_symbols, rest, dy):
     return fill >= 0.35
 
 
+def _validate_small_rest(music_symbols, rest, dy):
+    """Verify a quarter/eighth rest match has a real symbol body.
+
+    stop_4/stop_8 templates include staff-line context, so they can
+    fire on slur arcs, chord-area noise, or stray decorations. A
+    genuine quarter or eighth rest has a substantial connected
+    component (>=~half the symbol height squared) at the match
+    center; spurious matches show only thin lines.
+    """
+    if rest.get('type') not in ('stop_4.jpg', 'stop_8.jpg'):
+        return True
+    cx = int(rest['x'])
+    cy = int(rest['y_center'])
+    half_w = max(3, int(0.5 * dy))
+    half_h = max(3, int(0.6 * dy))
+    h, w = music_symbols.shape
+    y1 = max(0, cy - half_h); y2 = min(h, cy + half_h)
+    x1 = max(0, cx - half_w); x2 = min(w, cx + half_w)
+    if y2 <= y1 or x2 <= x1:
+        return False
+    roi = (music_symbols[y1:y2, x1:x2] > 127).astype(np.uint8)
+    nl, _, st, _ = cv2.connectedComponentsWithStats(roi, connectivity=8)
+    if nl <= 1:
+        return False
+    biggest = max(int(st[i, cv2.CC_STAT_AREA]) for i in range(1, nl))
+    # Quarter rests need a substantial body (~0.18*dy²); eighth rests
+    # are smaller (~0.10*dy²). Slur tails / accent marks come in
+    # below the eighth threshold (typically <0.08*dy²).
+    if rest['type'] == 'stop_4.jpg':
+        return biggest >= int(dy * dy * 0.18)
+    return biggest >= int(dy * dy * 0.10)
+
+
 def _filter_rests(all_rests, barlines_per_pair, all_notes, dy, music_symbols=None):
     """Filter rests near barlines and overlapping with notes."""
     # Remove rests near barlines
@@ -1214,7 +1504,7 @@ def _filter_rests(all_rests, barlines_per_pair, all_notes, dy, music_symbols=Non
         rest_pair_idx = rest['system_idx'] // 2
         if rest_pair_idx < len(barlines_per_pair):
             barlines = barlines_per_pair[rest_pair_idx]
-            near_barline = any(abs(rest['x'] - bx) < dy * 3.0 for bx in barlines)
+            near_barline = any(abs(rest['x'] - bx) < dy * 3.5 for bx in barlines)
             if barlines and rest['x'] < barlines[0]:
                 near_barline = True
             if near_barline:
