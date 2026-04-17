@@ -1167,12 +1167,44 @@ def segment_into_measures(note_units, rests, barline_xs, dy,
         detected_durs = [e['duration'] for e in rest_events]
         detected_total = sum(detected_durs)
 
+        # Strategy 0: if the gap is a standard duration and there is
+        # enough x-space between the last note and the first rest,
+        # insert a new rest instead of upgrading.  This produces
+        # cleaner results (e.g., 0/2 + 0 + 0- vs 0. + 0-) when an
+        # eighth rest was missed by the detector.
+        gap = remaining - detected_total
+        if gap in STANDARD_DURATIONS or any(abs(gap - d) < 0.01 for d in STANDARD_DURATIONS):
+            snapped_gap = min(STANDARD_DURATIONS, key=lambda d: abs(d - gap))
+            # Find position: look for x-space between last note and first rest
+            if note_events and rest_events:
+                all_sorted = sorted(measure, key=lambda e: e['x'])
+                first_rest_x = min(e['x'] for e in rest_events)
+                # Find the last non-rest event before the first rest
+                prev_x = None
+                for e in all_sorted:
+                    if e['x'] < first_rest_x and e['type'] != 'rest':
+                        prev_x = e['x']
+                if prev_x is not None and (first_rest_x - prev_x) > dy * 2.5:
+                    # Enough space — insert a rest between note and first rest
+                    insert_x = (prev_x + first_rest_x) // 2
+                    measure.append({
+                        'type': 'rest', 'x': insert_x,
+                        'duration': snapped_gap,
+                        'duration_source': 'gap_insert',
+                    })
+                    measure.sort(key=lambda e: e['x'])
+                    # Recompute after insertion
+                    rest_events = [e for e in measure if e['type'] == 'rest']
+                    n_rests = len(rest_events)
+                    detected_durs = [e['duration'] for e in rest_events]
+                    detected_total = sum(detected_durs)
+                    gap = remaining - detected_total
+
+        best_durs = list(detected_durs)
         # Strategy 1: upgrade individual rests to fill the gap.
         # When multiple rests share the same detected duration, prefer
         # upgrading the one with more horizontal space (proportional
         # spacing heuristic: longer rests occupy more x-distance).
-        gap = remaining - detected_total
-        best_durs = list(detected_durs)
         if 0 < gap <= 3.5:
             # Compute x-span for each rest: distance to next event.
             # For the rightmost rest in a measure, the next "event" is
