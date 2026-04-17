@@ -630,8 +630,10 @@ def _main_single_staff(image_path, systems, staff_lines, music_symbols, binary, 
     # Clef boundary for single-staff scores.
     # All lines use adaptive boundary: the leftmost high-confidence
     # notehead sets the boundary just before the first real note.
-    # The sibling-reject filter only fires near the clef itself
-    # (x < 8*dy) so that real chords further right are kept.
+    # The sibling-reject filter fires in the clef/key-sig/TS zone
+    # (x < clef_area_x) to remove treble-clef interior matches and
+    # time-sig digit false positives.  Beyond that, vertical stacks
+    # are real chords.
     clef_area_x = int(img_w * 0.17)
     clef_boundaries = {}
     for si, sys_info in enumerate(systems):
@@ -645,14 +647,14 @@ def _main_single_staff(image_path, systems, staff_lines, music_symbols, binary, 
             and n.get('score', 1.0) >= 0.70
             and n['x'] > int(dy * 4)
         ]
-        # Reject treble-clef interior matches: those come as vertical
-        # stacks at the same x (±2 px) but with widely different cy.
-        # Only apply near the clef (x < 8*dy) — further right, vertical
-        # stacks are real chords, not clef artifacts.
-        clef_vicinity = int(dy * 8)
+        # Reject treble-clef interior matches and TS digit false
+        # positives: vertical stacks at the same x (±2 px) with widely
+        # different cy.  Only apply within the clef/TS area
+        # (x < clef_area_x); beyond that, vertical stacks are real
+        # chords and must be kept.
         candidates = []
         for n in raw:
-            if n['x'] < clef_vicinity:
+            if n['x'] < clef_area_x:
                 has_vertical_sibling = any(
                     m is not n
                     and abs(m['x'] - n['x']) <= 2
@@ -696,6 +698,32 @@ def _main_single_staff(image_path, systems, staff_lines, music_symbols, binary, 
                                                          notehead_xs_per_staff,
                                                          music_symbols=music_symbols,
                                                          clef_boundaries=clef_boundaries)
+    # ── 4b. Remove barlines at time-signature positions ──
+    # The fraction line of a time signature (e.g. "4/4") is a short
+    # horizontal bar that the barline detector can match. Remove any
+    # barline within 2*dy of a detected TS digit position.
+    for si, sys_info in enumerate(systems):
+        bl = barlines_per_system[si]
+        if not bl:
+            continue
+        ts_dets = detect_time_signatures_along_system(binary, sys_info, bl, dy)
+        ts_match_xs = []
+        for d in ts_dets:
+            if d.get('time_sig') is None:
+                continue  # skip failed detections
+            mx = d.get('match_x')
+            if mx is not None:
+                ts_match_xs.append(mx)
+            elif d.get('x', 0) > 0:
+                ts_match_xs.append(d['x'])
+        if ts_match_xs:
+            before = len(bl)
+            bl = [b for b in bl
+                  if not any(abs(b - tx) < dy * 2 for tx in ts_match_xs)]
+            removed = before - len(bl)
+            if removed:
+                barlines_per_system[si] = bl
+
     for si, bl in enumerate(barlines_per_system):
         print(f"   Staff {si}: {len(bl)} barlines at x={bl}")
 
@@ -1181,7 +1209,7 @@ def _print_and_save_single_staff_output(staff_data, accidentals_map, dy,
 
     for i, line in enumerate(all_lines):
         print(f"\n--- 第{i + 1}行 ---")
-        print(f"  {line}")
+        print(line)
 
     # Save to file
     with open("output_jianpu.txt", "w", encoding="utf-8") as f:
