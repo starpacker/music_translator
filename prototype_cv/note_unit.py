@@ -1136,6 +1136,29 @@ def segment_into_measures(note_units, rests, barline_xs, dy,
         _apply_tuplet_markers(measures, tuplet_markers, measure_bpms, dy=dy,
                               barline_xs=sorted_barlines)
 
+    # Post-processing: remove false hollow note-units that cause overflow.
+    # A hollow note with floored score (0.80) is often a false detection
+    # (slur curve, ornament, etc.).  If removing it brings the measure
+    # total closer to the beat target, it is almost certainly spurious.
+    for mi_h, measure in enumerate(measures):
+        m_bpm = measure_bpms[mi_h] if mi_h < len(measure_bpms) else beats_per_measure
+        note_evts = [e for e in measure if e['type'] == 'note_unit']
+        total_dur = sum(e['unit']['duration'] for e in note_evts)
+        if total_dur <= m_bpm * 1.2:
+            continue  # no significant overflow
+        # Find hollow candidates (score == 0.80, the floor value)
+        hollow_candidates = [
+            e for e in note_evts
+            if any(abs(n.get('score', 1.0) - 0.80) < 0.02 for n in e['unit']['notes'])
+        ]
+        for hc in hollow_candidates:
+            hc_dur = hc['unit']['duration']
+            without = total_dur - hc_dur
+            # Removing it must bring us closer to target
+            if abs(without - m_bpm) < abs(total_dur - m_bpm):
+                measure.remove(hc)
+                total_dur = without
+
     # Post-processing: if a measure has a whole note (duration >= 3.5),
     # remove all rests — the whole note fills the measure.
     for measure in measures:
