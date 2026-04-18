@@ -124,14 +124,20 @@ def format_measure(measure, accidentals_map, measure_idx=0, dy=21.0):
     persistent_accs = {}
     parts = []
 
+    multi_count = None
     for event in measure:
         if event['type'] == 'rest':
             parts.append(format_rest(event))
         elif event['type'] == 'note_unit':
             parts.append(format_note_unit(event['unit'], accidentals_map,
                                           persistent_accs, dy=dy))
+        elif event['type'] == 'multi_rest_count':
+            multi_count = event['count']
 
-    return " ".join(parts)
+    result = " ".join(parts)
+    if multi_count is not None:
+        result += f" ×{multi_count}"
+    return result
 
 
 def format_output(measures, accidentals_map, dy=21.0,

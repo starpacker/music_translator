@@ -1112,16 +1112,34 @@ def _main_single_staff(image_path, systems, staff_lines, music_symbols, binary, 
             # tripping the notehead matcher. Drop them via the expansion.
             if n_rest is not None and n_rest >= 2:
                 fills = _fill_rests_for_gap(0.0, bpm)
-                for k in range(n_rest):
+                # For large multi-rests (≥5), store as a single compact
+                # measure with a count tag instead of N identical empties.
+                if n_rest >= 5:
                     proto = []
                     for j, fdur in enumerate(fills):
                         proto.append({
                             'type': 'rest',
-                            'x': float(left) + 1 + k * 1000 + j,
+                            'x': float(left) + 1 + j,
                             'duration': fdur,
                             'duration_source': 'multi_rest',
                         })
+                    proto.append({
+                        'type': 'multi_rest_count',
+                        'x': float(left),
+                        'count': n_rest,
+                    })
                     expanded.append(proto)
+                else:
+                    for k in range(n_rest):
+                        proto = []
+                        for j, fdur in enumerate(fills):
+                            proto.append({
+                                'type': 'rest',
+                                'x': float(left) + 1 + k * 1000 + j,
+                                'duration': fdur,
+                                'duration_source': 'multi_rest',
+                            })
+                        expanded.append(proto)
                 print(f"   Staff {si + 1}: multi-rest at measure {mi_x}"
                       f" → expanded to {n_rest} measures")
                 continue

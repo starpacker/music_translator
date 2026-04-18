@@ -71,6 +71,9 @@ def score_event(event):
         dur_conf = DURATION_SOURCE_CONF.get(dsource, 0.70)
         return dur_conf, ([] if dur_conf >= 0.90 else [f"rest dur: {dsource}"])
 
+    if event.get('type') == 'multi_rest_count':
+        return 1.0, []
+
     unit = event['unit']
     notes = unit.get('notes', [])
     if not notes:
