@@ -11,6 +11,17 @@ Usage:
 """
 from dataclasses import dataclass, field
 from typing import List
+import os
+
+# ── Shared template paths ───────────────────────────────────
+_BASE = os.path.dirname(__file__)
+TEMPLATE_DIR = os.path.join(_BASE, "..", "template")
+PICTURE_DIR = os.path.join(_BASE, "..", "repo",
+    "translate-staff-to-simple-musical-notation-master",
+    "score_recognition_v4", "picture")
+PICTURE_EXPAND_DIR = os.path.join(_BASE, "..", "repo",
+    "translate-staff-to-simple-musical-notation-master",
+    "score_recognition_v4", "picture_expand")
 
 
 # ── Staff & Image ────────────────────────────────────────────
@@ -147,7 +158,8 @@ class DurationConfig:
     pickup_duration: float = 0.5            # pickup note duration
     min_remaining_beats: float = 0.25       # min beats after rest deduction
     snap_tolerance: float = 0.1             # tolerance for duration snapping
-    beats_per_measure: float = 2.0          # time signature (2/4)
+    beats_per_measure: float = 2.0          # default; overridden by auto-detect
+    use_legacy_bass: bool = True            # True = bass reads as treble (for GT compat)
 
 
 # ── Two-Voice Merge ──────────────────────────────────────────
@@ -182,12 +194,14 @@ class AccidentalConfig:
 @dataclass
 class RestConfig:
     quarter_height_ratio: float = 0.5       # ideal height = staff_height * N
-    quarter_scale_range: List[float] = field(default_factory=lambda: [0.9, 1.1])
-    quarter_threshold: float = 0.55         # template match threshold
+    quarter_scale_factors: List[float] = field(default_factory=lambda: [0.8, 0.9, 1.0, 1.1, 1.2])
+    quarter_threshold: float = 0.48         # template match threshold
     eighth_height_ratio: float = 0.35       # ideal height = staff_height * N
-    eighth_scale_range: List[float] = field(default_factory=lambda: [0.85, 1.0, 1.15])
-    eighth_threshold: float = 0.50          # template match threshold
-    eighth_duration: float = 0.5            # eighth rest duration
+    eighth_scale_factors: List[float] = field(default_factory=lambda: [0.85, 1.0, 1.15])
+    eighth_threshold: float = 0.60          # template match threshold
+    half_threshold: float = 0.55            # stop_2 template threshold
+    whole_threshold: float = 0.60           # stop_1 template threshold
+    half_whole_scale_factors: List[float] = field(default_factory=lambda: [0.85, 1.0, 1.15])
     nms_distance_dy: float = 2.0            # NMS minimum distance
     min_x_ratio: float = 0.10              # minimum x = img_w * N
 

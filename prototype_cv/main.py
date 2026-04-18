@@ -109,7 +109,7 @@ def main(image_path):
     print(f"   Found {len(systems)} individual staves")
 
     # Calculate average dy (staff line spacing)
-    dy = np.mean([(sys[4] - sys[0]) / 4.0 for sys in systems])
+    dy = np.mean([(s[4] - s[0]) / 4.0 for s in systems])
     print(f"   Average staff line spacing (dy): {dy:.1f}px")
 
     # Detect layout: grand staff (piano) vs single staff (solo instrument)
@@ -128,11 +128,11 @@ def main(image_path):
         return
 
     # ── 2b. Auto-detect time signature ──
+    from config import CFG
     time_sig = detect_time_signature(binary, systems[0], dy)
     if time_sig:
         num, den = time_sig
-        bpm_detected = num * (4.0 / den)  # e.g., 2/4 → 2.0, 4/4 → 4.0, 3/8 → 1.5
-        from config import CFG
+        bpm_detected = _timesig_to_bpm(num, den)
         CFG.duration.beats_per_measure = bpm_detected
         print(f"   Time signature: {num}/{den} → beats_per_measure={bpm_detected}")
     else:
@@ -199,21 +199,9 @@ def main(image_path):
         clef_boundaries[pi * 2 + 1] = boundary
 
     # Filter notes based on their system's clef boundary
-    filtered_notes = []
-    for n in all_notes:
-        n_cy = n['y_center']
-        best_sys_idx = None
-        best_dist = float('inf')
-        for si, sys in enumerate(systems):
-            mid_y = (sys[0] + sys[4]) / 2.0
-            dist = abs(n_cy - mid_y)
-            if dist < best_dist:
-                best_dist = dist
-                best_sys_idx = si
-        boundary = clef_boundaries.get(best_sys_idx, clef_area_x)
-        if n['x'] > boundary:
-            filtered_notes.append(n)
-    all_notes = filtered_notes
+    all_notes = [n for n in all_notes
+                 if n['x'] > clef_boundaries.get(_nearest_staff(n['y_center'], systems),
+                                                  clef_area_x)]
     print(f"   After clef area filtering: {len(all_notes)} notes")
 
     # ── 5. Assign Notes to Treble/Bass ──
@@ -605,6 +593,75 @@ def _detect_barlines_single_staff(binary, systems, dy,
     return all_barlines
 
 
+def _nearest_staff(y_center, systems):
+    """Return the index of the staff system closest to y_center."""
+    return min(range(len(systems)),
+               key=lambda i: abs(y_center - (systems[i][0] + systems[i][4]) / 2.0))
+
+
+def _detect_clef_boundaries(all_notes, systems, dy, clef_area_x):
+    """Detect per-staff clef boundaries using the leftmost high-confidence notehead.
+
+    Returns dict mapping staff_index -> x boundary.
+    """
+    clef_boundaries = {}
+    for si, sys_info in enumerate(systems):
+        sys_mid = (sys_info[0] + sys_info[4]) / 2.0
+        raw = [
+            n for n in all_notes
+            if abs(n['y_center'] - sys_mid) < dy * 5
+            and n.get('score', 1.0) >= 0.70
+            and n['x'] > int(dy * 4)
+        ]
+        candidates = []
+        for n in raw:
+            if n['x'] < clef_area_x:
+                has_vertical_sibling = any(
+                    m is not n
+                    and abs(m['x'] - n['x']) <= 2
+                    and abs(m['y_center'] - n['y_center']) > dy * 2
+                    for m in raw
+                )
+                if has_vertical_sibling:
+                    continue
+            candidates.append(n)
+        if candidates:
+            first_x = min(n['x'] for n in candidates)
+            boundary = max(int(dy * 4), first_x - int(dy))
+        else:
+            boundary = clef_area_x
+        clef_boundaries[si] = boundary
+    return clef_boundaries
+
+
+def _filter_rests_single_staff(all_rests, systems, dy, img_w, barlines_per_system,
+                                clef_boundaries, all_detected_notes, music_symbols):
+    """Filter rests for single-staff scores: remove clef-area, barline-near,
+    note-overlapping, and invalid block/small rests."""
+    filtered = []
+    for rest in all_rests:
+        si = rest['system_idx']
+        if si < len(barlines_per_system):
+            barlines = barlines_per_system[si]
+            near_barline = any(abs(rest['x'] - bx) < dy * 3.5 for bx in barlines)
+            clef_x = (clef_boundaries.get(si, int(img_w * 0.17))
+                      if clef_boundaries else int(img_w * 0.17))
+            if rest['x'] < clef_x:
+                near_barline = True
+            if near_barline:
+                continue
+        has_nearby = any(
+            note.get('pair_idx', -1) == si
+            and abs(rest['x'] - note['x']) < dy * 2.0
+            for note in all_detected_notes
+        )
+        if not has_nearby:
+            filtered.append(rest)
+    filtered = [r for r in filtered if _validate_block_rest(music_symbols, r, dy)]
+    filtered = [r for r in filtered if _validate_small_rest(music_symbols, r, dy)]
+    return filtered
+
+
 def _main_single_staff(image_path, systems, staff_lines, music_symbols, binary, dy):
     """Process a single-staff score (solo instrument like 二胡, 笛子, etc.)."""
     from config import CFG
@@ -627,69 +684,19 @@ def _main_single_staff(image_path, systems, staff_lines, music_symbols, binary, 
     nh_template = create_notehead_template(dy)
     th, tw = nh_template.shape
 
-    # Clef boundary for single-staff scores.
-    # All lines use adaptive boundary: the leftmost high-confidence
-    # notehead sets the boundary just before the first real note.
-    # The sibling-reject filter fires in the clef/key-sig/TS zone
-    # (x < clef_area_x) to remove treble-clef interior matches and
-    # time-sig digit false positives.  Beyond that, vertical stacks
-    # are real chords.
     clef_area_x = int(img_w * 0.17)
-    clef_boundaries = {}
-    for si, sys_info in enumerate(systems):
-        sys_top, sys_bot = sys_info[0], sys_info[4]
-        sys_mid = (sys_top + sys_bot) / 2.0
-        # High-confidence notes belonging to this staff, after the clef
-        # itself (x > 4*dy) and within reasonable vertical range.
-        raw = [
-            n for n in all_notes
-            if abs(n['y_center'] - sys_mid) < dy * 5
-            and n.get('score', 1.0) >= 0.70
-            and n['x'] > int(dy * 4)
-        ]
-        # Reject treble-clef interior matches and TS digit false
-        # positives: vertical stacks at the same x (±2 px) with widely
-        # different cy.  Only apply within the clef/TS area
-        # (x < clef_area_x); beyond that, vertical stacks are real
-        # chords and must be kept.
-        candidates = []
-        for n in raw:
-            if n['x'] < clef_area_x:
-                has_vertical_sibling = any(
-                    m is not n
-                    and abs(m['x'] - n['x']) <= 2
-                    and abs(m['y_center'] - n['y_center']) > dy * 2
-                    for m in raw
-                )
-                if has_vertical_sibling:
-                    continue
-            candidates.append(n)
-        if candidates:
-            first_x = min(n['x'] for n in candidates)
-            boundary = max(int(dy * 4), first_x - int(dy))
-        else:
-            boundary = clef_area_x
-        clef_boundaries[si] = boundary
+    clef_boundaries = _detect_clef_boundaries(all_notes, systems, dy, clef_area_x)
 
     # Filter notes by clef boundary
-    filtered_notes = []
-    for n in all_notes:
-        n_cy = n['y_center']
-        best_si = min(range(len(systems)),
-                      key=lambda i: abs(n_cy - (systems[i][0] + systems[i][4]) / 2.0))
-        boundary = clef_boundaries.get(best_si, clef_area_x)
-        if n['x'] > boundary:
-            filtered_notes.append(n)
-    all_notes = filtered_notes
+    all_notes = [n for n in all_notes
+                 if n['x'] > clef_boundaries.get(_nearest_staff(n['y_center'], systems),
+                                                  clef_area_x)]
     print(f"   After clef area filtering: {len(all_notes)} notes")
 
     # Build per-staff notehead x-ranges for barline filtering
     notehead_xs_per_staff = [[] for _ in systems]
     for n in all_notes:
-        n_cy = n['y_center']
-        best_si = min(range(len(systems)),
-                      key=lambda i: abs(n_cy - (systems[i][0] + systems[i][4]) / 2.0))
-        # Store (left_edge, right_edge) of notehead bbox
+        best_si = _nearest_staff(n['y_center'], systems)
         notehead_xs_per_staff[best_si].append((n['x'], n['x'] + n['w']))
 
     # ── 4. Detect Barlines (using noteheads to filter stems) ──
@@ -731,12 +738,9 @@ def _main_single_staff(image_path, systems, staff_lines, music_symbols, binary, 
     print("5. Assigning notes to staves...")
     notes_per_staff = [[] for _ in systems]
     for n in all_notes:
-        n_cy = n['y_center']
-        best_si = min(range(len(systems)),
-                      key=lambda i: abs(n_cy - (systems[i][0] + systems[i][4]) / 2.0))
+        best_si = _nearest_staff(n['y_center'], systems)
         sys_info = systems[best_si]
-        # Only accept notes within reasonable range of staff
-        if abs(n_cy - (sys_info[0] + sys_info[4]) / 2.0) < dy * 8:
+        if abs(n['y_center'] - (sys_info[0] + sys_info[4]) / 2.0) < dy * 8:
             n['system'] = sys_info
             n['pair_idx'] = best_si
             n['clef'] = 'treble'
@@ -744,7 +748,6 @@ def _main_single_staff(image_path, systems, staff_lines, music_symbols, binary, 
 
     # Filter false positives
     for si in range(len(systems)):
-        before = len(notes_per_staff[si])
         notes_per_staff[si] = filter_false_positive_notes(notes_per_staff[si], dy, clef='treble')
         # Additional filter for single-staff: remove notes above the staff
         # near the left edge (measure numbers, rehearsal marks).
@@ -1022,48 +1025,11 @@ def _main_single_staff(image_path, systems, staff_lines, music_symbols, binary, 
     print("7. Detecting rests...")
     all_rests = detect_rests(binary, systems, dy)
     all_rests = [r for r in all_rests if r['x'] > int(img_w * 0.10)]
-    # Filter rests near barlines and notes.
-    # For single-staff mode, system_idx IS the staff index (no grand staff pairing).
-    # _filter_rests uses system_idx // 2 for pair_idx, so we need to remap.
     for r in all_rests:
         r['pair_idx'] = r['system_idx']
-    # Create a version of _filter_rests that uses direct staff index
-    filtered_rests = []
-    for rest in all_rests:
-        si = rest['system_idx']
-        # Remove rests near barlines
-        if si < len(barlines_per_system):
-            barlines = barlines_per_system[si]
-            near_barline = any(abs(rest['x'] - bx) < dy * 3.5 for bx in barlines)
-            # Drop rests sitting in the clef/key-sig area only — NOT
-            # all rests before the first barline. M1 starts AFTER the
-            # clef and can legitimately begin with a rest.
-            clef_x = (clef_boundaries.get(si, int(img_w * 0.17))
-                      if clef_boundaries else int(img_w * 0.17))
-            if rest['x'] < clef_x:
-                near_barline = True
-            if near_barline:
-                continue
-        # Remove rests overlapping with notes. Two checks:
-        # 1. Close in both x and y (standard overlap)
-        # 2. Close in x only (catches beam-area false rests between notes)
-        has_nearby = any(
-            note.get('pair_idx', -1) == si
-            and abs(rest['x'] - note['x']) < dy * 2.0
-            for note in all_detected_notes
-        )
-        if not has_nearby:
-            filtered_rests.append(rest)
-    # Block-rest validation: stop_1/stop_2 templates include staff lines, so
-    # verify each match actually has a rest block on the staff-lines-removed
-    # image.
-    filtered_rests = [r for r in filtered_rests
-                      if _validate_block_rest(music_symbols, r, dy)]
-    # Small-rest validation: stop_4/stop_8 fire on slur arcs and chord
-    # noise; verify a real symbol body exists at the match center.
-    filtered_rests = [r for r in filtered_rests
-                      if _validate_small_rest(music_symbols, r, dy)]
-    all_rests = filtered_rests
+    all_rests = _filter_rests_single_staff(
+        all_rests, systems, dy, img_w, barlines_per_system,
+        clef_boundaries, all_detected_notes, music_symbols)
     print(f"   Found {len(all_rests)} rests")
 
     rests_per_staff = [[] for _ in systems]
@@ -1092,7 +1058,7 @@ def _main_single_staff(image_path, systems, staff_lines, music_symbols, binary, 
     time_sig = detect_time_signature(binary, systems[0], dy)
     if time_sig:
         num, den = time_sig
-        bpm_detected = num * (4.0 / den)
+        bpm_detected = _timesig_to_bpm(num, den)
         CFG.duration.beats_per_measure = bpm_detected
         print(f"   Time signature: {num}/{den} → beats_per_measure={bpm_detected}")
     else:
@@ -1760,7 +1726,6 @@ def _generate_jianpu_pil(pair_data, accidentals_map, dy):
 
     pair_formatted = []
     for pd in pair_data:
-        barline_xs = pd['barlines']
         t_parts = [format_measure(m, accidentals_map, measure_idx=mi, dy=dy)
                    for mi, m in enumerate(pd['treble_measures'])]
         b_parts = [format_measure(m, accidentals_map, measure_idx=mi, dy=dy)
@@ -1907,7 +1872,6 @@ def _generate_jianpu_cv2(pair_data, accidentals_map, dy):
     """Fallback: generate jianpu image using OpenCV."""
     lines = []
     for i, pd in enumerate(pair_data):
-        barline_xs = pd['barlines']
         t_parts = [format_measure(m, accidentals_map, measure_idx=mi, dy=dy)
                    for mi, m in enumerate(pd['treble_measures'])]
         b_parts = [format_measure(m, accidentals_map, measure_idx=mi, dy=dy)

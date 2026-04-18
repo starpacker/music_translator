@@ -5,6 +5,8 @@ then segment into measures by barline positions.
 """
 import cv2
 import numpy as np
+from collections import Counter, defaultdict
+from config import CFG
 from pitch_detection import y_to_jianpu
 
 
@@ -94,8 +96,6 @@ def _count_beams(binary, tip_y, stem_x, dy, staff_lines=None, stem_dir=None,
     min_thickness = max(1, int(dy * 0.08))
     max_thickness = max(min_thickness + 1, int(dy * 0.55))
 
-    _debug_beam = False  # set True for beam detection debug
-
     # Find bands above threshold
     bands = []
     i = 0
@@ -107,9 +107,6 @@ def _count_beams(binary, tip_y, stem_x, dy, staff_lines=None, stem_dir=None,
             bands.append((start, i))
         else:
             i += 1
-
-    if _debug_beam:
-        print(f"    [BEAM DEBUG] raw bands={bands} (abs_y={[(s+roi_y1, e+roi_y1) for s,e in bands]})")
 
     beam_count = 0
     counted_bands = []
@@ -152,9 +149,6 @@ def _count_beams(binary, tip_y, stem_x, dy, staff_lines=None, stem_dir=None,
                     continue  # no beam remaining after notehead removal
             beam_count += 1
             counted_bands.append((start, end))
-            if _debug_beam:
-                print(f"    [BEAM DEBUG] counted band ({start},{end}) abs_y=({start+roi_y1},{end+roi_y1}) "
-                      f"thick={thickness} left={left_ink} right={right_ink}")
 
     # Validate beam gaps: genuine double beams (sixteenths) are closely
     # spaced (~0.2-0.35*dy apart). Larger gaps indicate beam-angle artifacts
@@ -179,9 +173,6 @@ def _count_beams(binary, tip_y, stem_x, dy, staff_lines=None, stem_dir=None,
         if len(filtered) < len(counted_bands):
             beam_count = len(filtered)
             counted_bands = filtered
-
-    if _debug_beam:
-        print(f"    [BEAM DEBUG] beam_count after binary={beam_count} bands={counted_bands}")
 
     # Cross-check with music_symbols: if any staff line is within
     # the ROI, the mask may have hidden beams. Use music_symbols
@@ -215,9 +206,6 @@ def _count_beams(binary, tip_y, stem_x, dy, staff_lines=None, stem_dir=None,
                 else:
                     merged.append((bs, be))
             ms_bands = merged
-        if _debug_beam:
-            print(f"    [BEAM DEBUG] MS masked zone=[{mask_min}:{mask_max}] ms_bands={ms_bands} "
-                  f"abs_y={[(s+roi_y1, e+roi_y1) for s,e in ms_bands]}")
         # Only add at most 1 MS-recovered beam, and only when binary
         # found few beams (0-1). Verify the beam reaches the stem.
         if beam_count <= 1:
@@ -249,8 +237,6 @@ def _count_beams(binary, tip_y, stem_x, dy, staff_lines=None, stem_dir=None,
                             if nearest > dy * 0.8:
                                 continue  # too far from existing beams
                         beam_count += 1
-                        if _debug_beam:
-                            print(f"    [BEAM DEBUG] MS recovered band ({s},{e}) abs_y=({s+roi_y1},{e+roi_y1})")
                         break  # at most 1 recovery
 
     # Check for flag if no beams found.
@@ -282,7 +268,6 @@ def _count_beams(binary, tip_y, stem_x, dy, staff_lines=None, stem_dir=None,
                 total_pixels = flag_roi.size - flag_roi.shape[0] * (s_col2 - s_col1)
                 if total_pixels > 0:
                     density = np.count_nonzero(flag_roi > 127) / total_pixels
-                    from config import CFG
                     # Mask all known noteheads from flag ROI to avoid
                     # notehead fragments inflating flag density.
                     if other_noteheads:
@@ -390,16 +375,6 @@ def _detect_duration(music_symbols, binary, notes_in_group, dy):
     hollow = any(_is_hollow(music_symbols, n, dy) for n in notes_in_group)
     if hollow:
         return 2.0
-
-    # Determine chord stem direction from staff position
-    system = notes_in_group[0].get('system')
-    if system is not None and len(system) >= 5:
-        mid_line = system[2]
-        avg_y = np.mean([n['y_center'] for n in notes_in_group])
-        chord_stem_dir = 'down' if avg_y <= mid_line else 'up'
-    else:
-        stemmed = [n for n in notes_in_group if n['stem']['stem_dir'] is not None]
-        chord_stem_dir = max(stemmed, key=lambda n: n['stem']['stem_length'])['stem']['stem_dir'] if stemmed else 'down'
 
     # Duration will be refined later by estimate_durations_in_measures()
     # which combines beam detection with proportional spacing.
@@ -629,10 +604,7 @@ def build_note_units(notes, music_symbols, binary, dy, single_staff=False):
     for n in notes:
         cx = n['x'] + n['w'] // 2
         cy = n['y_center']
-        # Use a larger pad to capture the outline of hollow noteheads.
-        # Center fill may be low (hollow), but outline fill should be non-zero.
         pad = max(2, int(dy * 0.15))
-        pad_large = max(4, int(dy * 0.4))
         ny1 = max(0, cy - pad)
         ny2 = min(music_symbols.shape[0], cy + pad)
         nx1 = max(0, cx - pad)
@@ -640,8 +612,6 @@ def build_note_units(notes, music_symbols, binary, dy, single_staff=False):
         region = music_symbols[ny1:ny2, nx1:nx2]
         if region.size > 0:
             fill = np.mean(region) / 255.0
-            # Check larger region as secondary fill check
-            fill_large = fill  # default to same as center fill
 
             # Position-aware threshold: notes far from staff need higher fill
             sys = n.get('system')
@@ -651,10 +621,9 @@ def build_note_units(notes, music_symbols, binary, dy, single_staff=False):
                 above = sys[0] - cy
                 if below > dy * 1.5 or above > dy * 3:
                     min_fill = 0.45
-            # Accept if center fill OR outline fill is sufficient.
-            # Also check for hollow noteheads (whole/half notes): low center
+            # Check for hollow noteheads (whole/half notes): low center
             # fill but significant ring density from the notehead outline.
-            if fill < min_fill and fill_large < min_fill:
+            if fill < min_fill:
                 ring_pad = max(5, int(dy * 0.5))
                 ry1 = max(0, cy - ring_pad)
                 ry2 = min(music_symbols.shape[0], cy + ring_pad)
@@ -769,7 +738,6 @@ def build_note_units(notes, music_symbols, binary, dy, single_staff=False):
 
             # Check y-distance: new note must be within chord_y_range of at
             # least one existing member (not just the first).
-            from config import CFG
             min_dist = min(abs(note_b['y_center'] - g['y_center']) for g in group)
             y_ok = min_dist <= dy * CFG.chord.y_range_max_dy
 
@@ -1004,6 +972,141 @@ def _resolve_measure_bpm(measure, default_bpm, timesig_anchors):
     return applicable
 
 
+def _clean_and_dedup_rests(events, dy):
+    """Remove rests too close to notes and deduplicate nearby rests.
+
+    Returns a new event list with spurious rests removed.
+    """
+    note_unit_xs = sorted(e['x'] for e in events if e['type'] == 'note_unit')
+    cleaned = []
+    for e in events:
+        if e['type'] == 'rest':
+            too_close = any(abs(e['x'] - nx) < dy * 1.5 for nx in note_unit_xs)
+            if too_close:
+                continue
+            left = [nx for nx in note_unit_xs if nx < e['x']]
+            right = [nx for nx in note_unit_xs if nx > e['x']]
+            if left and right:
+                total_gap = min(right) - max(left)
+                if total_gap < dy * 5.0:
+                    continue
+        cleaned.append(e)
+
+    final = []
+    for e in cleaned:
+        if e['type'] == 'rest':
+            duplicate = any(
+                f['type'] == 'rest' and abs(f['x'] - e['x']) < dy * 2.0
+                for f in final
+            )
+            if duplicate:
+                continue
+        final.append(e)
+    return final
+
+
+def _adjust_rest_durations(measures, measure_bpms, beats_per_measure,
+                            sorted_barlines, dy):
+    """Adjust rest durations so each measure totals beats_per_measure.
+
+    Three strategies tried in order:
+      0. Insert a missing rest into a detected gap
+      1. Upgrade individual rests to fill the gap
+      2. Equal distribution
+    Picks whichever is closest to the target.
+    """
+    for mi_r, measure in enumerate(measures):
+        m_bpm = measure_bpms[mi_r] if mi_r < len(measure_bpms) else beats_per_measure
+        note_events = [e for e in measure if e['type'] == 'note_unit']
+        rest_events = [e for e in measure if e['type'] == 'rest']
+        if not rest_events:
+            continue
+        note_beats = sum(e['unit']['duration'] for e in note_events)
+        remaining = m_bpm - note_beats
+        if remaining <= 0:
+            continue
+
+        n_rests = len(rest_events)
+        detected_durs = [e['duration'] for e in rest_events]
+        detected_total = sum(detected_durs)
+
+        # Strategy 0: insert a missing rest if gap is a standard duration
+        gap = remaining - detected_total
+        if gap in STANDARD_DURATIONS or any(abs(gap - d) < 0.01 for d in STANDARD_DURATIONS):
+            snapped_gap = min(STANDARD_DURATIONS, key=lambda d: abs(d - gap))
+            if note_events and rest_events:
+                all_sorted = sorted(measure, key=lambda e: e['x'])
+                first_rest_x = min(e['x'] for e in rest_events)
+                prev_x = None
+                for e in all_sorted:
+                    if e['x'] < first_rest_x and e['type'] != 'rest':
+                        prev_x = e['x']
+                if prev_x is not None and (first_rest_x - prev_x) > dy * 2.5:
+                    insert_x = (prev_x + first_rest_x) // 2
+                    measure.append({
+                        'type': 'rest', 'x': insert_x,
+                        'duration': snapped_gap,
+                        'duration_source': 'gap_insert',
+                    })
+                    measure.sort(key=lambda e: e['x'])
+                    rest_events = [e for e in measure if e['type'] == 'rest']
+                    n_rests = len(rest_events)
+                    detected_durs = [e['duration'] for e in rest_events]
+                    detected_total = sum(detected_durs)
+                    gap = remaining - detected_total
+
+        best_durs = list(detected_durs)
+        # Strategy 1: upgrade individual rests to fill the gap
+        if 0 < gap <= 3.5:
+            right_bl = None
+            if sorted_barlines:
+                for bx in sorted_barlines:
+                    if bx > max(e['x'] for e in measure):
+                        right_bl = bx
+                        break
+            rest_spans = []
+            for ri, re_ in enumerate(rest_events):
+                rx = re_['x']
+                next_x = None
+                for e in measure:
+                    if e['x'] > rx + 1:
+                        next_x = e['x']
+                        break
+                if next_x is None and right_bl is not None:
+                    next_x = right_bl
+                span = (next_x - rx) if next_x else 0
+                rest_spans.append(span)
+            indices = sorted(range(n_rests),
+                             key=lambda i: (detected_durs[i], -rest_spans[i]))
+            trial = list(detected_durs)
+            gap_left = gap
+            for idx in indices:
+                if gap_left <= 0.01:
+                    break
+                target = trial[idx] + gap_left
+                candidates = [d for d in STANDARD_DURATIONS
+                              if trial[idx] < d <= target + 0.01]
+                if not candidates:
+                    continue
+                trial[idx] = max(candidates)
+                gap_left = remaining - sum(trial)
+            if abs(sum(trial) - remaining) < abs(detected_total - remaining):
+                best_durs = trial
+
+        # Strategy 2: equal distribution
+        per_rest = _snap_duration(remaining / n_rests)
+        equal_total = per_rest * n_rests
+
+        # Pick whichever is closest to remaining
+        best_total = sum(best_durs)
+        if abs(equal_total - remaining) < abs(best_total - remaining):
+            for e in rest_events:
+                e['duration'] = per_rest
+        elif abs(best_total - remaining) < abs(detected_total - remaining):
+            for i, e in enumerate(rest_events):
+                e['duration'] = best_durs[i]
+
+
 def segment_into_measures(note_units, rests, barline_xs, dy,
                           beats_per_measure=2.0, is_first_system=True,
                           tuplet_markers=None, timesig_anchors=None,
@@ -1038,39 +1141,8 @@ def segment_into_measures(note_units, rests, barline_xs, dy,
                        'duration': rest.get('duration', 1.0),
                        'duration_source': 'rest_detected'})
 
-    # Sort by x
     events.sort(key=lambda e: e['x'])
-
-    # Clean rests: remove rests within dy*1.5 of any note_unit, or
-    # sandwiched between two notes with total gap < dy*5 (likely a
-    # false template match in a beamed group — e.g. dotted-eighth gap).
-    note_unit_xs = sorted(e['x'] for e in events if e['type'] == 'note_unit')
-    cleaned = []
-    for e in events:
-        if e['type'] == 'rest':
-            too_close = any(abs(e['x'] - nx) < dy * 1.5 for nx in note_unit_xs)
-            if too_close:
-                continue
-            # Reject rests sandwiched between close notes
-            left = [nx for nx in note_unit_xs if nx < e['x']]
-            right = [nx for nx in note_unit_xs if nx > e['x']]
-            if left and right:
-                total_gap = min(right) - max(left)
-                if total_gap < dy * 5.0:
-                    continue
-        cleaned.append(e)
-
-    # Deduplicate rests within dy*2.0 of each other
-    final_events = []
-    for e in cleaned:
-        if e['type'] == 'rest':
-            duplicate = any(
-                f['type'] == 'rest' and abs(f['x'] - e['x']) < dy * 2.0
-                for f in final_events
-            )
-            if duplicate:
-                continue
-        final_events.append(e)
+    final_events = _clean_and_dedup_rests(events, dy)
 
     sorted_barlines = sorted(barline_xs)
 
@@ -1169,121 +1241,8 @@ def segment_into_measures(note_units, rests, barline_xs, dy,
         if has_whole:
             measure[:] = [e for e in measure if e['type'] != 'rest']
 
-    # Post-processing: adjust rest durations so each measure totals
-    # beats_per_measure. Strategy:
-    # 1. If detected rest durations sum close to remaining, try upgrading
-    #    individual rests to fill the gap exactly.
-    # 2. If that fails, try distributing remaining beats equally.
-    # 3. Keep whichever approach is closest to beats_per_measure.
-    for mi_r, measure in enumerate(measures):
-        m_bpm = measure_bpms[mi_r] if mi_r < len(measure_bpms) else beats_per_measure
-        note_events = [e for e in measure if e['type'] == 'note_unit']
-        rest_events = [e for e in measure if e['type'] == 'rest']
-        if not rest_events:
-            continue
-        note_beats = sum(e['unit']['duration'] for e in note_events)
-        remaining = m_bpm - note_beats
-        if remaining <= 0:
-            continue
-
-        n_rests = len(rest_events)
-        detected_durs = [e['duration'] for e in rest_events]
-        detected_total = sum(detected_durs)
-
-        # Strategy 0: if the gap is a standard duration and there is
-        # enough x-space between the last note and the first rest,
-        # insert a new rest instead of upgrading.  This produces
-        # cleaner results (e.g., 0/2 + 0 + 0- vs 0. + 0-) when an
-        # eighth rest was missed by the detector.
-        gap = remaining - detected_total
-        if gap in STANDARD_DURATIONS or any(abs(gap - d) < 0.01 for d in STANDARD_DURATIONS):
-            snapped_gap = min(STANDARD_DURATIONS, key=lambda d: abs(d - gap))
-            # Find position: look for x-space between last note and first rest
-            if note_events and rest_events:
-                all_sorted = sorted(measure, key=lambda e: e['x'])
-                first_rest_x = min(e['x'] for e in rest_events)
-                # Find the last non-rest event before the first rest
-                prev_x = None
-                for e in all_sorted:
-                    if e['x'] < first_rest_x and e['type'] != 'rest':
-                        prev_x = e['x']
-                if prev_x is not None and (first_rest_x - prev_x) > dy * 2.5:
-                    # Enough space — insert a rest between note and first rest
-                    insert_x = (prev_x + first_rest_x) // 2
-                    measure.append({
-                        'type': 'rest', 'x': insert_x,
-                        'duration': snapped_gap,
-                        'duration_source': 'gap_insert',
-                    })
-                    measure.sort(key=lambda e: e['x'])
-                    # Recompute after insertion
-                    rest_events = [e for e in measure if e['type'] == 'rest']
-                    n_rests = len(rest_events)
-                    detected_durs = [e['duration'] for e in rest_events]
-                    detected_total = sum(detected_durs)
-                    gap = remaining - detected_total
-
-        best_durs = list(detected_durs)
-        # Strategy 1: upgrade individual rests to fill the gap.
-        # When multiple rests share the same detected duration, prefer
-        # upgrading the one with more horizontal space (proportional
-        # spacing heuristic: longer rests occupy more x-distance).
-        if 0 < gap <= 3.5:
-            # Compute x-span for each rest: distance to next event.
-            # For the rightmost rest in a measure, the next "event" is
-            # the right barline — so include barline_xs fallback.
-            right_bl = None
-            if sorted_barlines:
-                for bx in sorted_barlines:
-                    if bx > max(e['x'] for e in measure):
-                        right_bl = bx
-                        break
-            rest_spans = []
-            for ri, re_ in enumerate(rest_events):
-                rx = re_['x']
-                next_x = None
-                for e in measure:
-                    if e['x'] > rx + 1:
-                        next_x = e['x']
-                        break
-                if next_x is None and right_bl is not None:
-                    next_x = right_bl
-                span = (next_x - rx) if next_x else 0
-                rest_spans.append(span)
-            # Sort by (duration, -span): smallest duration first,
-            # largest span first among equal durations
-            indices = sorted(range(n_rests),
-                             key=lambda i: (detected_durs[i], -rest_spans[i]))
-            trial = list(detected_durs)
-            gap_left = gap
-            for idx in indices:
-                if gap_left <= 0.01:
-                    break
-                # Upgrade to the largest standard duration that fits the
-                # remaining gap. Allows 0.5 → 2.0 jumps when one rest was
-                # detected as eighth but is actually a half rest.
-                target = trial[idx] + gap_left
-                candidates = [d for d in STANDARD_DURATIONS
-                              if trial[idx] < d <= target + 0.01]
-                if not candidates:
-                    continue
-                trial[idx] = max(candidates)
-                gap_left = remaining - sum(trial)
-            if abs(sum(trial) - remaining) < abs(detected_total - remaining):
-                best_durs = trial
-
-        # Strategy 2: equal distribution
-        per_rest = _snap_duration(remaining / n_rests)
-        equal_total = per_rest * n_rests
-
-        # Pick whichever is closest to remaining
-        best_total = sum(best_durs)
-        if abs(equal_total - remaining) < abs(best_total - remaining):
-            for e in rest_events:
-                e['duration'] = per_rest
-        elif abs(best_total - remaining) < abs(detected_total - remaining):
-            for i, e in enumerate(rest_events):
-                e['duration'] = best_durs[i]
+    _adjust_rest_durations(measures, measure_bpms, beats_per_measure,
+                           sorted_barlines, dy)
 
     # Post-processing: fill empty/under-filled measures with rests so each
     # measure totals beats_per_measure. Only enabled for single-staff
@@ -1388,7 +1347,6 @@ def _apply_tuplet_markers(measures, tuplet_markers, beats_per_measure_or_list,
     # Group markers by best_mi so multiple markers within one measure
     # are applied collectively — otherwise later markers' leftover pass
     # overwrites earlier markers' tuplet assignments.
-    from collections import defaultdict
     markers_by_measure = defaultdict(list)
     for marker in tuplet_markers:
         mx = marker['x']
@@ -1445,7 +1403,6 @@ def _apply_tuplet_markers(measures, tuplet_markers, beats_per_measure_or_list,
             for note in e['unit']['notes']:
                 idurs.append(note.get('individual_duration', 0.25))
         if idurs:
-            from collections import Counter
             base_dur = Counter(idurs).most_common(1)[0][0]
         else:
             base_dur = 0.25
@@ -1630,7 +1587,6 @@ def _estimate_durations_in_measure(measure, beats_per_measure=2.0, measure_idx=0
     for e in note_events:
         idurs = [ne.get('individual_duration', 1.0) for ne in e['unit']['notes']]
         if idurs:
-            from collections import Counter
             beam_durs.append(Counter(idurs).most_common(1)[0][0])
         else:
             beam_durs.append(1.0)

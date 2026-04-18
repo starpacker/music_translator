@@ -3,14 +3,7 @@ import numpy as np
 import os
 import glob
 
-# --- Path to the provided symbol templates ---
-PICTURE_DIR = os.path.join(os.path.dirname(__file__),
-    "..", "repo", "translate-staff-to-simple-musical-notation-master",
-    "score_recognition_v4", "picture")
-PICTURE_EXPAND_DIR = os.path.join(os.path.dirname(__file__),
-    "..", "repo", "translate-staff-to-simple-musical-notation-master",
-    "score_recognition_v4", "picture_expand")
-TEMPLATE_DIR = os.path.join(os.path.dirname(__file__), "..", "template")
+from config import TEMPLATE_DIR, PICTURE_DIR, PICTURE_EXPAND_DIR
 
 # Names of non-note symbols that should be EXCLUDED
 EXCLUSION_TEMPLATES = [
@@ -683,32 +676,3 @@ def find_noteheads(binary_img, dy, threshold=0.55, staff_systems=None, music_sym
     return picked_boxes, create_notehead_template(dy), exclusion_zones
 
 
-def _load_real_notehead_templates(dy):
-    """
-    Load real notehead templates from the template/ folder (1_1.jpg, 1_2.jpg, etc.)
-    and scale them to match the current staff spacing.
-    """
-    templates = []
-    if not os.path.isdir(TEMPLATE_DIR):
-        return templates
-    
-    for ext in ['*.png', '*.jpg']:
-        for path in glob.glob(os.path.join(TEMPLATE_DIR, ext)):
-            fname = os.path.basename(path)
-            name = os.path.splitext(fname)[0]
-            # Only load filled notehead templates (1_x)
-            if name.startswith('1_'):
-                img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
-                if img is not None:
-                    _, bimg = cv2.threshold(img, 128, 255, cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
-                    # Scale to match dy
-                    th, tw = bimg.shape
-                    ideal_h = int(dy * 0.85)
-                    if th > 0:
-                        scale = ideal_h / float(th)
-                        new_w = max(3, int(tw * scale))
-                        new_h = max(3, int(th * scale))
-                        resized = cv2.resize(bimg, (new_w, new_h), interpolation=cv2.INTER_AREA)
-                        templates.append(resized)
-    
-    return templates

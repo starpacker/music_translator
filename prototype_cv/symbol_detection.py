@@ -11,16 +11,7 @@ import numpy as np
 import os
 import glob
 
-# --- Template paths ---
-# New comprehensive template folder
-TEMPLATE_DIR = os.path.join(os.path.dirname(__file__), "..", "template")
-# Legacy template folders (fallback)
-PICTURE_DIR = os.path.join(os.path.dirname(__file__),
-    "..", "repo", "translate-staff-to-simple-musical-notation-master",
-    "score_recognition_v4", "picture")
-PICTURE_EXPAND_DIR = os.path.join(os.path.dirname(__file__),
-    "..", "repo", "translate-staff-to-simple-musical-notation-master",
-    "score_recognition_v4", "picture_expand")
+from config import TEMPLATE_DIR, PICTURE_DIR, PICTURE_EXPAND_DIR
 
 
 def _load_template(name, directory=None):
@@ -183,8 +174,7 @@ def detect_barlines(binary_img, staff_systems, dy, min_spacing_dy=18.0):
 # ============================================================
 def detect_accidentals_global(binary_img, staff_systems, dy, clef_boundaries=None,
                               music_symbols=None):
-    """
-    Detect accidentals globally in each staff region using multi-scale template matching.
+    """Detect accidentals globally in each staff region using multi-scale template matching.
     Uses ALL available sharp/flat/natural templates from the new template/ folder.
 
     If music_symbols is provided, also searches it for naturals (catches signs
@@ -193,6 +183,8 @@ def detect_accidentals_global(binary_img, staff_systems, dy, clef_boundaries=Non
     Returns list of dicts: {'x': x, 'y': y, 'type': '#'/'b'/'n', 'score': score, 'system_idx': idx}
     Natural signs ('n') are used to cancel accidental persistence within a measure.
     """
+    from config import CFG
+
     # Load all sharp, flat, and natural templates from new template folder
     sharp_templates = _load_all_templates_by_prefix("sharp_", TEMPLATE_DIR)
     flat_templates = _load_all_templates_by_prefix("flat_", TEMPLATE_DIR)
@@ -254,8 +246,7 @@ def detect_accidentals_global(binary_img, staff_systems, dy, clef_boundaries=Non
                     
                     resized = cv2.resize(template, (new_w, new_h), interpolation=cv2.INTER_AREA)
                     res = cv2.matchTemplate(roi, resized, cv2.TM_CCOEFF_NORMED)
-                    
-                    from config import CFG
+
                     ac = CFG.accidental
                     threshold = ac.match_threshold_sharp if acc_char == '#' else ac.match_threshold_global
                     loc = np.where(res >= threshold)
@@ -354,8 +345,6 @@ def assign_accidentals_to_notes(global_accidentals, noteheads, dy):
     Returns dict mapping (note_cx, note_cy) -> '#' or 'b'
     """
     accidentals_map = {}
-    used_accidentals = set()
-    
     # Sort accidentals by score descending so high-confidence ones get assigned first
     sorted_accs = sorted(enumerate(global_accidentals), key=lambda x: x[1]['score'], reverse=True)
     
@@ -402,7 +391,6 @@ def assign_accidentals_to_notes(global_accidentals, noteheads, dy):
             # Only assign if this note doesn't already have a higher-score accidental
             if best_key not in accidentals_map:
                 accidentals_map[best_key] = (acc['type'], acc['score'])
-                used_accidentals.add(acc_idx)
     
     result = {k: v[0] for k, v in accidentals_map.items()}
     print(f"   Assigned {len(result)} accidentals to notes "
@@ -412,67 +400,6 @@ def assign_accidentals_to_notes(global_accidentals, noteheads, dy):
     return result
 
 
-# Legacy per-note approach (kept as fallback)
-def detect_accidentals(binary_img, staff_systems, dy, noteheads):
-    """
-    Detect sharp (#) and flat (b) symbols near noteheads using per-note search.
-    Uses multiple templates from the new template/ folder.
-    """
-    sharp_templates = _load_all_templates_by_prefix("sharp_", TEMPLATE_DIR)
-    flat_templates = _load_all_templates_by_prefix("flat_", TEMPLATE_DIR)
-    
-    # Also from legacy
-    for name in ["sharp_1.jpg"]:
-        t = _load_template(name, PICTURE_DIR)
-        if t is not None:
-            sharp_templates.append((name + "_legacy", t))
-    for name in ["flat_1.jpg"]:
-        t = _load_template(name, PICTURE_DIR)
-        if t is not None:
-            flat_templates.append((name + "_legacy", t))
-    
-    print(f"   Per-note: {len(sharp_templates)} sharp templates, {len(flat_templates)} flat templates")
-    
-    accidentals = {}
-    img_h, img_w = binary_img.shape
-    
-    for note in noteheads:
-        nx = note['x']
-        ny = note['y_center']
-        
-        search_x1 = max(0, nx - int(dy * 3.5))
-        search_x2 = nx + int(dy * 0.3)
-        search_y1 = max(0, ny - int(dy * 2.0))
-        search_y2 = min(img_h, ny + int(dy * 2.0))
-        
-        roi = binary_img[search_y1:search_y2, search_x1:search_x2]
-        roi_h, roi_w = roi.shape
-        if roi_h < 5 or roi_w < 5:
-            continue
-        
-        best_score = 0.0
-        best_acc = None
-        best_threshold = 0.45
-        
-        for tname, template in sharp_templates:
-            score = _match_accidental_template(roi, template, dy, roi_h, roi_w)
-            if score > best_score and score > best_threshold:
-                best_score = score
-                best_acc = '#'
-        
-        for tname, template in flat_templates:
-            score = _match_accidental_template(roi, template, dy, roi_h, roi_w)
-            if score > best_score and score > best_threshold:
-                best_score = score
-                best_acc = 'b'
-        
-        if best_acc is not None:
-            key = (note['x'] + note['w'] // 2, note['y_center'])
-            if key not in accidentals or accidentals[key][1] < best_score:
-                accidentals[key] = (best_acc, best_score)
-    
-    result = {k: v[0] for k, v in accidentals.items()}
-    return result
 
 
 def _match_accidental_template(roi, template, dy, roi_h, roi_w):
@@ -507,170 +434,66 @@ def _match_accidental_template(roi, template, dy, roi_h, roi_w):
 # ============================================================
 def detect_rests(binary_img, staff_systems, dy):
     """Detect rest symbols using templates."""
-    rest_templates = {
-        'stop_4.jpg': 1.0,   # quarter rest = 1 beat
-    }
-    
+    from config import CFG
+    rc = CFG.rest
+
     rests = []
     img_h, img_w = binary_img.shape
-    
+
+    # Per-template config: (filename, duration, height_ratio, scale_factors, threshold, dirs)
+    rest_specs = [
+        ('stop_4.jpg', 1.0, rc.quarter_height_ratio, rc.quarter_scale_factors,
+         rc.quarter_threshold, [TEMPLATE_DIR, PICTURE_EXPAND_DIR, PICTURE_DIR]),
+        ('stop_8.jpg', 0.5, rc.eighth_height_ratio, rc.eighth_scale_factors,
+         rc.eighth_threshold, [TEMPLATE_DIR, PICTURE_EXPAND_DIR]),
+        ('stop_2.jpg', 2.0, 1.0, rc.half_whole_scale_factors,
+         rc.half_threshold, [TEMPLATE_DIR, PICTURE_EXPAND_DIR, PICTURE_DIR]),
+        ('stop_1.jpg', 4.0, 1.0, rc.half_whole_scale_factors,
+         rc.whole_threshold, [TEMPLATE_DIR, PICTURE_EXPAND_DIR, PICTURE_DIR]),
+    ]
+
     for sys_idx, system in enumerate(staff_systems):
         staff_height = system[4] - system[0]
         margin = int(dy * 0.5)
         search_y1 = max(0, system[0] - margin)
         search_y2 = min(img_h, system[4] + margin)
-        
-        for tname, duration in rest_templates.items():
-            # Try from multiple directories
+        roi = binary_img[search_y1:search_y2, :]
+        roi_h, roi_w = roi.shape
+
+        for tname, duration, height_ratio, scale_factors, threshold, dirs in rest_specs:
             template = None
-            for d in [TEMPLATE_DIR, PICTURE_EXPAND_DIR, PICTURE_DIR]:
+            for d in dirs:
                 template = _load_template(tname, d)
                 if template is not None:
                     break
             if template is None:
                 continue
-            
+
             th_orig, tw_orig = template.shape
-            ideal_scale = (staff_height * 0.5) / float(th_orig) if th_orig > 0 else 0.5
+            ideal_scale = (staff_height * height_ratio) / float(th_orig) if th_orig > 0 else 0.5
 
-            for scale_factor in [ideal_scale * 0.8, ideal_scale * 0.9,
-                                 ideal_scale, ideal_scale * 1.1, ideal_scale * 1.2]:
-                new_h = int(th_orig * scale_factor)
-                new_w = int(tw_orig * scale_factor)
-
-                if new_h < 5 or new_w < 5:
-                    continue
-
-                roi = binary_img[search_y1:search_y2, :]
-                roi_h, roi_w = roi.shape
-
-                if new_h >= roi_h or new_w >= roi_w:
+            for sf in scale_factors:
+                new_h = int(th_orig * ideal_scale * sf)
+                new_w = int(tw_orig * ideal_scale * sf)
+                if new_h < 5 or new_w < 5 or new_h >= roi_h or new_w >= roi_w:
                     continue
 
                 resized = cv2.resize(template, (new_w, new_h), interpolation=cv2.INTER_AREA)
                 res = cv2.matchTemplate(roi, resized, cv2.TM_CCOEFF_NORMED)
-
-                threshold = 0.48  # quarter rest threshold
-                loc = np.where(res >= threshold)
-                
-                for pt in zip(*loc[::-1]):
-                    rx = pt[0] + new_w // 2
-                    ry = search_y1 + pt[1] + new_h // 2
-                    score = res[pt[1], pt[0]]
-                    
-                    rests.append({
-                        'x': rx,
-                        'y_center': ry,
-                        'system_idx': sys_idx,
-                        'duration': duration,
-                        'score': score,
-                        'type': tname,
-                    })
-    
-    # Also try stop_8 (eighth rest = 0.5 beat) for half-beat rests
-    for sys_idx, system in enumerate(staff_systems):
-        staff_height = system[4] - system[0]
-        margin = int(dy * 0.5)
-        search_y1 = max(0, system[0] - margin)
-        search_y2 = min(img_h, system[4] + margin)
-        
-        for tname in ['stop_8.jpg']:
-            template = None
-            for d in [TEMPLATE_DIR, PICTURE_EXPAND_DIR]:
-                template = _load_template(tname, d)
-                if template is not None:
-                    break
-            if template is None:
-                continue
-            
-            th_orig, tw_orig = template.shape
-            ideal_scale = (staff_height * 0.35) / float(th_orig) if th_orig > 0 else 0.5
-            
-            for scale_factor in [ideal_scale * 0.85, ideal_scale, ideal_scale * 1.15]:
-                new_h = int(th_orig * scale_factor)
-                new_w = int(tw_orig * scale_factor)
-                
-                if new_h < 5 or new_w < 5:
-                    continue
-                
-                roi = binary_img[search_y1:search_y2, :]
-                roi_h, roi_w = roi.shape
-                
-                if new_h >= roi_h or new_w >= roi_w:
-                    continue
-                
-                resized = cv2.resize(template, (new_w, new_h), interpolation=cv2.INTER_AREA)
-                res = cv2.matchTemplate(roi, resized, cv2.TM_CCOEFF_NORMED)
-
-                threshold = 0.60
                 loc = np.where(res >= threshold)
 
                 for pt in zip(*loc[::-1]):
-                    rx = pt[0] + new_w // 2
-                    ry = search_y1 + pt[1] + new_h // 2
-                    score = res[pt[1], pt[0]]
-                    
                     rests.append({
-                        'x': rx,
-                        'y_center': ry,
-                        'system_idx': sys_idx,
-                        'duration': 0.5,
-                        'score': score,
-                        'type': tname,
-                    })
-    
-    # Detect half rests (stop_2) and whole rests (stop_1).
-    # These templates include staff line context, so scale to match staff height.
-    for sys_idx, system in enumerate(staff_systems):
-        staff_height = system[4] - system[0]
-        margin = int(dy * 0.5)
-        search_y1 = max(0, system[0] - margin)
-        search_y2 = min(img_h, system[4] + margin)
-
-        for tname, duration, thresh in [('stop_2.jpg', 2.0, 0.55), ('stop_1.jpg', 4.0, 0.60)]:
-            template = None
-            for d in [TEMPLATE_DIR, PICTURE_EXPAND_DIR, PICTURE_DIR]:
-                template = _load_template(tname, d)
-                if template is not None:
-                    break
-            if template is None:
-                continue
-
-            th_orig, tw_orig = template.shape
-            # Scale template so its height matches the staff height
-            ideal_scale = staff_height / float(th_orig) if th_orig > 0 else 0.5
-
-            for scale_factor in [ideal_scale * 0.85, ideal_scale, ideal_scale * 1.15]:
-                new_h = int(th_orig * scale_factor)
-                new_w = int(tw_orig * scale_factor)
-                if new_h < 5 or new_w < 5:
-                    continue
-
-                roi = binary_img[search_y1:search_y2, :]
-                roi_h, roi_w = roi.shape
-                if new_h >= roi_h or new_w >= roi_w:
-                    continue
-
-                resized = cv2.resize(template, (new_w, new_h),
-                                     interpolation=cv2.INTER_AREA)
-                res = cv2.matchTemplate(roi, resized, cv2.TM_CCOEFF_NORMED)
-
-                loc = np.where(res >= thresh)
-                for pt in zip(*loc[::-1]):
-                    rx = pt[0] + new_w // 2
-                    ry = search_y1 + pt[1] + new_h // 2
-                    score = res[pt[1], pt[0]]
-                    rests.append({
-                        'x': rx,
-                        'y_center': ry,
+                        'x': pt[0] + new_w // 2,
+                        'y_center': search_y1 + pt[1] + new_h // 2,
                         'system_idx': sys_idx,
                         'duration': duration,
-                        'score': score,
+                        'score': float(res[pt[1], pt[0]]),
                         'type': tname,
                     })
 
     if rests:
-        rests = _nms_rests(rests, dy * 2.0)
+        rests = _nms_rests(rests, dy * rc.nms_distance_dy)
 
     return rests
 

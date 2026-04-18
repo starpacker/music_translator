@@ -158,17 +158,13 @@ BASS_NOTE_STANDARD  = [4, 3, 2, 1, 7, 6, 5, 4, 3, 2, 1, 7, 6, 5, 4, 3, 2, 1, 7]
 BASS_RANGE_LEGACY = TREBLE_RANGE
 BASS_NOTE_LEGACY  = TREBLE_NOTE
 
-# Default: use standard bass clef mapping
-# Set USE_LEGACY_BASS = True to match the original GT convention
-USE_LEGACY_BASS = True
 
-BASS_RANGE = BASS_RANGE_LEGACY if USE_LEGACY_BASS else BASS_RANGE_STANDARD
-BASS_NOTE  = BASS_NOTE_LEGACY  if USE_LEGACY_BASS else BASS_NOTE_STANDARD
-
-# Extended pitch sequence for notes beyond the 19-position grid
-# This is the chromatic scale in jianpu: ...7,6,5,4,3,2,1,7,6,5,4,3,2,1,7,6,5...
-# Each step is a half-step on the staff (line or space)
-_PITCH_SEQUENCE = [1, 2, 3, 4, 5, 6, 7]  # repeating pattern
+def _get_bass_tables():
+    """Return (BASS_RANGE, BASS_NOTE) based on config setting."""
+    from config import CFG
+    if CFG.duration.use_legacy_bass:
+        return BASS_RANGE_LEGACY, BASS_NOTE_LEGACY
+    return BASS_RANGE_STANDARD, BASS_NOTE_STANDARD
 
 
 def _build_line_21(staff_system):
@@ -286,18 +282,20 @@ def y_to_jianpu(y_center, staff_system, clef='treble'):
     idx = y_to_extended_position(y_center, staff_system)
     
     # If within standard range, use the lookup tables
+    if clef == 'bass':
+        bass_range, bass_note = _get_bass_tables()
     if 0 <= idx <= 18:
         if clef == 'bass':
-            note_num = BASS_NOTE[idx]
-            octave = BASS_RANGE[idx]
+            note_num = bass_note[idx]
+            octave = bass_range[idx]
         else:
             note_num = TREBLE_NOTE[idx]
             octave = TREBLE_RANGE[idx]
     else:
         # Extended range: extrapolate from the nearest edge
         if clef == 'bass':
-            range_table = BASS_RANGE
-            note_table = BASS_NOTE
+            range_table = bass_range
+            note_table = bass_note
         else:
             range_table = TREBLE_RANGE
             note_table = TREBLE_NOTE
