@@ -197,11 +197,16 @@ def _count_beams(binary, tip_y, stem_x, dy, staff_lines=None, stem_dir=None,
                 ms_bands.append((s, j))
             else:
                 j += 1
-        # Merge bands with small gaps
+        # Merge bands with small gaps — but only truly overlapping
+        # bands (gap ≤ 0).  A gap of 1-3 px between two MS bands
+        # typically means two distinct beams separated by a staff-
+        # line removal artifact; merging them creates a single fat
+        # band that can overlap with a binary-detected beam and get
+        # rejected, hiding the second beam (sixteenth → eighth).
         if len(ms_bands) > 1:
             merged = [ms_bands[0]]
             for bs, be in ms_bands[1:]:
-                if bs - merged[-1][1] <= 3:
+                if bs - merged[-1][1] <= 0:
                     merged[-1] = (merged[-1][0], be)
                 else:
                     merged.append((bs, be))

@@ -526,7 +526,16 @@ def _detect_barlines_single_staff(binary, systems, dy,
 
             score = val * 0.5 + half_score * 0.5
             if on_notehead:
-                score *= 0.2  # heavy penalty for stems
+                # A real barline adjacent to a notehead has:
+                #   - high half_score (spans full staff) ≥0.75
+                #   - lower projection than the staff max (not boosted
+                #     by notehead/stem ink): val < max_fill * 0.95
+                # A stem has low half_score OR projection near/above
+                # the staff max (notehead + stem ink inflates density).
+                if half_score >= 0.75 and val < max_fill * 0.95:
+                    score *= 0.50  # mild — likely barline + adjacent notehead
+                else:
+                    score *= 0.20  # heavy — likely a stem
 
             scored.append((cx, score))
 
