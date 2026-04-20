@@ -89,7 +89,7 @@ from note_unit import (build_note_units, segment_into_measures,
 from jianpu_formatter import format_measure, format_output
 
 
-def main(image_path):
+def main(image_path, bpm_override=False):
     print(f"Processing image: {image_path}")
 
     # ── 1. Staff Line Extraction ──
@@ -118,7 +118,7 @@ def main(image_path):
 
     if layout == 'single':
         return _main_single_staff(image_path, systems, staff_lines, music_symbols,
-                                   binary, dy)
+                                   binary, dy, bpm_override=bpm_override)
 
     grand_staff_pairs = pair_grand_staves(systems)
     print(f"   Paired into {len(grand_staff_pairs)} grand staff systems (treble+bass)")
@@ -677,7 +677,8 @@ def _filter_rests_single_staff(all_rests, systems, dy, img_w, barlines_per_syste
     return filtered
 
 
-def _main_single_staff(image_path, systems, staff_lines, music_symbols, binary, dy):
+def _main_single_staff(image_path, systems, staff_lines, music_symbols, binary, dy,
+                        bpm_override=False):
     """Process a single-staff score (solo instrument like 二胡, 笛子, etc.)."""
     from config import CFG
     img_w = binary.shape[1]
@@ -701,7 +702,9 @@ def _main_single_staff(image_path, systems, staff_lines, music_symbols, binary, 
 
     clef_area_x = int(img_w * 0.17)
     # Quick time-sig check for clef boundary width decision
-    _has_ts = detect_time_signature(binary, systems[0], dy) is not None
+    # On continuation pages (bpm_override), there's no TS in the clef area.
+    _has_ts = (not bpm_override
+               and detect_time_signature(binary, systems[0], dy) is not None)
     clef_boundaries = _detect_clef_boundaries(all_notes, systems, dy, clef_area_x,
                                                has_time_sig=_has_ts)
     print(f"   Clef boundaries: {clef_boundaries} (clef_area_x={clef_area_x})")
@@ -736,7 +739,10 @@ def _main_single_staff(image_path, systems, staff_lines, music_symbols, binary, 
     # The fraction line of a time signature (e.g. "4/4") is a short
     # horizontal bar that the barline detector can match. Remove any
     # barline within 2*dy of a detected TS digit position.
+    # Skip on continuation pages (bpm_override) — no TS digits present.
     for si, sys_info in enumerate(systems):
+        if bpm_override:
+            continue
         bl = barlines_per_system[si]
         if not bl:
             continue
@@ -882,7 +888,12 @@ def _main_single_staff(image_path, systems, staff_lines, music_symbols, binary, 
     # digit position. This covers BOTH mid-staff TS changes (where d['x']
     # is the snapped-barline anchor) AND the clef-area TS (where d['x']=0
     # is the anchor and d['match_x'] holds the actual digit position).
+    # Skip on continuation pages (bpm_override) — no time-sig digits to
+    # confuse with hollow noteheads, and false TS detections can remove
+    # real notes.
     for si, sys_info in enumerate(systems):
+        if bpm_override:
+            continue
         bl = barlines_per_system[si] if si < len(barlines_per_system) else []
         ts_dets = detect_time_signatures_along_system(binary, sys_info, bl, dy)
         ts_xs = []
@@ -1120,14 +1131,17 @@ def _main_single_staff(image_path, systems, staff_lines, music_symbols, binary, 
             note['stem'] = track_stem(music_symbols, note, dy, binary=binary)
 
     # ── 8b. Auto-detect time signature ──
-    time_sig = detect_time_signature(binary, systems[0], dy)
-    if time_sig:
-        num, den = time_sig
-        bpm_detected = _timesig_to_bpm(num, den)
-        CFG.duration.beats_per_measure = bpm_detected
-        print(f"   Time signature: {num}/{den} → beats_per_measure={bpm_detected}")
+    if bpm_override:
+        print(f"   Time signature: using override {CFG.duration.beats_per_measure}")
     else:
-        print(f"   Time signature: not detected, using default {CFG.duration.beats_per_measure}")
+        time_sig = detect_time_signature(binary, systems[0], dy)
+        if time_sig:
+            num, den = time_sig
+            bpm_detected = _timesig_to_bpm(num, den)
+            CFG.duration.beats_per_measure = bpm_detected
+            print(f"   Time signature: {num}/{den} → beats_per_measure={bpm_detected}")
+        else:
+            print(f"   Time signature: not detected, using default {CFG.duration.beats_per_measure}")
 
     # ── 9. Build Note Units & Segment Measures ──
     print("9. Building note units and segmenting measures...")
@@ -1142,12 +1156,19 @@ def _main_single_staff(image_path, systems, staff_lines, music_symbols, binary, 
         units = build_note_units(notes, music_symbols, binary, dy, single_staff=True)
         # No merge_overlapping for single-staff (no two-voice)
 
-        anchors, current_bpm = _build_system_timesig_anchors(
-            binary, sys_info, barlines, dy, current_bpm)
-        bpm = anchors[0][1]
-        if len(anchors) > 1 or anchors[0][1] != CFG.duration.beats_per_measure:
-            print(f"   Staff {si + 1}: timesig anchors = "
-                  f"{[(round(x,1), b) for x, b in anchors]}")
+        # When BPM is overridden (continuation page), skip mid-line
+        # time-sig detection — false positives from noteheads are common
+        # and cause wrong beat counts across entire staves.
+        if bpm_override:
+            anchors = [(0.0, current_bpm)]
+            bpm = current_bpm
+        else:
+            anchors, current_bpm = _build_system_timesig_anchors(
+                binary, sys_info, barlines, dy, current_bpm)
+            bpm = anchors[0][1]
+            if len(anchors) > 1 or anchors[0][1] != CFG.duration.beats_per_measure:
+                print(f"   Staff {si + 1}: timesig anchors = "
+                      f"{[(round(x,1), b) for x, b in anchors]}")
 
         # ── Filter notes near time-sig barline positions ──
         # Time-signature digits at barlines can be detected as filled
@@ -2014,10 +2035,12 @@ if __name__ == "__main__":
     import sys
     img_path = sys.argv[1] if len(sys.argv) > 1 else "../input_page1.png"
     # Optional: --bpm N to override beats_per_measure
+    bpm_override = False
     if '--bpm' in sys.argv:
         idx = sys.argv.index('--bpm')
         if idx + 1 < len(sys.argv):
             from config import CFG
             CFG.duration.beats_per_measure = float(sys.argv[idx + 1])
             print(f"Override beats_per_measure = {CFG.duration.beats_per_measure}")
-    main(img_path)
+            bpm_override = True
+    main(img_path, bpm_override=bpm_override)
