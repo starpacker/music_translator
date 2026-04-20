@@ -552,7 +552,7 @@ def _detect_barlines_single_staff(binary, systems, dy,
                     deduped[-1] = (cx, sc)
             scored = deduped
 
-        scored = [(cx, sc) for cx, sc in scored if sc > 0.35]
+        scored = [(cx, sc) for cx, sc in scored if sc > 0.50]
 
         # Use adaptive clef boundary if available, else config
         clef_end = (clef_boundaries.get(si, int(img_w * bc.clef_end_ratio))
@@ -594,6 +594,7 @@ def _detect_barlines_single_staff(binary, systems, dy,
 
         result = [x for x, _ in result_scored]
 
+
         # Keep end-of-line barline — segment_into_measures merges
         # content after the last barline into the final measure.
 
@@ -608,10 +609,14 @@ def _nearest_staff(y_center, systems):
                key=lambda i: abs(y_center - (systems[i][0] + systems[i][4]) / 2.0))
 
 
-def _detect_clef_boundaries(all_notes, systems, dy, clef_area_x):
+def _detect_clef_boundaries(all_notes, systems, dy, clef_area_x,
+                            has_time_sig=True):
     """Detect per-staff clef boundaries using the leftmost high-confidence notehead.
 
     Returns dict mapping staff_index -> x boundary.
+    Notes inside the standard clef area (clef + time-signature zone) are
+    excluded from boundary computation — they are almost always false
+    positives from the treble/bass clef or time-signature digits.
     """
     clef_boundaries = {}
     for si, sys_info in enumerate(systems):
@@ -622,20 +627,21 @@ def _detect_clef_boundaries(all_notes, systems, dy, clef_area_x):
             and n.get('score', 1.0) >= 0.70
             and n['x'] > int(dy * 4)
         ]
-        candidates = []
-        for n in raw:
-            if n['x'] < clef_area_x:
-                has_vertical_sibling = any(
-                    m is not n
-                    and abs(m['x'] - n['x']) <= 2
-                    and abs(m['y_center'] - n['y_center']) > dy * 2
-                    for m in raw
-                )
-                if has_vertical_sibling:
-                    continue
-            candidates.append(n)
-        if candidates:
-            first_x = min(n['x'] for n in candidates)
+        # Only consider notes OUTSIDE the clef zone for boundary
+        # computation.  Clef symbols and time-signature digits routinely
+        # produce high-score false positives (score=1.0) that pull the
+        # boundary left and let artifacts through.
+        # System 0 has clef+key-sig+time-sig → full clef_area_x (17%).
+        # Systems 1+ have only the clef → narrower zone (80% of full).
+        # When no time signature is detected (continuation pages), system
+        # 0 also uses the narrower zone.
+        if si == 0 and has_time_sig:
+            min_clef = clef_area_x
+        else:
+            min_clef = int(clef_area_x * 0.80)
+        outside = [n for n in raw if n['x'] >= min_clef]
+        if outside:
+            first_x = min(n['x'] for n in outside)
             boundary = max(int(dy * 4), first_x - int(dy))
         else:
             boundary = clef_area_x
@@ -694,13 +700,25 @@ def _main_single_staff(image_path, systems, staff_lines, music_symbols, binary, 
     th, tw = nh_template.shape
 
     clef_area_x = int(img_w * 0.17)
-    clef_boundaries = _detect_clef_boundaries(all_notes, systems, dy, clef_area_x)
+    # Quick time-sig check for clef boundary width decision
+    _has_ts = detect_time_signature(binary, systems[0], dy) is not None
+    clef_boundaries = _detect_clef_boundaries(all_notes, systems, dy, clef_area_x,
+                                               has_time_sig=_has_ts)
+    print(f"   Clef boundaries: {clef_boundaries} (clef_area_x={clef_area_x})")
 
     # Filter notes by clef boundary
+    before_count = len(all_notes)
+    filtered_out = [n for n in all_notes
+                    if n['x'] <= clef_boundaries.get(_nearest_staff(n['y_center'], systems),
+                                                      clef_area_x)]
     all_notes = [n for n in all_notes
                  if n['x'] > clef_boundaries.get(_nearest_staff(n['y_center'], systems),
                                                   clef_area_x)]
-    print(f"   After clef area filtering: {len(all_notes)} notes")
+    print(f"   After clef area filtering: {len(all_notes)} notes (removed {before_count - len(all_notes)})")
+    if filtered_out:
+        for n in sorted(filtered_out, key=lambda x: x['x'])[:10]:
+            si = _nearest_staff(n['y_center'], systems)
+            print(f"     [FILTERED] staff={si} x={n['x']} y={n['y_center']:.0f} score={n.get('score',0):.3f}")
 
     # Build per-staff notehead x-ranges for barline filtering
     notehead_xs_per_staff = [[] for _ in systems]
@@ -771,10 +789,23 @@ def _main_single_staff(image_path, systems, staff_lines, music_symbols, binary, 
                     and n['y_center'] < staff_top - dy * 0.3
                     and n['score'] < 0.70):
                 continue
-            # Filter notes far above the staff (> 2.5*dy) — these are tempo
-            # markings, rehearsal marks, or other text, not real notes.
-            if n['y_center'] < staff_top - dy * 2.5:
+            # Filter notes far above the staff — tempo markings, rehearsal
+            # marks, etc.  On continuation pages (no time signature), high-
+            # score notes (>= 0.95) on ledger lines can legitimately extend
+            # to 4-5 ledger lines (5*dy) above staff. On pages WITH a time
+            # signature (page 1), keep the strict limit to avoid false
+            # positives from tempo/rehearsal markings.
+            above_dist = staff_top - n['y_center']
+            if above_dist > dy * 5.0:
                 continue
+            if _has_ts:
+                # Strict: original 2.5*dy limit for pages with time sig
+                if above_dist > dy * 2.5:
+                    continue
+            else:
+                # Relaxed: allow high-score notes on ledger lines
+                if above_dist > dy * 2.5 and n['score'] < 0.95:
+                    continue
             clean.append(n)
         notes_per_staff[si] = clean
 
@@ -814,6 +845,32 @@ def _main_single_staff(image_path, systems, staff_lines, music_symbols, binary, 
         if removed:
             print(f"   Staff {si+1}: removed {removed} duplicate note(s)")
 
+    # ── 5b2. Remove low-score filled notes near hollow notes (tremolo marks) ──
+    # Tremolo marks (diagonal double-bars between whole notes) produce
+    # filled-template false positives with score ~0.55-0.65.  Remove any
+    # note with score < 0.65 that is within 5*dy of a confirmed hollow
+    # note (score in [0.78, 0.81]).
+    # ONLY for grand-staff (piano) where tremolo marks are common. For
+    # single-staff instruments, low-score filled notes near hollow notes
+    # are usually chord companions (e.g., qudi stacked intervals).
+    if False:  # disabled for now — was causing qudi chord note removal
+        for si in range(len(systems)):
+            notes = notes_per_staff[si]
+            hollow = [n for n in notes if 0.78 <= n.get('score', 1.0) <= 0.81]
+            if not hollow:
+                continue
+            keep = []
+            for n in notes:
+                if n.get('score', 1.0) < 0.65:
+                    near_hollow = any(abs(n['x'] - h['x']) < dy * 5 for h in hollow)
+                    if near_hollow:
+                        continue
+                keep.append(n)
+            removed = len(notes) - len(keep)
+            if removed:
+                notes_per_staff[si] = keep
+                print(f"   Staff {si+1}: removed {removed} tremolo artifact(s)")
+
     total = sum(len(ns) for ns in notes_per_staff)
     print(f"   Total notes after filtering: {total}")
 
@@ -852,21 +909,20 @@ def _main_single_staff(image_path, systems, staff_lines, music_symbols, binary, 
                   f"near time-sig")
 
     # ── 5d. Hollow chord companion scan ──
-    # For confirmed hollow noteheads (score ≈ 0.80), search the same x on
-    # music_symbols for additional notehead outlines. Only runs when
-    # filled-note chords exist (multi-voice evidence after all filtering).
+    # Check if existing notes already form chords (vertically stacked at
+    # same x AND separated vertically by 1-4*dy). This distinguishes real
+    # stacked intervals (qudi, ~2dy) from false positives on different
+    # staff lines (erhu, ~6dy).
     has_chords = False
+    chord_pair_count = 0
     for ns in notes_per_staff:
-        xs_sorted = sorted(n['x'] for n in ns)
-        for xi in range(len(xs_sorted) - 1):
-            if xs_sorted[xi + 1] - xs_sorted[xi] < dy * 0.8:
-                pair = [n for n in ns if abs(n['x'] - xs_sorted[xi]) < dy * 0.8]
-                ys = [n['y_center'] for n in pair]
-                if len(ys) >= 2 and max(ys) - min(ys) > dy * 0.8:
-                    has_chords = True
-                    break
-        if has_chords:
-            break
+        for i, n1 in enumerate(ns):
+            for n2 in ns[i + 1:]:
+                vert_sep = abs(n1['y_center'] - n2['y_center'])
+                if (abs(n1['x'] - n2['x']) < dy * 0.5 and
+                        dy * 1.0 < vert_sep < dy * 2.5):
+                    chord_pair_count += 1
+    has_chords = chord_pair_count >= 3
     if has_chords:
         added_total = 0
         for si in range(len(systems)):
@@ -1092,6 +1148,21 @@ def _main_single_staff(image_path, systems, staff_lines, music_symbols, binary, 
         if len(anchors) > 1 or anchors[0][1] != CFG.duration.beats_per_measure:
             print(f"   Staff {si + 1}: timesig anchors = "
                   f"{[(round(x,1), b) for x, b in anchors]}")
+
+        # ── Filter notes near time-sig barline positions ──
+        # Time-signature digits at barlines can be detected as filled
+        # noteheads.  Remove note units whose x falls within 2*dy of a
+        # barline-attached time-sig anchor (not the clef@x=0 anchor).
+        if len(anchors) > 1:
+            ts_bar_xs = [ax for ax, _ in anchors if ax > 0]
+            ts_radius = int(dy * 2)
+            before = len(units)
+            units = [u for u in units
+                     if not any(abs(u['notes'][0]['x'] - bx) < ts_radius
+                                for bx in ts_bar_xs)]
+            removed = before - len(units)
+            if removed:
+                print(f"   Staff {si+1}: removed {removed} note(s) near time-sig barlines")
 
         is_first = (si == 0)
         staff_tuplets = [m for m in tuplet_markers

@@ -11,7 +11,12 @@ from pitch_detection import y_to_jianpu
 
 
 def _is_hollow(music_symbols, note, dy):
-    """Check if a notehead is hollow by examining fill ratio of center region."""
+    """Check if a notehead is hollow by examining fill ratio of center region.
+
+    For half notes, the stem passes through the center and inflates
+    overall fill. Split the center into left and right halves — if
+    EITHER half has low fill, the notehead is hollow (half or whole).
+    """
     cx = note['x'] + note['w'] // 2
     cy = note['y_center']
     r = max(1, int(dy * 0.2))
@@ -26,7 +31,19 @@ def _is_hollow(music_symbols, note, dy):
     if region.size == 0:
         return False
     fill_ratio = np.count_nonzero(region > 127) / region.size
-    return fill_ratio <= 0.4
+    if fill_ratio <= 0.4:
+        return True
+    # Half-note check: stem inflates overall fill. Split into left/right
+    # halves and check each separately. The side without the stem will
+    # have low fill if the notehead is truly hollow.
+    mid_x = region.shape[1] // 2
+    if mid_x < 1:
+        return False
+    left_half = region[:, :mid_x]
+    right_half = region[:, mid_x:]
+    left_fill = np.count_nonzero(left_half > 127) / left_half.size if left_half.size else 1.0
+    right_fill = np.count_nonzero(right_half > 127) / right_half.size if right_half.size else 1.0
+    return min(left_fill, right_fill) <= 0.35
 
 
 def _count_beams(binary, tip_y, stem_x, dy, staff_lines=None, stem_dir=None,
@@ -80,6 +97,7 @@ def _count_beams(binary, tip_y, stem_x, dy, staff_lines=None, stem_dir=None,
                 nh_mask[ly1:ly2, lx1:lx2] = True
 
     projection = np.count_nonzero(roi > 127, axis=1) / roi_w
+    raw_projection = projection.copy()  # keep unmasked copy for straddle check
 
     # Mask staff line rows on the binary projection
     mask_radius = max(3, int(dy * 0.2))
@@ -135,6 +153,17 @@ def _count_beams(binary, tip_y, stem_x, dy, staff_lines=None, stem_dir=None,
             min_beam_extent = max(3, int(dy * 0.3))
             if left_ink < min_beam_extent and right_ink < min_beam_extent:
                 continue  # insufficient horizontal extent for a beam
+            # One-sided contamination check: if a band has ink on only one
+            # side (other side = 0) AND is far from the stem tip, it's likely
+            # beam ink from a neighboring note bleeding into this ROI.
+            # Legitimate end-of-group beams are close to the tip (<0.8*dy).
+            one_sided = (left_ink >= min_beam_extent and right_ink == 0) or \
+                        (right_ink >= min_beam_extent and left_ink == 0)
+            if one_sided:
+                band_abs_y = roi_y1 + mid_row
+                dist_from_tip = abs(band_abs_y - tip_y)
+                if dist_from_tip > dy * 0.8:
+                    continue  # far from tip — contamination from neighbor
             # Notehead check: a beam extends wider than any notehead.
             # If removing notehead-region ink leaves insufficient horizontal
             # extent, the band is a notehead, not a beam.
@@ -149,6 +178,54 @@ def _count_beams(binary, tip_y, stem_x, dy, staff_lines=None, stem_dir=None,
                     continue  # no beam remaining after notehead removal
             beam_count += 1
             counted_bands.append((start, end))
+
+    # ── Staff-line straddling check ──
+    # If two consecutive bands sit on opposite sides of a masked staff-
+    # line zone, they are fragments of ONE beam split by the mask, not
+    # two separate beams. Merge them into a single count.
+    # Guard: use music_symbols (staff-lines-removed) to check the gap.
+    # If there is still significant horizontal ink in the gap region on
+    # the clean image, it's one beam. If ink disappears with staff
+    # lines, the bands are two separate beams.
+    if beam_count >= 2 and len(counted_bands) >= 2 and masked_rows:
+        merged_bands = [counted_bands[0]]
+        for bi in range(1, len(counted_bands)):
+            prev_end = counted_bands[bi - 1][1]
+            curr_start = counted_bands[bi][0]
+            # Check if all rows between prev_end and curr_start are masked
+            gap_rows = set(range(prev_end, curr_start))
+            if gap_rows and gap_rows.issubset(masked_rows):
+                should_merge = True
+                # Thickness guard: if merging produces a band wider than
+                # max_thickness, the fragments are two separate beams that
+                # happen to straddle a staff line, not one beam split by mask.
+                merged_thickness = counted_bands[bi][1] - merged_bands[-1][0]
+                if merged_thickness > max_thickness:
+                    should_merge = False
+                # If music_symbols available, check clean gap density
+                elif music_symbols is not None and curr_start > prev_end:
+                    gap_abs_y1 = roi_y1 + prev_end
+                    gap_abs_y2 = roi_y1 + curr_start
+                    ms_gap = music_symbols[gap_abs_y1:gap_abs_y2,
+                                           roi_x1:roi_x2]
+                    if ms_gap.size > 0:
+                        gap_proj = np.count_nonzero(ms_gap > 127, axis=1) / max(1, ms_gap.shape[1])
+                        gap_density = np.mean(gap_proj)
+                        # A real beam shows continuous ink even after
+                        # staff removal (density > threshold). Two beams
+                        # separated by a staff line show low density in
+                        # the clean gap.
+                        if gap_density < beam_threshold * 0.6:
+                            should_merge = False
+                if should_merge:
+                    merged_bands[-1] = (merged_bands[-1][0], counted_bands[bi][1])
+                else:
+                    merged_bands.append(counted_bands[bi])
+            else:
+                merged_bands.append(counted_bands[bi])
+        if len(merged_bands) < len(counted_bands):
+            beam_count = len(merged_bands)
+            counted_bands = merged_bands
 
     # Validate beam gaps: genuine double beams (sixteenths) are closely
     # spaced (~0.2-0.35*dy apart). Larger gaps indicate beam-angle artifacts
@@ -186,7 +263,7 @@ def _count_beams(binary, tip_y, stem_x, dy, staff_lines=None, stem_dir=None,
         margin = 2
         mask_min = max(0, min(masked_rows) - margin)
         mask_max = min(roi_h, max(masked_rows) + margin + 1)
-        ms_threshold = 0.15
+        ms_threshold = 0.20
         ms_bands = []
         j = mask_min
         while j < mask_max:
@@ -211,15 +288,42 @@ def _count_beams(binary, tip_y, stem_x, dy, staff_lines=None, stem_dir=None,
                 else:
                     merged.append((bs, be))
             ms_bands = merged
-        # Only add at most 1 MS-recovered beam, and only when binary
-        # found few beams (0-1). Verify the beam reaches the stem.
-        if beam_count <= 1:
+        # Recover beams from music_symbols when binary detection found
+        # NO beams and staff-line masking may have hidden them.
+        # Only for beam_count==0 to avoid inflating already-detected beams.
+        if beam_count == 0:
             ms_stem_local = stem_x - roi_x1
+            recovered = 0
             for s, e in ms_bands:
                 thickness = e - s
                 if min_thickness <= thickness <= max_thickness:
+                    # Reject 1px bands adjacent to masked staff-line rows
+                    # (same check as for binary bands — these are usually
+                    # faint fragments of a beam split by staff-line removal).
+                    if thickness <= 1:
+                        if s - 1 in masked_rows or e in masked_rows:
+                            continue
                     overlaps = any(not (e <= bs or s >= be) for bs, be in counted_bands)
                     if not overlaps:
+                        # Distance-from-tip check: a real beam should be
+                        # near the stem tip. Reject bands far from it.
+                        band_mid_abs = roi_y1 + (s + e) / 2
+                        if abs(band_mid_abs - tip_y) > dy * 0.8:
+                            continue  # too far from stem tip
+                        # One-sided check on music_symbols: a real beam
+                        # extends on both sides or at least toward the
+                        # neighboring beamed note. If ink is only on one
+                        # side, it's contamination from a neighbor's beam.
+                        ms_mid_r = (s + e) // 2
+                        if 0 <= ms_mid_r < ms_roi.shape[0]:
+                            ms_row = ms_roi[ms_mid_r, :]
+                            ms_margin = 3
+                            ms_left = np.sum(ms_row[:max(0, ms_stem_local - ms_margin)] > 127)
+                            ms_right = np.sum(ms_row[min(roi_w, ms_stem_local + ms_margin + 1):] > 127)
+                            ms_min_ext = max(3, int(dy * 0.3))
+                            if (ms_left >= ms_min_ext and ms_right < 2) or \
+                               (ms_right >= ms_min_ext and ms_left < 2):
+                                continue  # one-sided ink — contamination
                         # Verify beam reaches the stem on music_symbols.
                         # Check ANY row in the band (not just mid — the
                         # mid may fall on a staff-line gap).
@@ -242,7 +346,10 @@ def _count_beams(binary, tip_y, stem_x, dy, staff_lines=None, stem_dir=None,
                             if nearest > dy * 0.8:
                                 continue  # too far from existing beams
                         beam_count += 1
-                        break  # at most 1 recovery
+                        counted_bands.append((s, e))
+                        recovered += 1
+                        if recovered >= 1:
+                            break
 
     # Check for flag if no beams found.
     # Flags extend horizontally from the stem tip. To avoid counting the
@@ -571,9 +678,11 @@ def detect_duration_per_note(note, binary, dy, music_symbols=None, all_notes=Non
     dur = _detect_individual_duration(beam_count, has_flag, is_hollow)
 
     # Check for augmentation dot (multiplies duration by 1.5)
-    if _detect_dot(binary, note, dy, all_notes=all_notes,
-                   music_symbols=music_symbols):
+    has_dot = _detect_dot(binary, note, dy, all_notes=all_notes,
+                          music_symbols=music_symbols)
+    if has_dot:
         dur *= 1.5
+    note['_has_dot'] = has_dot  # stash for post-processing
 
     return dur
 
@@ -820,6 +929,7 @@ def build_note_units(notes, music_symbols, binary, dy, single_staff=False):
                 'beam_count': n.get('beam_count', -1),
                 'has_flag': n.get('has_flag', False),
                 'score': n.get('score', 0.0),
+                '_has_dot': n.get('_has_dot', False),
             })
 
         # Detect duration
@@ -844,6 +954,113 @@ def build_note_units(notes, music_symbols, binary, dy, single_staff=False):
             'stem_x': stem_x,
             'x': avg_x,
         })
+
+    # ── Beam consistency: upgrade isolated beam=0 notes ──
+    # In a sequence of beamed notes (beam≥1), beam=0 notes with
+    # similar x-spacing are likely also beamed (their beam was
+    # missed due to staff-line overlap). Scan ±3 neighbors to find
+    # beamed context, then upgrade.
+    if len(note_units) >= 3:
+        changed = True
+        while changed:
+            changed = False
+            for i in range(1, len(note_units) - 1):
+                u = note_units[i]
+                n0 = u['notes'][0]
+                if n0.get('beam_count', -1) != 0 or n0.get('has_flag', False):
+                    continue
+                # Find nearest beamed neighbor on each side (within 3)
+                left_beam = None
+                for j in range(i - 1, max(-1, i - 4), -1):
+                    nb = note_units[j]['notes'][0]
+                    if nb.get('beam_count', -1) >= 1:
+                        left_beam = j
+                        break
+                right_beam = None
+                for j in range(i + 1, min(len(note_units), i + 4)):
+                    nb = note_units[j]['notes'][0]
+                    if nb.get('beam_count', -1) >= 1:
+                        right_beam = j
+                        break
+                if left_beam is None or right_beam is None:
+                    continue
+                # Check spacing consistency with immediate neighbors.
+                # A beam-group member has very uniform gaps (ratio < 1.3).
+                # Wider ratio suggests a standalone note between groups.
+                gap_left = abs(u['x'] - note_units[i - 1]['x'])
+                gap_right = abs(note_units[i + 1]['x'] - u['x'])
+                if gap_left > 0 and gap_right > 0:
+                    ratio = max(gap_left, gap_right) / min(gap_left, gap_right)
+                    if ratio < 1.3:
+                        n0['beam_count'] = 1
+                        n0['individual_duration'] = 0.5
+                        u['duration'] = 0.5
+                        changed = True
+
+    # ── Dotted-pair fix + false-dot suppression ──
+    # Runs AFTER beam consistency so beam counts are corrected.
+    # Priority: try dotted-pair fix first (real dot), then suppress false dots.
+    for i in range(len(note_units) - 1):
+        u1 = note_units[i]
+        u2 = note_units[i + 1]
+        n1 = u1['notes'][0]
+        n2 = u2['notes'][0]
+        if not n1.get('_has_dot', False):
+            continue
+        n1_beam = n1.get('beam_count', -1)
+        n2_beam = n2.get('beam_count', -1)
+        # Dotted-pair fix: n1 has dot, n2 has beam≥2 (companion sixteenth)
+        if n1_beam >= 1 and n2_beam >= 2:
+            gap = abs(u2['x'] - u1['x'])
+            if gap < dy * 5:
+                n1['individual_duration'] = 0.75
+                u1['duration'] = 0.75
+                continue
+        # Extended pair fix: n2 has beam=1 (beam-2 missed due to staff-line
+        # masking), but gap pattern confirms dotted pair — n1's gap to n2 is
+        # much wider than n2's gap to the note after it.
+        if n1_beam >= 1 and n2_beam == 1 and i + 2 < len(note_units) and i > 0:
+            gap1 = abs(u2['x'] - u1['x'])
+            gap2 = abs(note_units[i + 2]['x'] - u2['x'])
+            # Require that the predecessor has a different beam count
+            # (rules out false dots at the start of a uniform eighth group).
+            pred_beam = note_units[i - 1]['notes'][0].get('beam_count', -1)
+            if gap2 > 0 and gap1 / gap2 > 1.5 and pred_beam != n1_beam:
+                n1['individual_duration'] = 0.75
+                u1['duration'] = 0.75
+                continue
+        # Suppress false dot: dot on a note in a uniform beam group
+        # (≥3 consecutive same-beam notes, looking both forward and backward).
+        # Guard: only suppress if spacing is uniform. A dotted note has a
+        # wider gap to its companion — don't suppress if this note's gap is
+        # >1.3× the next same-beam note's gap (indicates dotted pattern).
+        if n1_beam == n2_beam and n1_beam >= 1:
+            fwd = (i + 2 < len(note_units) and
+                   note_units[i + 2]['notes'][0].get('beam_count', -1) == n1_beam)
+            bwd = (i > 0 and
+                   note_units[i - 1]['notes'][0].get('beam_count', -1) == n1_beam)
+            if fwd and bwd:
+                # Fully embedded in uniform group → suppress dot
+                n1['individual_duration'] = n1['individual_duration'] / 1.5
+                u1['duration'] = u1['duration'] / 1.5
+                n1['_has_dot'] = False
+            elif fwd and not bwd:
+                # Start-of-group edge case (often i=0): suppress dot if
+                # the forward window already contains a long note (>1.0
+                # beats). A genuine dotted-pair measure with all eighth
+                # companions has exactly the right total; but if a dotted
+                # quarter or longer exists, the dot would push total even
+                # further over budget → likely a false positive.
+                has_long = False
+                for k in range(i + 1, min(i + 8, len(note_units))):
+                    kd = note_units[k]['notes'][0].get('individual_duration', 0.5)
+                    if kd > 1.0:
+                        has_long = True
+                        break
+                if has_long:
+                    n1['individual_duration'] = n1['individual_duration'] / 1.5
+                    u1['duration'] = u1['duration'] / 1.5
+                    n1['_has_dot'] = False
 
     return note_units
 
@@ -1108,8 +1325,18 @@ def _adjust_rest_durations(measures, measure_bpms, beats_per_measure,
             for e in rest_events:
                 e['duration'] = per_rest
         elif abs(best_total - remaining) < abs(detected_total - remaining):
+            best_durs.sort()
             for i, e in enumerate(rest_events):
                 e['duration'] = best_durs[i]
+
+        # Standard notation: rests go short→long (fill current beat first).
+        # Re-sort if the total is correct but ordering is wrong.
+        if n_rests > 1:
+            cur_durs = [e['duration'] for e in rest_events]
+            if abs(sum(cur_durs) - remaining) < 0.01 and cur_durs != sorted(cur_durs):
+                cur_durs.sort()
+                for i, e in enumerate(rest_events):
+                    e['duration'] = cur_durs[i]
 
 
 def segment_into_measures(note_units, rests, barline_xs, dy,
@@ -1217,6 +1444,9 @@ def segment_into_measures(note_units, rests, barline_xs, dy,
     # A hollow note with floored score (0.80) is often a false detection
     # (slur curve, ornament, etc.).  If removing it brings the measure
     # total closer to the beat target, it is almost certainly spurious.
+    # Exception: if ALL notes in a measure are hollow, they are likely
+    # real notes in a longer time signature (e.g., two half notes in 4/4
+    # when default bpm is 2). Don't remove in that case.
     for mi_h, measure in enumerate(measures):
         m_bpm = measure_bpms[mi_h] if mi_h < len(measure_bpms) else beats_per_measure
         note_evts = [e for e in measure if e['type'] == 'note_unit']
@@ -1228,6 +1458,10 @@ def segment_into_measures(note_units, rests, barline_xs, dy,
             e for e in note_evts
             if any(abs(n.get('score', 1.0) - 0.80) < 0.02 for n in e['unit']['notes'])
         ]
+        # If every note in the measure is hollow, they are likely real
+        # notes in a measure with more beats than detected. Skip removal.
+        if len(hollow_candidates) == len(note_evts) and len(note_evts) >= 2:
+            continue
         for hc in hollow_candidates:
             hc_dur = hc['unit']['duration']
             without = total_dur - hc_dur
@@ -1554,7 +1788,7 @@ def _estimate_durations_in_measure(measure, beats_per_measure=2.0, measure_idx=0
     if is_first_system and measure_idx == 0 and n >= 2 and barline_xs and len(barline_xs) > 0:
         first_barline = barline_xs[0]
         event_xs = [e['x'] for e in note_events]
-        if first_barline > 0 and all(x > first_barline * 0.4 for x in event_xs):
+        if first_barline > 0 and all(x > first_barline * 0.6 for x in event_xs):
             for e in note_events:
                 e['unit']['duration'] = 0.5
                 e['duration_source'] = 'pickup'
@@ -1597,6 +1831,7 @@ def _estimate_durations_in_measure(measure, beats_per_measure=2.0, measure_idx=0
             beam_durs.append(1.0)
 
     # Snap non-standard durations (e.g. 0.375 from detection artifacts)
+    beam_durs_raw = list(beam_durs)
     beam_durs = [_snap_duration(d) for d in beam_durs]
     beam_note_total = sum(beam_durs)
     beam_total = beam_note_total + rest_beats
@@ -1606,7 +1841,10 @@ def _estimate_durations_in_measure(measure, beats_per_measure=2.0, measure_idx=0
     # For 2/4 with matching beam total, beam detection preserves dots and
     # sixteenths that proportional spacing would flatten to equal eighths.
     beam_total_matches = abs(beam_total - beats_per_measure) < 0.1
-    if beats_per_measure > 2.5 or beam_total_matches:
+    # Enter beam-first when any dotted-eighth pair fix was applied,
+    # or the total roughly matches, or for longer measures.
+    has_dotted_pair = any(abs(d - 0.75) < 0.01 for d in beam_durs)
+    if beats_per_measure > 2.5 or beam_total_matches or has_dotted_pair:
         beam_durs_original = list(beam_durs)
 
         # Uniform-upgrade rescue: if every short note can be lifted so the
@@ -1696,6 +1934,7 @@ def _estimate_durations_in_measure(measure, beats_per_measure=2.0, measure_idx=0
         # found).  Downgrade quarter notes with the narrowest gaps first.
         beam_note_total2 = sum(beam_durs)
         surplus = beam_note_total2 + rest_beats - beats_per_measure
+        gaps_r = None
         if surplus >= 0.2 and n >= 3:
             xs = [e['x'] for e in note_events]
             # Compute gap for each note to its right neighbor
@@ -1791,6 +2030,22 @@ def _estimate_durations_in_measure(measure, beats_per_measure=2.0, measure_idx=0
                         surplus -= 0.25
                         break
 
+            # Eighth→sixteenth (dotted-note-safe): before removing a detected
+            # dot, try demoting the narrowest-gap eighth to sixteenth. Dots
+            # are physical evidence (detected blob); beam counts are more
+            # error-prone, so prefer adjusting beam over removing dot.
+            if 0.2 <= surplus <= 0.3:
+                de_idxs = [i for i in range(n) if beam_durs[i] == 0.75]
+                s_idxs = [i for i in range(n) if beam_durs[i] == 0.25]
+                if de_idxs and len(s_idxs) >= 2:
+                    e_cands = [(i, gaps_r[i]) for i in range(n)
+                               if beam_durs[i] == 0.5]
+                    if e_cands:
+                        e_cands.sort(key=lambda t: t[1])
+                        idx = e_cands[0][0]
+                        beam_durs[idx] = 0.25
+                        surplus -= 0.25
+
             # Dot-removal: if surplus ≈ 0.25 and a dotted-eighth (0.75) exists
             # with no eligible companion above, undot it as a last resort.
             if 0.2 <= surplus <= 0.3:
@@ -1802,6 +2057,46 @@ def _estimate_durations_in_measure(measure, beats_per_measure=2.0, measure_idx=0
                     beam_durs[di] = 0.5
                     surplus -= 0.25
 
+        # Zero-surplus spacing swap: if total is correct but some
+        # sixteenths have wider gaps than some eighths, they were likely
+        # mis-detected. Swap the widest-gap sixteenth with the
+        # narrowest-gap eighth until no such pair remains.
+        # Compute gaps_r if not already done (when surplus was ~0 initially)
+        if gaps_r is None and n >= 3:
+            xs = [e['x'] for e in note_events]
+            gaps_r = []
+            for i in range(n):
+                if i < n - 1:
+                    gaps_r.append(xs[i + 1] - xs[i])
+                else:
+                    right_bl = float('inf')
+                    if barline_xs:
+                        for bx in sorted(barline_xs):
+                            if bx > xs[-1]:
+                                right_bl = bx
+                                break
+                    gaps_r.append(right_bl - xs[-1] if right_bl < float('inf') else 0)
+        if abs(surplus) < 0.1 and gaps_r is not None:
+            changed_swap = True
+            while changed_swap:
+                changed_swap = False
+                # Protect sixteenths adjacent to dotted notes (dotted+16 pair
+                # naturally has wider gap; swapping breaks the pair).
+                protected_16 = set()
+                for i in range(n):
+                    if beam_durs[i] == 0.25 and i > 0 and abs(beam_durs[i-1] - 0.75) < 0.01:
+                        protected_16.add(i)
+                s_idxs = [(i, gaps_r[i]) for i in range(n)
+                          if beam_durs[i] == 0.25 and i not in protected_16]
+                e_idxs = [(i, gaps_r[i]) for i in range(n) if beam_durs[i] == 0.5]
+                if s_idxs and e_idxs:
+                    si, sg = max(s_idxs, key=lambda t: t[1])
+                    ei, eg = min(e_idxs, key=lambda t: t[1])
+                    if sg > eg * 1.2:
+                        beam_durs[si] = 0.5
+                        beam_durs[ei] = 0.25
+                        changed_swap = True
+
         for i, e in enumerate(note_events):
             e['unit']['duration'] = beam_durs[i]
             if beam_durs[i] != beam_durs_original[i]:
@@ -1810,15 +2105,30 @@ def _estimate_durations_in_measure(measure, beats_per_measure=2.0, measure_idx=0
                 e['duration_source'] = 'beam'
         return
 
+    # --- Pre-fallback: respect hollow note durations ---
+    # Hollow noteheads (whole/half notes) have reliable individual_duration
+    # from template detection. Trust those and only use proportional spacing
+    # for the remaining (filled) notes.
+    hollow_fixed = []
+    for i, e in enumerate(note_events):
+        idur = e['unit']['notes'][0].get('individual_duration', 1.0)
+        if idur >= 2.0:
+            e['unit']['duration'] = idur
+            e['duration_source'] = 'hollow'
+            hollow_fixed.append(i)
+    if len(hollow_fixed) == n:
+        return  # all notes are hollow, durations set
+
     # --- Fallback: proportional spacing ---
     xs = [e['x'] for e in note_events]
     gaps = [xs[i + 1] - xs[i] for i in range(n - 1)]
 
     if not gaps or sum(gaps) == 0:
         dur = _snap_duration(remaining / n)
-        for e in note_events:
-            e['unit']['duration'] = dur
-            e['duration_source'] = 'proportional_uniform'
+        for i, e in enumerate(note_events):
+            if i not in hollow_fixed:
+                e['unit']['duration'] = dur
+                e['duration_source'] = 'proportional_uniform'
         return
 
     last_x = xs[-1]

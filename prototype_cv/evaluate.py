@@ -148,14 +148,11 @@ def _normalize_gt_measure(measure_str):
     - Other annotations in parentheses
     """
     s = measure_str
-    # Remove (undone) and similar annotations
-    s = re.sub(r'\(undone\)', '', s)
-    # Convert dashes: '5'---' means whole note (4 beats), remove dashes
-    # In jianpu, dashes after a note mean held beats.
-    # Keep them as-is for now — they represent sustained beats.
-    # Normalize dotted annotations: (1.5拍) → . suffix
+    # Normalize dotted annotations first: (1.5拍) → . suffix
     s = re.sub(r'\(1\.5拍\)', '.', s)
     s = re.sub(r'\(\d+\.?\d*拍\)', '', s)
+    # Remove all remaining parenthetical comments (undone, Chinese annotations, etc.)
+    s = re.sub(r'\([^)]*\)', '', s)
     return s.strip()
 
 
@@ -201,6 +198,31 @@ def load_gt_from_file(path):
                 continue
             if current_key not in sections:
                 sections[current_key] = []
+            continue
+
+        # Format 3: Chinese headers ("--- 第N行 ---")
+        m = re.match(r'---\s*第\s*(\d+)\s*行\s*---', stripped)
+        if m:
+            line_num = int(m.group(1))
+            current_key = ('solo', line_num)
+            if current_key not in sections:
+                sections[current_key] = []
+            continue
+
+        # Special: "空N拍" rest measures in GT (Chinese notation)
+        # Treated as N full measures of rest. Format varies:
+        # - Single measure: "0---" (whole rest) or "0 0 0 0"
+        # - Multiple measures: each as "0 0 0 0"
+        if current_key and re.match(r'^\|?空[一二两三四]拍\|?$', stripped):
+            count_map = {'一': 1, '二': 2, '两': 2, '三': 3, '四': 4}
+            m_rest = re.search(r'空([一二两三四])拍', stripped)
+            if m_rest:
+                n = count_map.get(m_rest.group(1), 1)
+                if n == 1:
+                    sections[current_key].append('0---')
+                else:
+                    for _ in range(n):
+                        sections[current_key].append('0 0 0 0')
             continue
 
         if stripped.startswith('|') and current_key:
