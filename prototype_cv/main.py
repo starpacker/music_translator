@@ -40,6 +40,8 @@ from symbol_detection import (
     detect_time_signature,
     detect_time_signatures_along_system,
     detect_multi_rest_count,
+    detect_key_signature,
+    detect_slur_arcs,
 )
 
 
@@ -88,6 +90,14 @@ from note_unit import (build_note_units, segment_into_measures,
                         merge_overlapping_note_units, _fill_rests_for_gap)
 from jianpu_formatter import format_measure, format_output
 
+OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output")
+
+
+def _output_path(filename):
+    """Return path inside the output/ directory, creating it if needed."""
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    return os.path.join(OUTPUT_DIR, filename)
+
 
 def main(image_path, bpm_override=False):
     print(f"Processing image: {image_path}")
@@ -111,6 +121,12 @@ def main(image_path, bpm_override=False):
     # Calculate average dy (staff line spacing)
     dy = np.mean([(s[4] - s[0]) / 4.0 for s in systems])
     print(f"   Average staff line spacing (dy): {dy:.1f}px")
+
+    # ── 2a. Detect and mask slur/tie arcs ──
+    arc_mask, arc_regions = detect_slur_arcs(music_symbols, systems, dy)
+    if arc_regions:
+        print(f"   Detected {len(arc_regions)} slur/tie arcs — masking from music_symbols")
+        music_symbols = cv2.subtract(music_symbols, arc_mask)
 
     # Detect layout: grand staff (piano) vs single staff (solo instrument)
     layout = detect_staff_layout(systems)
@@ -137,6 +153,21 @@ def main(image_path, bpm_override=False):
         print(f"   Time signature: {num}/{den} → beats_per_measure={bpm_detected}")
     else:
         print(f"   Time signature: not detected, using default {CFG.duration.beats_per_measure}")
+
+    # ── 2c. Auto-detect key signature ──
+    # Determine time-sig x position to limit key-sig search area
+    _ts_x = None
+    if time_sig:
+        from symbol_detection import detect_time_signatures_along_system as _dts
+        _ts_detections = _dts(binary, systems[0], [], dy)
+        if _ts_detections:
+            _ts_x = _ts_detections[0].get('match_x')
+    key_sig = detect_key_signature(binary, systems[0], dy, time_sig_x=_ts_x)
+    if key_sig:
+        print(f"   Key signature: {key_sig['count']}{key_sig['type']} → "
+              f"notes {key_sig['notes']}")
+    else:
+        print("   Key signature: none detected (C major / A minor)")
 
     # ── 3. Detect Barlines ──
     print("3. Detecting barlines...")
@@ -321,14 +352,14 @@ def main(image_path, bpm_override=False):
               f"{len(treble_measures)} treble measures, {len(bass_measures)} bass measures")
 
     # ── 10. Format & Save Output ──
-    _print_and_save_output(pair_data, accidentals_map, dy)
+    _print_and_save_output(pair_data, accidentals_map, dy, key_sig=key_sig)
 
     # ── 11. Visualization ──
     print("\n11. Generating visualizations...")
     _generate_annotated_image(image_path, pair_data, accidentals_map,
                               treble_notes, bass_notes, grand_staff_pairs,
-                              barlines_per_pair, dy)
-    _generate_jianpu_only_image(pair_data, accidentals_map, dy)
+                              barlines_per_pair, dy, key_sig=key_sig)
+    _generate_jianpu_only_image(pair_data, accidentals_map, dy, key_sig=key_sig)
 
 
 # ============================================================
@@ -1143,6 +1174,20 @@ def _main_single_staff(image_path, systems, staff_lines, music_symbols, binary, 
         else:
             print(f"   Time signature: not detected, using default {CFG.duration.beats_per_measure}")
 
+    # ── 8c. Auto-detect key signature ──
+    _ts_x_single = None
+    if not bpm_override:
+        from symbol_detection import detect_time_signatures_along_system as _dts
+        _ts_detections = _dts(binary, systems[0], [], dy)
+        if _ts_detections:
+            _ts_x_single = _ts_detections[0].get('match_x')
+    key_sig = detect_key_signature(binary, systems[0], dy, time_sig_x=_ts_x_single)
+    if key_sig:
+        print(f"   Key signature: {key_sig['count']}{key_sig['type']} → "
+              f"notes {key_sig['notes']}")
+    else:
+        print("   Key signature: none detected (C major / A minor)")
+
     # ── 9. Build Note Units & Segment Measures ──
     print("9. Building note units and segmenting measures...")
     current_bpm = CFG.duration.beats_per_measure
@@ -1266,26 +1311,27 @@ def _main_single_staff(image_path, systems, staff_lines, music_symbols, binary, 
     # by fill_to_measure (so they format as "0 0 0 0" and pass through),
     # while false-barline narrow empties remain as "0 0" and get dropped.
     _print_and_save_single_staff_output(staff_data, accidentals_map, dy,
-                                        skip_empty=has_chords)
+                                        skip_empty=has_chords, key_sig=key_sig)
 
     # ── 11. Visualization ──
     print("\n11. Generating visualizations...")
-    _generate_single_staff_annotated(image_path, staff_data, accidentals_map, dy)
+    _generate_single_staff_annotated(image_path, staff_data, accidentals_map, dy,
+                                     key_sig=key_sig)
     # Visual jianpu (matches reference repo's PIL-rendered style:
     # red digits + 减时线 + octave dots + dashes for half/whole)
     from jianpu_visual import render_full_image
     render_full_image(image_path, staff_data, accidentals_map, dy,
-                      "output_jianpu_visual.png")
-    print("   Saved: output_jianpu_visual.png")
+                      _output_path("jianpu_visual.png"), key_sig=key_sig)
+    print("   Saved: output/jianpu_visual.png")
 
 
 def _print_and_save_single_staff_output(staff_data, accidentals_map, dy,
-                                         skip_empty=False):
+                                         skip_empty=False, key_sig=None):
     """Format, print, and save output for single-staff scores."""
     all_lines = []
     for sd in staff_data:
         line = format_output(sd['measures'], accidentals_map, dy=dy,
-                              skip_empty=skip_empty)
+                              skip_empty=skip_empty, key_sig=key_sig)
         all_lines.append(line)
 
     print(f"\n{'=' * 60}")
@@ -1297,14 +1343,14 @@ def _print_and_save_single_staff_output(staff_data, accidentals_map, dy,
         print(line)
 
     # Save to file
-    with open("output_jianpu.txt", "w", encoding="utf-8") as f:
+    with open(_output_path("jianpu.txt"), "w", encoding="utf-8") as f:
         f.write("简谱翻译结果\n")
         f.write("=" * 60 + "\n\n")
         for i, line in enumerate(all_lines):
             f.write(f"--- 第{i + 1}行 ---\n")
             f.write(f"{line}\n\n")
         f.write("=" * 60 + "\n")
-    print("\n   Saved text: output_jianpu.txt")
+    print("\n   Saved text: output/jianpu.txt")
 
     # Confidence report
     from confidence import format_confidence_report
@@ -1316,12 +1362,13 @@ def _print_and_save_single_staff_output(staff_data, accidentals_map, dy,
                                       beats_per_measure=CFG.duration.beats_per_measure,
                                       dy=dy,
                                       staff_anchors=staff_anchors)
-    with open("output_confidence.txt", "w", encoding="utf-8") as f:
+    with open(_output_path("confidence.txt"), "w", encoding="utf-8") as f:
         f.write(report)
-    print("   Saved confidence: output_confidence.txt")
+    print("   Saved confidence: output/confidence.txt")
 
 
-def _generate_single_staff_annotated(image_path, staff_data, accidentals_map, dy):
+def _generate_single_staff_annotated(image_path, staff_data, accidentals_map, dy,
+                                     key_sig=None):
     """Generate annotated image for single-staff scores."""
     img_orig = cv2.imread(image_path)
     if img_orig is None:
@@ -1370,7 +1417,8 @@ def _generate_single_staff_annotated(image_path, staff_data, accidentals_map, dy
             if mi > 0:
                 cv2.line(img_out, (left, ann_y1 + 2), (left, ann_y2 - 2), (150, 150, 150), 1)
 
-            text = format_measure(measures[mi], accidentals_map, measure_idx=mi, dy=dy)
+            text = format_measure(measures[mi], accidentals_map, measure_idx=mi, dy=dy,
+                                  key_sig=key_sig)
             if text:
                 scale = 0.35
                 (tw, _), _ = cv2.getTextSize(text, font, scale, 1)
@@ -1390,8 +1438,8 @@ def _generate_single_staff_annotated(image_path, staff_data, accidentals_map, dy
         h_to_copy = end - y_offset
         img_out[y_offset:end, :remaining.shape[1]] = remaining[:h_to_copy]
 
-    cv2.imwrite("output_jianpu_on_staff.png", img_out)
-    print("   Saved: output_jianpu_on_staff.png")
+    cv2.imwrite(_output_path("jianpu_on_staff.png"), img_out)
+    print("   Saved: output/jianpu_on_staff.png")
 
 
 # ============================================================
@@ -1664,14 +1712,16 @@ def _split_rests_by_clef(all_rests, grand_staff_pairs):
     return treble_rests, bass_rests
 
 
-def _print_and_save_output(pair_data, accidentals_map, dy):
+def _print_and_save_output(pair_data, accidentals_map, dy, key_sig=None):
     """Format, print, and save the Jianpu output."""
     all_treble_lines = []
     all_bass_lines = []
 
     for pd in pair_data:
-        t_line = format_output(pd['treble_measures'], accidentals_map, dy=dy)
-        b_line = format_output(pd['bass_measures'], accidentals_map, dy=dy)
+        t_line = format_output(pd['treble_measures'], accidentals_map, dy=dy,
+                               key_sig=key_sig)
+        b_line = format_output(pd['bass_measures'], accidentals_map, dy=dy,
+                               key_sig=key_sig)
         all_treble_lines.append(t_line)
         all_bass_lines.append(b_line)
 
@@ -1693,7 +1743,7 @@ def _print_and_save_output(pair_data, accidentals_map, dy):
         print(line)
 
     # Save to file
-    with open("output_jianpu.txt", "w", encoding="utf-8") as f:
+    with open(_output_path("jianpu.txt"), "w", encoding="utf-8") as f:
         f.write("简谱翻译结果\n")
         f.write("=" * 60 + "\n\n")
         for i in range(len(pair_data)):
@@ -1707,7 +1757,7 @@ def _print_and_save_output(pair_data, accidentals_map, dy):
         f.write("\n低音部分:\n")
         for line in all_bass_lines:
             f.write(line + "\n")
-    print("\n   Saved text: output_jianpu.txt")
+    print("\n   Saved text: output/jianpu.txt")
 
     # Confidence report
     from confidence import format_confidence_report
@@ -1723,9 +1773,9 @@ def _print_and_save_output(pair_data, accidentals_map, dy):
                                       beats_per_measure=CFG.duration.beats_per_measure,
                                       dy=dy,
                                       staff_anchors=staff_anchors)
-    with open("output_confidence.txt", "w", encoding="utf-8") as f:
+    with open(_output_path("confidence.txt"), "w", encoding="utf-8") as f:
         f.write(report)
-    print("   Saved confidence: output_confidence.txt")
+    print("   Saved confidence: output/confidence.txt")
 
 
 # ============================================================
@@ -1734,7 +1784,7 @@ def _print_and_save_output(pair_data, accidentals_map, dy):
 
 def _generate_annotated_image(image_path, pair_data, accidentals_map,
                               treble_notes, bass_notes, grand_staff_pairs,
-                              barlines_per_pair, dy):
+                              barlines_per_pair, dy, key_sig=None):
     """Generate original staff with jianpu annotation rows below each grand staff."""
     img_orig = cv2.imread(image_path)
     if img_orig is None:
@@ -1806,7 +1856,7 @@ def _generate_annotated_image(image_path, pair_data, accidentals_map,
             ]:
                 if mi < len(measures):
                     text = format_measure(measures[mi], accidentals_map,
-                                          measure_idx=mi, dy=dy)
+                                          measure_idx=mi, dy=dy, key_sig=key_sig)
                     if text:
                         scale = font_scale
                         (tw, _), _ = cv2.getTextSize(text, font, scale, thickness)
@@ -1826,28 +1876,30 @@ def _generate_annotated_image(image_path, pair_data, accidentals_map,
         h_to_copy = end - y_offset
         img_out[y_offset:end, :remaining.shape[1]] = remaining[:h_to_copy]
 
-    cv2.imwrite("output_jianpu_on_staff.png", img_out)
-    print("   Saved: output_jianpu_on_staff.png")
+    cv2.imwrite(_output_path("jianpu_on_staff.png"), img_out)
+    print("   Saved: output/jianpu_on_staff.png")
 
 
-def _generate_jianpu_only_image(pair_data, accidentals_map, dy):
+def _generate_jianpu_only_image(pair_data, accidentals_map, dy, key_sig=None):
     """Generate clean jianpu-only image."""
     try:
         from PIL import Image, ImageDraw, ImageFont
-        _generate_jianpu_pil(pair_data, accidentals_map, dy)
+        _generate_jianpu_pil(pair_data, accidentals_map, dy, key_sig=key_sig)
     except ImportError:
-        _generate_jianpu_cv2(pair_data, accidentals_map, dy)
+        _generate_jianpu_cv2(pair_data, accidentals_map, dy, key_sig=key_sig)
 
 
-def _generate_jianpu_pil(pair_data, accidentals_map, dy):
+def _generate_jianpu_pil(pair_data, accidentals_map, dy, key_sig=None):
     """Generate jianpu-only image using PIL."""
     from PIL import Image, ImageDraw, ImageFont
 
     pair_formatted = []
     for pd in pair_data:
-        t_parts = [format_measure(m, accidentals_map, measure_idx=mi, dy=dy)
+        t_parts = [format_measure(m, accidentals_map, measure_idx=mi, dy=dy,
+                                  key_sig=key_sig)
                    for mi, m in enumerate(pd['treble_measures'])]
-        b_parts = [format_measure(m, accidentals_map, measure_idx=mi, dy=dy)
+        b_parts = [format_measure(m, accidentals_map, measure_idx=mi, dy=dy,
+                                  key_sig=key_sig)
                    for mi, m in enumerate(pd['bass_measures'])]
         pair_formatted.append((t_parts, b_parts))
 
@@ -1983,17 +2035,19 @@ def _generate_jianpu_pil(pair_data, accidentals_map, dy):
             y += section_gap
 
     img = img.crop((0, 0, img_w, min(y + padding, img_h)))
-    img.save("output_jianpu_clean.png")
-    print("   Saved: output_jianpu_clean.png")
+    img.save(_output_path("jianpu_clean.png"))
+    print("   Saved: output/jianpu_clean.png")
 
 
-def _generate_jianpu_cv2(pair_data, accidentals_map, dy):
+def _generate_jianpu_cv2(pair_data, accidentals_map, dy, key_sig=None):
     """Fallback: generate jianpu image using OpenCV."""
     lines = []
     for i, pd in enumerate(pair_data):
-        t_parts = [format_measure(m, accidentals_map, measure_idx=mi, dy=dy)
+        t_parts = [format_measure(m, accidentals_map, measure_idx=mi, dy=dy,
+                                  key_sig=key_sig)
                    for mi, m in enumerate(pd['treble_measures'])]
-        b_parts = [format_measure(m, accidentals_map, measure_idx=mi, dy=dy)
+        b_parts = [format_measure(m, accidentals_map, measure_idx=mi, dy=dy,
+                                  key_sig=key_sig)
                    for mi, m in enumerate(pd['bass_measures'])]
 
         t_line = "| " + " | ".join(t_parts) + " |"
@@ -2027,13 +2081,13 @@ def _generate_jianpu_cv2(pair_data, accidentals_map, dy):
                         (color[2], color[1], color[0]), thickness, cv2.LINE_AA)
         y += line_height
 
-    cv2.imwrite("output_jianpu_clean.png", img)
-    print("   Saved: output_jianpu_clean.png")
+    cv2.imwrite(_output_path("jianpu_clean.png"), img)
+    print("   Saved: output/jianpu_clean.png")
 
 
 if __name__ == "__main__":
     import sys
-    img_path = sys.argv[1] if len(sys.argv) > 1 else "../input_page1.png"
+    img_path = sys.argv[1] if len(sys.argv) > 1 else "../input/piano_p1.png"
     # Optional: --bpm N to override beats_per_measure
     bpm_override = False
     if '--bpm' in sys.argv:

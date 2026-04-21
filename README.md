@@ -1,14 +1,15 @@
 # music_translator — Staff Notation → Jianpu (Chinese Numbered Notation)
 
 A computer-vision pipeline that takes an image of **Western staff notation**
-(specifically a piano Grand Staff) and produces the corresponding
-**jianpu** (简谱, Chinese numbered musical notation) — useful for
-musicians who read jianpu and want to play pieces that only exist as
-Western sheet music.
+and produces the corresponding **jianpu** (简谱, Chinese numbered musical notation).
 
-> **Status:** the OpenCV prototype reaches **100% accuracy** on the test
-> piece (Mozart *Turkish March*, K.331, Volodos arrangement —
-> 20 bars / 111 events / 213 pitches all correct).
+Supports both **piano grand staff** (treble + bass) and **single-staff**
+instruments (erhu, flute, etc.).
+
+> **Accuracy** (evaluated test pieces):
+> - Piano (Mozart K.331): **100%** measures / events / pitches (20 bars)
+> - Erhu (二胡 8 pages): **93%** measures, **97%** events, **99%** pitches
+> - Qudi (曲笛 5 pages): **81%** measures, **86%** events, **90%** pitches
 
 ---
 
@@ -16,69 +17,80 @@ Western sheet music.
 
 ```
 music_translator/
-├── prototype_cv/         ← main implementation (OpenCV-based pipeline)
-│   ├── main.py             ← end-to-end driver
-│   ├── pitch_detection.py  ← detect note heads and assign pitches from staff lines
-│   ├── note_unit.py        ← Note datatype + duration/beam logic
-│   ├── note_assignment.py  ← assign each note its measure / voice
-│   ├── symbol_detection.py ← clefs, accidentals, rests, time-signature symbols
-│   ├── stem_tracking.py    ← stem/beam tracking for grouped notes
-│   ├── segmentation.py     ← measure / system segmentation
-│   ├── staff_removal.py    ← remove staff lines so symbols can be found cleanly
-│   ├── template_matching.py ← match small symbols against the template library
-│   ├── jianpu_formatter.py ← lay out the result as jianpu text
-│   ├── evaluate.py         ← compare against ground truth, report accuracy
-│   ├── ground_truth.md     ← per-bar ground truth
-│   ├── README.md           ← detailed pipeline-stage / algorithm walkthrough
-│   └── test_duration_merge.py
-├── template/             ← template images used by template_matching
-│                            (clefs, time-signatures, rests, accidentals…)
-├── input_page1.png       ← test input score (Mozart K.331, page 1)
-├── ground_truth_2.md     ← extended ground truth (line-by-line jianpu)
-├── 二胡.pdf              ← reference scores (erhu)
-└── 曲笛.pdf              ← reference scores (Chinese flute)
+├── prototype_cv/          ← main implementation (OpenCV-based pipeline)
+│   ├── main.py              ← end-to-end driver
+│   ├── config.py            ← all hyperparameters (dy-relative)
+│   ├── staff_removal.py     ← staff line extraction & erasure
+│   ├── pitch_detection.py   ← staff system detection + pitch mapping
+│   ├── template_matching.py ← notehead detection (morphology + templates)
+│   ├── symbol_detection.py  ← barlines, accidentals, rests, time/key sigs, slur arcs
+│   ├── note_assignment.py   ← treble/bass assignment
+│   ├── stem_tracking.py     ← stem direction & position
+│   ├── note_unit.py         ← chord grouping + beam counting + duration estimation
+│   ├── jianpu_formatter.py  ← text output formatting (key sig, accidental persistence)
+│   ├── jianpu_visual.py     ← PIL-rendered visual jianpu output
+│   ├── confidence.py        ← detection confidence scoring
+│   ├── evaluate.py          ← accuracy evaluation vs ground truth
+│   ├── batch_erhu.py        ← batch processor for multi-page erhu scores
+│   ├── output/              ← generated output files (gitignored)
+│   ├── ground_truth.md      ← piano ground truth
+│   ├── ground_truth_2.md    ← erhu ground truth
+│   └── README.md            ← detailed algorithm walkthrough (Chinese)
+├── template/              ← symbol templates (sharps, flats, rests, clefs, digits…)
+└── input/                 ← test input images
+    ├── piano_p1.png         ← Mozart K.331
+    ├── erhu_p[1-8].png      ← erhu (8 pages)
+    └── qudi_p[1-5].png      ← qudi flute (5 pages)
 ```
 
 ## Quick start
 
 ```bash
 cd prototype_cv
-
 pip install opencv-python numpy Pillow
 
-# Run on the default test image (../input_page1.png)
-python main.py
+# Run on the default test image (piano)
+python main.py                          # uses ../input/piano_p1.png
 
-# Or pass a custom image
-python main.py path/to/score.png
+# Run on a custom image
+python main.py ../input/erhu_p1.png
 
-# Run accuracy evaluation against the embedded ground truth
+# Override time signature (e.g. 3/4 = 3.0 beats)
+python main.py score.png --bpm 3.0
+
+# Run accuracy evaluation
 python evaluate.py
+python evaluate.py ground_truth_2.md output/jianpu.txt
+
+# Batch process erhu (8 pages)
+python batch_erhu.py
 ```
 
-### Outputs
+### Outputs (saved to `prototype_cv/output/`)
 
 | File | Description |
 |---|---|
-| `output_jianpu.txt`           | Jianpu text, separated into treble / bass lines |
-| `output_jianpu_on_staff.png`  | Original staff with jianpu annotations overlaid |
-| `output_jianpu_clean.png`     | Clean rendered jianpu image |
+| `jianpu.txt`           | Jianpu text (treble/bass lines for piano, line-by-line for single staff) |
+| `jianpu_on_staff.png`  | Original staff with jianpu annotations overlaid |
+| `jianpu_visual.png`    | Visual jianpu rendering (red digits + rhythm marks) |
+| `jianpu_clean.png`     | Clean rendered jianpu image (piano only) |
+| `confidence.txt`       | Per-measure confidence scores with `[!]` flags |
 
-## Pipeline at a glance
+## Pipeline
 
-1. **Staff removal** — detect staff lines and erase them so symbols stand alone.
-2. **Symbol detection** — clefs, accidentals (sharp/flat/natural), rests,
-   time signatures, via template matching against `template/`.
-3. **Note-head detection + pitch assignment** — find note heads, then map
-   each one to a pitch using the staff position + active clef + key signature.
-4. **Stem / beam tracking** — group flagged notes and recover their durations.
-5. **Note assignment** — assign each note to its measure and voice.
-6. **Jianpu formatting** — render the result as numbered notation, splitting
-   into treble (high) and bass (low) lines.
+1. **Staff removal** — detect & erase staff lines, producing a clean symbol image
+2. **System detection** — find staff systems, detect layout (grand staff vs single staff)
+3. **Slur/tie masking** — detect arc contours and subtract from symbol image
+4. **Time & key signature** — template-match digits for time sig; detect accidental clusters for key sig
+5. **Barline detection** — dual strategy (template + vertical morphology), adaptive threshold
+6. **Notehead detection** — morphological opening + template matching + NMS
+7. **Accidental detection** — multi-scale template matching for sharps/flats/naturals
+8. **Rest detection** — quarter/eighth rest templates with false-positive filtering
+9. **Stem tracking** — find stem direction, tip position, and beam count
+10. **Note units & measures** — chord grouping, duration estimation (beams + proportional spacing), measure segmentation
+11. **Formatting** — jianpu text with accidental persistence, key signature application, chord brackets
 
-See [`prototype_cv/README.md`](./prototype_cv/README.md) for the full
-per-stage algorithm walkthrough, the jianpu notation conventions, the
-accuracy report, and the known limitations / generalisation discussion.
+All pixel-level parameters scale with `dy` (staff-line spacing). No hardcoded pixel values.
 
 ## License
 

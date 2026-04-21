@@ -6,7 +6,7 @@ import sys
 def test_first_chord_detected():
     """The [3 1'] chord at x~284 on line 2 must not be filtered."""
     result = subprocess.run(
-        [sys.executable, "main.py", "../input_page1.png"],
+        [sys.executable, "main.py", "../input/piano_p1.png"],
         capture_output=True, text=True, cwd="."
     )
     output = result.stdout

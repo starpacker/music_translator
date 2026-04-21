@@ -234,7 +234,7 @@ def load_gt_from_file(path):
 
 
 def load_output_from_file(path):
-    """Load converter output from output_jianpu.txt.
+    """Load converter output from output/jianpu.txt.
 
     Returns dict: {(clef, line_num): [measure_strings]}
     Supports both grand-staff (高音/低音 labels) and single-staff output.
@@ -297,7 +297,7 @@ def load_output_from_file(path):
 def main():
     import os
     gt_path = os.path.join(os.path.dirname(__file__), "ground_truth.md")
-    out_path = os.path.join(os.path.dirname(__file__), "output_jianpu.txt")
+    out_path = os.path.join(os.path.dirname(__file__), "output", "jianpu.txt")
 
     if len(sys.argv) > 1:
         gt_path = sys.argv[1]
@@ -309,7 +309,7 @@ def main():
         sys.exit(1)
     if not os.path.exists(out_path):
         print(f"Error: Output file not found: {out_path}")
-        print("Run main.py first to generate output_jianpu.txt")
+        print("Run main.py first to generate output/jianpu.txt")
         sys.exit(1)
 
     print("Loading ground truth and output...")
