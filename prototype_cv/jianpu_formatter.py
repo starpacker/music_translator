@@ -3,7 +3,7 @@ jianpu_formatter.py
 Format NoteUnit events into Jianpu (简谱) text strings.
 
 This module produces the text representation written to
-``output_jianpu.txt``. It uses ASCII-only suffixes so the file
+``output/jianpu.txt``. It uses ASCII-only suffixes so the file
 renders identically in any terminal/editor and so the strings can
 be drawn with cv2.putText. The visual jianpu (with proper 减时线
 underlines and octave dots) is rendered separately by
@@ -48,8 +48,17 @@ def duration_to_suffix(duration):
     return ""
 
 
-def format_note(note, accidentals_map, persistent_accs=None, dy=21.0):
-    """Format a single note from a NoteUnit as Jianpu string."""
+def format_note(note, accidentals_map, persistent_accs=None, dy=21.0,
+                key_sig=None):
+    """Format a single note from a NoteUnit as Jianpu string.
+
+    key_sig : dict or None
+        If provided, {'type': '#'/'b', 'count': int, 'notes': [int, ...]}
+        where 'notes' are jianpu note numbers affected by the key signature.
+        Applied to notes that have no explicit accidental and no persistence.
+        A natural sign ('n') cancels the key sig for that pitch within the
+        measure (tracked via persistent_accs with value 'n').
+    """
     pitch = note['pitch']
     base = pitch[0]
     suffix = pitch[1:]
@@ -64,8 +73,9 @@ def format_note(note, accidentals_map, persistent_accs=None, dy=21.0):
     max_persist_gap = dy * 5.0
 
     if acc == 'n':
-        if persistent_accs is not None and pitch_key in persistent_accs:
-            del persistent_accs[pitch_key]
+        # Natural cancels both persistence and key signature for this pitch
+        if persistent_accs is not None:
+            persistent_accs[pitch_key] = ('n', note_x)
         acc = ''
     elif acc:
         if persistent_accs is not None:
@@ -74,18 +84,32 @@ def format_note(note, accidentals_map, persistent_accs=None, dy=21.0):
         if persistent_accs is not None and pitch_key in persistent_accs:
             stored_acc, stored_x = persistent_accs[pitch_key]
             if abs(note_x - stored_x) <= max_persist_gap:
-                acc = stored_acc
+                if stored_acc == 'n':
+                    # Natural override active — no accidental
+                    acc = ''
+                else:
+                    acc = stored_acc
                 persistent_accs[pitch_key] = (stored_acc, note_x)
+            else:
+                # Gap too large: persistence expired, try key sig
+                if key_sig and int(base) in key_sig['notes']:
+                    acc = key_sig['type']
+        else:
+            # No explicit accidental, no persistence → apply key signature
+            if key_sig and int(base) in key_sig['notes']:
+                acc = key_sig['type']
 
     return acc + base + suffix
 
 
-def format_note_unit(unit, accidentals_map, persistent_accs=None, dy=21.0):
+def format_note_unit(unit, accidentals_map, persistent_accs=None, dy=21.0,
+                     key_sig=None):
     """Format a NoteUnit (single note or chord) with duration suffix."""
     notes = unit['notes']
     duration = unit['duration']
 
-    note_strs = [format_note(n, accidentals_map, persistent_accs, dy=dy)
+    note_strs = [format_note(n, accidentals_map, persistent_accs, dy=dy,
+                             key_sig=key_sig)
                  for n in notes]
 
     if len(note_strs) == 1:
@@ -116,7 +140,8 @@ def format_rest(event):
     return "0"
 
 
-def format_measure(measure, accidentals_map, measure_idx=0, dy=21.0):
+def format_measure(measure, accidentals_map, measure_idx=0, dy=21.0,
+                    key_sig=None):
     """Format a complete measure as Jianpu string."""
     if not measure:
         return "0 0"
@@ -130,7 +155,8 @@ def format_measure(measure, accidentals_map, measure_idx=0, dy=21.0):
             parts.append(format_rest(event))
         elif event['type'] == 'note_unit':
             parts.append(format_note_unit(event['unit'], accidentals_map,
-                                          persistent_accs, dy=dy))
+                                          persistent_accs, dy=dy,
+                                          key_sig=key_sig))
         elif event['type'] == 'multi_rest_count':
             multi_count = event['count']
 
@@ -141,14 +167,14 @@ def format_measure(measure, accidentals_map, measure_idx=0, dy=21.0):
 
 
 def format_output(measures, accidentals_map, dy=21.0,
-                   skip_empty=False):
+                   skip_empty=False, key_sig=None):
     """Format all measures into the final Jianpu output string."""
     lines = []
     for i, measure in enumerate(measures):
         if skip_empty and not measure:
             continue
         measure_str = format_measure(measure, accidentals_map,
-                                     measure_idx=i, dy=dy)
+                                     measure_idx=i, dy=dy, key_sig=key_sig)
         if skip_empty and measure_str == "0 0":
             continue
         lines.append("|" + measure_str + "|")

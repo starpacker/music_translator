@@ -49,6 +49,75 @@ def _load_all_templates_by_prefix(prefix, directory=None):
 
 
 # ============================================================
+# 0. SLUR / TIE ARC DETECTION
+# ============================================================
+def detect_slur_arcs(music_symbols, staff_systems, dy):
+    """Detect slur and tie arcs in the staff-removed image.
+
+    Slur/tie arcs are thin curved lines connecting noteheads.  They cause
+    false positives in hollow-notehead and rest detection.  This function
+    finds them via contour analysis and returns a binary mask of arc pixels
+    so they can be subtracted from ``music_symbols`` before downstream
+    detection.
+
+    Returns
+    -------
+    arc_mask : np.ndarray (same shape as music_symbols, dtype uint8)
+        255 where a slur/tie arc pixel was detected, 0 elsewhere.
+    arc_regions : list[dict]
+        Each dict has keys x, y, w, h, system_idx describing a detected arc.
+    """
+    h, w = music_symbols.shape
+    arc_mask = np.zeros((h, w), dtype=np.uint8)
+    arc_regions = []
+
+    min_arc_width = 3.0 * dy      # arcs span at least 3 staff-spacings
+    max_arc_height = 1.5 * dy     # arcs are thin vertically
+    max_fill = 0.22               # arcs are sparse (thin curve in bbox)
+
+    for si, sys in enumerate(staff_systems):
+        y_top = max(0, int(sys[0] - 2.5 * dy))
+        y_bot = min(h, int(sys[4] + 2.5 * dy))
+        roi = music_symbols[y_top:y_bot, :]
+
+        contours, _ = cv2.findContours(roi, cv2.RETR_EXTERNAL,
+                                       cv2.CHAIN_APPROX_SIMPLE)
+        for c in contours:
+            x_c, y_c, w_c, h_c = cv2.boundingRect(c)
+            if w_c < min_arc_width or h_c > max_arc_height:
+                continue
+            area = cv2.contourArea(c)
+            bbox_area = w_c * h_c
+            if bbox_area == 0:
+                continue
+            fill = area / bbox_area
+            if fill >= max_fill:
+                continue
+
+            # Additional guard: reject components whose arc length is too
+            # short relative to width (noise fragments).  A real slur arc
+            # has perimeter ≈ 2*width (top and bottom of thin curve).
+            peri = cv2.arcLength(c, closed=True)
+            if peri < w_c * 1.2:
+                continue
+
+            # Draw the contour (filled) onto the mask
+            shifted = c.copy()
+            shifted[:, :, 1] += y_top
+            cv2.drawContours(arc_mask, [shifted], -1, 255, thickness=cv2.FILLED)
+            # Also draw a thin border to capture anti-aliased edge pixels
+            cv2.drawContours(arc_mask, [shifted], -1, 255, thickness=2)
+
+            arc_regions.append({
+                'x': x_c, 'y': y_c + y_top,
+                'w': w_c, 'h': h_c,
+                'system_idx': si,
+            })
+
+    return arc_mask, arc_regions
+
+
+# ============================================================
 # 1. BARLINE DETECTION
 # ============================================================
 def detect_barlines(binary_img, staff_systems, dy, min_spacing_dy=18.0):
@@ -758,6 +827,209 @@ def _scan_timesigs_full_line(binary_img, staff_system, dy, x1, x2,
     kept.sort(key=lambda t: t[0])
     return [{'x': float(cx), 'num': cn, 'den': cd, 'score': cs}
             for cx, cn, cd, cs in kept]
+
+
+# ============================================================
+# KEY SIGNATURE DETECTION
+# ============================================================
+
+# Circle of fifths: fixed order of sharps/flats in key signatures.
+# Jianpu note numbers: 1=C, 2=D, 3=E, 4=F, 5=G, 6=A, 7=B
+_SHARPS_ORDER_JIANPU = [4, 1, 5, 2, 6, 3, 7]  # F C G D A E B
+_FLATS_ORDER_JIANPU = [7, 3, 6, 2, 5, 1, 4]   # B E A D G C F
+
+
+def detect_key_signature(binary_img, staff_system, dy, time_sig_x=None):
+    """Detect the key signature from the clef area of a staff system.
+
+    Searches the region between the clef symbol and the time signature
+    (or the standard clef-area right edge if no time sig found) for
+    sharp and flat accidentals.
+
+    Parameters
+    ----------
+    binary_img : ndarray
+        Binarized image (white-on-black notation).
+    staff_system : list
+        5 Y-coordinates of the staff lines.
+    dy : float
+        Staff-line spacing.
+    time_sig_x : int or None
+        X-coordinate of the detected time signature's left edge.
+        If provided, limits the key-sig search to end before it.
+
+    Returns
+    -------
+    dict or None
+        {'type': '#' or 'b', 'count': int, 'notes': list[int]}
+        where 'notes' are the jianpu note numbers affected.
+        Returns None if no key signature detected (C major / A minor).
+    """
+    img_h, img_w = binary_img.shape
+    staff_height = staff_system[4] - staff_system[0]
+
+    # Key signature sits between the clef symbol and time signature.
+    # Treble/bass clef symbols are about 3.5-4 dy wide from the left margin.
+    # Start searching AFTER the clef to avoid false positives on clef curves.
+    roi_x1 = max(int(img_w * 0.05), int(dy * 4))
+    if time_sig_x is not None:
+        roi_x2 = max(roi_x1 + 10, time_sig_x - int(dy * 0.5))
+    else:
+        roi_x2 = int(img_w * 0.12)
+
+    # Vertical range: staff lines ± 1.5dy to catch accidentals on ledger positions
+    margin_y = int(dy * 1.5)
+    roi_y1 = max(0, staff_system[0] - margin_y)
+    roi_y2 = min(img_h, staff_system[4] + margin_y)
+
+    roi = binary_img[roi_y1:roi_y2, roi_x1:roi_x2]
+    roi_h, roi_w = roi.shape
+    if roi_h < 10 or roi_w < 10:
+        return None
+
+    # Load sharp and flat templates
+    sharp_templates = _load_all_templates_by_prefix("sharp_", TEMPLATE_DIR)
+    flat_templates = _load_all_templates_by_prefix("flat_", TEMPLATE_DIR)
+
+    # Also load legacy templates
+    for name in ["sharp_1.jpg"]:
+        t = _load_template(name, PICTURE_DIR)
+        if t is not None:
+            sharp_templates.append((name + "_legacy", t))
+    for name in ["flat_1.jpg"]:
+        t = _load_template(name, PICTURE_DIR)
+        if t is not None:
+            flat_templates.append((name + "_legacy", t))
+
+    if not sharp_templates and not flat_templates:
+        return None
+
+    # Detect accidentals in the key-sig ROI
+    # Key sig accidentals are spaced ~0.8-1.2 dy apart horizontally
+    # and occupy the full staff height vertically.
+    min_score = 0.55
+
+    sharp_hits = []
+    flat_hits = []
+
+    for templates, hits_list in [(sharp_templates, sharp_hits),
+                                  (flat_templates, flat_hits)]:
+        for tname, template in templates:
+            th_orig, tw_orig = template.shape
+            if th_orig < 3 or tw_orig < 3:
+                continue
+            # Key-sig accidentals are about 2-2.5 dy tall
+            ideal_scale = (dy * 2.2) / float(th_orig)
+            for scale_factor in np.linspace(ideal_scale * 0.75, ideal_scale * 1.3, 6):
+                new_h = int(th_orig * scale_factor)
+                new_w = int(tw_orig * scale_factor)
+                if new_h < 5 or new_w < 3 or new_h >= roi_h or new_w >= roi_w:
+                    continue
+                resized = cv2.resize(template, (new_w, new_h),
+                                     interpolation=cv2.INTER_AREA)
+                res = cv2.matchTemplate(roi, resized, cv2.TM_CCOEFF_NORMED)
+                if res.size == 0:
+                    continue
+                locs = np.where(res >= min_score)
+                for (py, px) in zip(locs[0], locs[1]):
+                    hits_list.append({
+                        'x': roi_x1 + int(px) + new_w // 2,
+                        'y': roi_y1 + int(py) + new_h // 2,
+                        'score': float(res[py, px]),
+                        'w': new_w, 'h': new_h,
+                    })
+
+    # NMS within each type: collapse hits within 0.7*dy distance
+    def _nms(hits, radius):
+        if not hits:
+            return []
+        hits_sorted = sorted(hits, key=lambda h: h['score'], reverse=True)
+        kept = []
+        for h in hits_sorted:
+            dup = False
+            for k in kept:
+                if abs(h['x'] - k['x']) < radius and abs(h['y'] - k['y']) < radius:
+                    dup = True
+                    break
+            if not dup:
+                kept.append(h)
+        return kept
+
+    nms_radius = dy * 0.7
+    sharp_hits = _nms(sharp_hits, nms_radius)
+    flat_hits = _nms(flat_hits, nms_radius)
+
+    n_sharps = len(sharp_hits)
+    n_flats = len(flat_hits)
+
+    # Key signatures are exclusively sharps OR flats, never mixed.
+    # Pick the type with more detections; if tied or both 0, no key sig.
+    if n_sharps == 0 and n_flats == 0:
+        return None
+
+    # Validation: key sig accidentals should be clustered in a narrow x-band
+    # (roughly within 5*dy width). Reject if hits are too spread out.
+    def _validate_cluster(hits):
+        if len(hits) <= 1:
+            return hits
+        xs = [h['x'] for h in hits]
+        x_span = max(xs) - min(xs)
+        # Key sig typically spans at most 4-5 dy wide
+        if x_span > dy * 6:
+            # Remove outliers: keep only hits within the densest cluster
+            xs_sorted = sorted(xs)
+            best_count = 0
+            best_start = 0
+            window = dy * 5
+            for i, x0 in enumerate(xs_sorted):
+                count = sum(1 for x in xs_sorted if x0 <= x <= x0 + window)
+                if count > best_count:
+                    best_count = count
+                    best_start = x0
+            hits = [h for h in hits if best_start <= h['x'] <= best_start + window]
+        return hits
+
+    sharp_hits = _validate_cluster(sharp_hits)
+    flat_hits = _validate_cluster(flat_hits)
+    n_sharps = len(sharp_hits)
+    n_flats = len(flat_hits)
+
+    # Decide: sharps or flats?
+    if n_sharps > n_flats:
+        acc_type = '#'
+        count = min(n_sharps, 7)  # max 7 sharps
+        notes = _SHARPS_ORDER_JIANPU[:count]
+    elif n_flats > n_sharps:
+        acc_type = 'b'
+        count = min(n_flats, 7)  # max 7 flats
+        notes = _FLATS_ORDER_JIANPU[:count]
+    else:
+        # Tied: use average score to break tie
+        avg_sharp = sum(h['score'] for h in sharp_hits) / n_sharps if n_sharps else 0
+        avg_flat = sum(h['score'] for h in flat_hits) / n_flats if n_flats else 0
+        if avg_sharp >= avg_flat:
+            acc_type = '#'
+            count = min(n_sharps, 7)
+            notes = _SHARPS_ORDER_JIANPU[:count]
+        else:
+            acc_type = 'b'
+            count = min(n_flats, 7)
+            notes = _FLATS_ORDER_JIANPU[:count]
+
+    # Final sanity checks
+    chosen_hits = sharp_hits if acc_type == '#' else flat_hits
+    avg_score = sum(h['score'] for h in chosen_hits) / len(chosen_hits)
+    # Single accidental detections are prone to false positives (clef
+    # residue, artifacts) — require higher confidence.
+    min_avg = 0.65 if count == 1 else 0.55
+    if avg_score < min_avg:
+        return None
+
+    print(f"   [key_sig] Detected: {count}{acc_type} "
+          f"(sharps_found={n_sharps}, flats_found={n_flats}, avg_score={avg_score:.3f})")
+    print(f"   [key_sig] Affected jianpu notes: {notes}")
+
+    return {'type': acc_type, 'count': count, 'notes': notes}
 
 
 def detect_time_signature(binary_img, staff_system, dy):

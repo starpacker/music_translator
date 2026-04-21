@@ -146,7 +146,7 @@ def _draw_digit_with_marks(draw, x, baseline_y, text, octave, underlines,
 
 def _draw_event(draw, event, x, baseline_y, accidentals_map,
                 font, glyph_w, glyph_h, color, persistent_accs,
-                dy_for_acc):
+                dy_for_acc, key_sig=None):
     """Draw one event (note_unit or rest); return new x cursor."""
     if event['type'] == 'rest':
         underlines, dotted, dashes = _rhythm_marks(event.get('duration', 1.0))
@@ -172,7 +172,6 @@ def _draw_event(draw, event, x, baseline_y, accidentals_map,
     notes = unit['notes']
 
     # Accidental: take from the highest-pitched note (top of chord)
-    # Apply persistent accidentals to all chord notes (simple heuristic).
     chord_w = glyph_w
     digit_x = x
 
@@ -181,8 +180,37 @@ def _draw_event(draw, event, x, baseline_y, accidentals_map,
     cx = n0['x'] + n0.get('w', 0) // 2
     cy = n0['y_center']
     acc = accidentals_map.get((cx, cy), '')
+
+    # Apply persistence and key signature logic (mirrors jianpu_formatter)
+    note_x = n0['x']
+    pitch = n0.get('pitch', '')
+    base_char = pitch[0] if pitch else ''
+    pitch_key = pitch
+    max_persist_gap = dy_for_acc * 5.0
+
     if acc == 'n':
+        if persistent_accs is not None:
+            persistent_accs[pitch_key] = ('n', note_x)
         acc = 'H'  # Natural rendered as 'H' like the reference repo
+    elif acc:
+        if persistent_accs is not None:
+            persistent_accs[pitch_key] = (acc, note_x)
+    else:
+        if persistent_accs is not None and pitch_key in persistent_accs:
+            stored_acc, stored_x = persistent_accs[pitch_key]
+            if abs(note_x - stored_x) <= max_persist_gap:
+                if stored_acc == 'n':
+                    acc = ''
+                else:
+                    acc = stored_acc
+                persistent_accs[pitch_key] = (stored_acc, note_x)
+            else:
+                if key_sig and base_char.isdigit() and int(base_char) in key_sig['notes']:
+                    acc = key_sig['type']
+        else:
+            if key_sig and base_char.isdigit() and int(base_char) in key_sig['notes']:
+                acc = key_sig['type']
+
     if acc:
         draw.text((digit_x, baseline_y), acc, font=font, fill=color)
         digit_x += glyph_w
@@ -223,7 +251,7 @@ def _draw_event(draw, event, x, baseline_y, accidentals_map,
 
 # ── Public renderer ─────────────────────────────────────────────────
 def render_measure_strip(draw, measures, barlines, x_left, x_right,
-                          y_top, strip_h, accidentals_map, dy):
+                          y_top, strip_h, accidentals_map, dy, key_sig=None):
     """Render one staff's worth of measures into the rectangle
     (x_left..x_right, y_top..y_top+strip_h). The strip is assumed
     to be a clear background colour already.
@@ -273,11 +301,12 @@ def render_measure_strip(draw, measures, barlines, x_left, x_right,
         for ei, ev in enumerate(events):
             ex = seg_left + inner_margin + int(ei * slot_w)
             _draw_event(draw, ev, ex, baseline_y, accidentals_map, font,
-                        glyph_w, glyph_h, color, persistent_accs, dy)
+                        glyph_w, glyph_h, color, persistent_accs, dy,
+                        key_sig=key_sig)
 
 
 def render_full_image(image_path, staff_data, accidentals_map, dy,
-                       output_path):
+                       output_path, key_sig=None):
     """Render the full annotated image: each staff system gets a
     visual jianpu strip drawn beneath it (red text + underlines + dots).
     """
@@ -314,7 +343,8 @@ def render_full_image(image_path, staff_data, accidentals_map, dy,
                        fill=(245, 245, 255))
 
         render_measure_strip(draw, measures, barlines, 0, orig_w,
-                              cursor, strip_h, accidentals_map, dy)
+                              cursor, strip_h, accidentals_map, dy,
+                              key_sig=key_sig)
         cursor += strip_h
         prev_copy = cut_y
 

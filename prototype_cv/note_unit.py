@@ -130,6 +130,8 @@ def _count_beams(binary, tip_y, stem_x, dy, staff_lines=None, stem_dir=None,
     counted_bands = []
     stem_local_x = stem_x - roi_x1  # stem position within ROI
     for start, end in bands:
+        if beam_count >= 2:
+            break  # already found double beam, no need to count more
         thickness = end - start
         if min_thickness <= thickness <= max_thickness:
             # Reject 1px bands adjacent to masked regions
@@ -156,13 +158,15 @@ def _count_beams(binary, tip_y, stem_x, dy, staff_lines=None, stem_dir=None,
             # One-sided contamination check: if a band has ink on only one
             # side (other side = 0) AND is far from the stem tip, it's likely
             # beam ink from a neighboring note bleeding into this ROI.
-            # Legitimate end-of-group beams are close to the tip (<0.8*dy).
+            # Legitimate end-of-group beams are close to the tip (<1.0*dy).
+            # (The second beam of a double-beam group can be ~0.3-0.5*dy
+            # from the first, so 0.8*dy was too strict — raised to 1.0.)
             one_sided = (left_ink >= min_beam_extent and right_ink == 0) or \
                         (right_ink >= min_beam_extent and left_ink == 0)
             if one_sided:
                 band_abs_y = roi_y1 + mid_row
                 dist_from_tip = abs(band_abs_y - tip_y)
-                if dist_from_tip > dy * 0.8:
+                if dist_from_tip > dy * 1.0:
                     continue  # far from tip — contamination from neighbor
             # Notehead check: a beam extends wider than any notehead.
             # If removing notehead-region ink leaves insufficient horizontal
@@ -178,6 +182,40 @@ def _count_beams(binary, tip_y, stem_x, dy, staff_lines=None, stem_dir=None,
                     continue  # no beam remaining after notehead removal
             beam_count += 1
             counted_bands.append((start, end))
+        elif thickness > max_thickness and thickness <= max_thickness * 2:
+            # Thick band — possibly two beams merged (sixteenth note).
+            # Check horizontal extent like a normal beam before accepting.
+            mid_row = (start + end) // 2
+            stem_col = max(0, min(roi_w - 1, stem_local_x))
+            row_pixels = roi[mid_row, :]
+            margin = 3
+            left_ink = np.sum(row_pixels[:max(0, stem_col - margin)] > 127)
+            right_ink = np.sum(row_pixels[min(roi_w, stem_col + margin + 1):] > 127)
+            min_beam_extent = max(3, int(dy * 0.3))
+            if left_ink >= min_beam_extent or right_ink >= min_beam_extent:
+                # Thickness > max (single beam) but <= 2x max: possibly two
+                # merged beams (sixteenth note). Additional checks:
+                band_mid_abs = roi_y1 + (start + end) / 2
+                dist_tip = abs(band_mid_abs - tip_y)
+                # Notehead check: after removing notehead-region ink, the
+                # band must still have sufficient horizontal extent.
+                nh_blocked = False
+                if np.any(nh_mask[start:end, :]):
+                    beam_ink = (roi[mid_row, :] > 127) & ~nh_mask[mid_row, :]
+                    left_beam = np.sum(beam_ink[:max(0, stem_col - 3)])
+                    right_beam = np.sum(beam_ink[min(roi_w, stem_col + 4):])
+                    if left_beam < min_beam_extent and right_beam < min_beam_extent:
+                        nh_blocked = True
+                # For thick bands, require substantial ink on BOTH sides
+                # of the stem (a double beam extends to neighboring notes).
+                # Use a stricter threshold than normal beams to reject
+                # notehead blobs and thick single-beam artifacts.
+                thick_min_extent = max(min_beam_extent, int(dy * 0.5))
+                both_sides = left_ink >= thick_min_extent and right_ink >= thick_min_extent
+                if dist_tip <= dy * 1.0 and not nh_blocked and both_sides:
+                    beam_count = 2
+                    counted_bands.append((start, start + thickness // 2))
+                    counted_bands.append((start + thickness // 2, end))
 
     # ── Staff-line straddling check ──
     # If two consecutive bands sit on opposite sides of a masked staff-
@@ -247,9 +285,12 @@ def _count_beams(binary, tip_y, stem_x, dy, staff_lines=None, stem_dir=None,
                 # else keep previous, skip current
             else:
                 filtered.append(counted_bands[bi])
-        if len(filtered) < len(counted_bands):
+        gap_filtered = len(filtered) < len(counted_bands)
+        if gap_filtered:
             beam_count = len(filtered)
             counted_bands = filtered
+    else:
+        gap_filtered = False
 
     # Cross-check with music_symbols: if any staff line is within
     # the ROI, the mask may have hidden beams. Use music_symbols
@@ -289,9 +330,10 @@ def _count_beams(binary, tip_y, stem_x, dy, staff_lines=None, stem_dir=None,
                     merged.append((bs, be))
             ms_bands = merged
         # Recover beams from music_symbols when binary detection found
-        # NO beams and staff-line masking may have hidden them.
-        # Only for beam_count==0 to avoid inflating already-detected beams.
-        if beam_count == 0:
+        # NO beams (staff-line masking may have hidden them), OR when
+        # gap filtering discarded a beam (2→1) — try to validate the
+        # discarded second beam from the staff-line-removed image.
+        if beam_count == 0 or (gap_filtered and beam_count == 1):
             ms_stem_local = stem_x - roi_x1
             recovered = 0
             for s, e in ms_bands:
