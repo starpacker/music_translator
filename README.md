@@ -92,6 +92,10 @@ python batch_erhu.py
 
 All pixel-level parameters scale with `dy` (staff-line spacing). No hardcoded pixel values.
 
+## Acknowledgments
+
+This project is inspired by and references [xuxiran/translate-staff-to-simple-musical-notation](https://github.com/xuxiran/translate-staff-to-simple-musical-notation). We would like to express our gratitude to the original author for their pioneering work in staff-to-jianpu translation.
+
 ## License
 
 TBD.
