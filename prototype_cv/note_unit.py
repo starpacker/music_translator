@@ -1390,6 +1390,47 @@ def _adjust_rest_durations(measures, measure_bpms, beats_per_measure,
                     e['duration'] = cur_durs[i]
 
 
+def _normalize_measure_rhythm(measures, beats_list):
+    """Musical sanity pass: every measure must add up to its time signature.
+
+    A systematic beam miscount (single beam read as double, or vice versa)
+    makes *every* beamed note in a measure wrong by the same factor, so the
+    measure total is exactly 2x or 0.5x the beat count (tuplets: 2/3, 3/2).
+    When a measure's total matches such a factor exactly and all its notes
+    are beam-derived, rescale them.  Measures whose total is off by an
+    irregular amount (missed/extra notes) are left untouched.
+    """
+    if not measures:
+        return measures
+    for mi, measure in enumerate(measures):
+        units = [e for e in measure if e['type'] == 'note_unit']
+        rests = [e for e in measure if e['type'] == 'rest']
+        if not units:
+            continue
+        beats = beats_list[mi] if mi < len(beats_list) else beats_list[-1]
+        total = sum(u['unit']['duration'] for u in units)
+        total += sum(r.get('duration', 1.0) for r in rests)
+        if abs(total - beats) < 0.05:
+            continue
+        beam_derived = all(
+            u['unit']['duration'] in (0.25, 0.5, 0.125)
+            and any(n.get('beam_count', 0) >= 1 for n in u['unit']['notes'])
+            for u in units)
+        if not beam_derived:
+            continue
+        for factor in (0.5, 2.0, 2.0 / 3.0, 1.5, 0.25, 4.0):
+            if abs(total * factor - beats) < 0.05:
+                if rests and factor not in (0.5, 2.0):
+                    continue
+                for u in units:
+                    u['unit']['duration'] *= factor
+                    for n in u['unit']['notes']:
+                        if 'individual_duration' in n:
+                            n['individual_duration'] *= factor
+                break
+    return measures
+
+
 def segment_into_measures(note_units, rests, barline_xs, dy,
                           beats_per_measure=2.0, is_first_system=True,
                           tuplet_markers=None, timesig_anchors=None,
@@ -1490,6 +1531,10 @@ def segment_into_measures(note_units, rests, barline_xs, dy,
     if tuplet_markers:
         _apply_tuplet_markers(measures, tuplet_markers, measure_bpms, dy=dy,
                               barline_xs=sorted_barlines)
+
+    # Musical sanity pass: fix systematic beam miscounts whose measure total
+    # is an exact multiple (2x / 0.5x / tuplet ratios) of the beat count.
+    _normalize_measure_rhythm(measures, measure_bpms)
 
     # Post-processing: remove false hollow note-units that cause overflow.
     # A hollow note with floored score (0.80) is often a false detection

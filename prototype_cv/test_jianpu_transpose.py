@@ -69,6 +69,20 @@ def test_tonic_from_key_sig():
     assert jt.tonic_from_key_sig({'type': 'b', 'count': 2}) == 10  # Bb major
 
 
+def test_detranspose_roundtrip():
+    # fixed-do C string -> movable-do D -> back must be lossless
+    src = "|#1'/2 #4'/2 7/2 3'/2 6/2 2'/2|"
+    d = jt.parse_tonic('D')
+    mov = jt.transpose_string(src, d)
+    back = jt.detranspose_string(mov, d)
+    assert back == src, (mov, back)
+    # explicit octave re-anchoring: '7' in 1=D is C#5 -> "#1'" in 1=C
+    assert jt.detranspose_string("7", d) == "#1'"
+    assert jt.detranspose_string("3'", d) == "#4'"
+    # rests and duration suffixes are preserved; 5 in 1=D is A -> 6 in 1=C
+    assert jt.detranspose_string("|0 5/2|", d) == "|0 6/2|"
+
+
 if __name__ == '__main__':
     for name, fn in sorted(globals().items()):
         if name.startswith('test_') and callable(fn):

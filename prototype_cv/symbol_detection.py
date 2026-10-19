@@ -839,7 +839,8 @@ _SHARPS_ORDER_JIANPU = [4, 1, 5, 2, 6, 3, 7]  # F C G D A E B
 _FLATS_ORDER_JIANPU = [7, 3, 6, 2, 5, 1, 4]   # B E A D G C F
 
 
-def detect_key_signature(binary_img, staff_system, dy, time_sig_x=None):
+def detect_key_signature(binary_img, staff_system, dy, time_sig_x=None,
+                         first_note_x=None):
     """Detect the key signature from the clef area of a staff system.
 
     Searches the region between the clef symbol and the time signature
@@ -875,7 +876,10 @@ def detect_key_signature(binary_img, staff_system, dy, time_sig_x=None):
     if time_sig_x is not None:
         roi_x2 = max(roi_x1 + 10, time_sig_x - int(dy * 0.5))
     else:
-        roi_x2 = int(img_w * 0.12)
+        # No time signature (continuation page): the key signature, if any,
+        # is re-printed right after the clef.  Scan a fixed window; the
+        # canonical-degree filter below rejects stray in-measure accidentals.
+        roi_x2 = int(img_w * 0.22)
 
     # Vertical range: staff lines ± 1.5dy to catch accidentals on ledger positions
     margin_y = int(dy * 1.5)
@@ -958,6 +962,22 @@ def detect_key_signature(binary_img, staff_system, dy, time_sig_x=None):
     nms_radius = dy * 0.7
     sharp_hits = _nms(sharp_hits, nms_radius)
     flat_hits = _nms(flat_hits, nms_radius)
+
+    # Key-signature accidentals sit ONLY on canonical staff degrees
+    # (sharps: F C G D A E B  -> dy-offsets 0, 1.5, 3, 4.5, 6, 2, 5*? ;
+    #  flats:  B E A D G C F -> 2, 0.5, 2.5, 1, 3, 1.5, 3.5).
+    # Reject hits on other degrees: they are in-measure accidentals or
+    # clef residue, not a key signature.
+    def _on_degrees(hits, offsets):
+        kept = []
+        for h in hits:
+            off = (h['y'] - staff_system[0]) / dy
+            if any(abs(off - o) <= 0.65 for o in offsets):
+                kept.append(h)
+        return kept
+
+    sharp_hits = _on_degrees(sharp_hits, (0.0, 1.5, 2.0, 2.5, 3.0, 4.5, 6.0))
+    flat_hits = _on_degrees(flat_hits, (0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5))
 
     n_sharps = len(sharp_hits)
     n_flats = len(flat_hits)

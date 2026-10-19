@@ -24,6 +24,7 @@ import difflib
 
 import pdf_tools
 import pdf_truth
+import jianpu_transpose
 from evaluate import parse_events, extract_notes_from_event
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -123,6 +124,22 @@ def run_one(pdf_path, pno, offsets, show=False, out_root=None):
         cv_main.main(png, bpm_override=False)
     cv_lines = _read_cv_measures(os.path.join(outdir, 'jianpu.txt'))
 
+    # The CV output may be renumbered to a movable-do tonic (1=D etc.),
+    # while the vector truth is always written in the fixed-do 1=C
+    # convention.  Invert the transposition so the two are comparable.
+    tonic_letter = 'C'
+    for _l in buf.getvalue().splitlines():
+        m = re.match(r'\s*Jianpu tonic:\s*1=(\S+)', _l)
+        if m:
+            tonic_letter = m.group(1)
+    try:
+        tsem = jianpu_transpose.parse_tonic(tonic_letter)
+    except ValueError:
+        tsem = 0
+    if tsem:
+        cv_lines = {k: [jianpu_transpose.detranspose_string(s_, tsem)
+                        for s_ in v] for k, v in cv_lines.items()}
+
     result = {'page': pno, 'systems': []}
     n_sys = max(len(t_measures), len(cv_lines))
     for i in range(n_sys):
@@ -160,6 +177,13 @@ def main(argv):
         offsets = pdf_truth._glyph_offsets(path)
         npages = pdf_tools.pdf_page_count(path)
         pages = pages_want or list(range(1, npages + 1))
+        # Fresh per-score state: bpm/tonic carry forward across pages of the
+        # SAME score (continuation pages have no time signature), but must
+        # not leak between different PDFs.
+        from config import CFG as _CFG
+        import jianpu_transpose as _jt
+        _CFG.duration.beats_per_measure = 2.0
+        _jt.set_target_tonic(0)
         print(f'\n{"=" * 70}\n  {rel}  ({npages} pages)\n{"=" * 70}')
         for pno in pages:
             if pno > npages:

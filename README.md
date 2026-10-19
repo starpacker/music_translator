@@ -9,7 +9,7 @@ instruments (erhu, flute, etc.).
 > **Accuracy** (evaluated test pieces):
 > - Piano (Mozart K.331, hand-written ground truth): **90%** measures / **95%** events / **99%** pitches (20 bars)
 > - Erhu + Qudi, **all 13 PDF pages** vs. exact vector-PDF ground truth
->   (`run_tests.py`): **38%** measures / **48%** events / **56%** pitches —
+>   (`run_tests.py`): **38%** measures / **50%** events / **57%** pitches —
 >   this whole-corpus number is the honest baseline the CV pipeline is now
 >   being iterated against (see `prototype_cv/README.md` for per-page detail).
 >

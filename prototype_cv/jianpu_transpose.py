@@ -137,3 +137,39 @@ def transpose_string(s, tonic_semis=None):
     if tonic_semis == 0:
         return s
     return _TOKEN_RE.sub(lambda m: transpose_note_token(m.group(0), tonic_semis), s)
+
+
+def detranspose_note_token(token, tonic_semis):
+    """Inverse of :func:`transpose_note_token`.
+
+    ``token`` is written relative to ``tonic_semis`` (movable-do); the
+    result is the same absolute pitch written in the fixed-do 1=C
+    convention.  Octave marks are recomputed because movable-do octaves
+    are relative to the tonic, not to C.
+    """
+    if not tonic_semis:
+        return token
+    m = _NOTE_RE.match(token)
+    if not m:
+        return token
+    acc = {'': 0, '#': 1, 'b': -1}[m.group('acc')]
+    deg = int(m.group('deg'))
+    octs = m.group('oct')
+    octv = octs.count("'") - octs.count(',')
+    midi = 60 + 12 * octv + _DEGREE_SEMIS[deg] + acc + tonic_semis
+    r = midi - 60
+    o2 = r // 12
+    rem = r - 12 * o2
+    if rem in _SEMIS_TO_DEGREE:
+        a2, d2 = '', _SEMIS_TO_DEGREE[rem]
+    else:
+        a2, d2 = _CHROMATIC[rem]
+    return a2 + str(d2) + ("'" * o2 if o2 > 0 else ',' * -o2)
+
+
+def detranspose_string(s, tonic_semis):
+    """Rewrite a movable-do jianpu string back into the 1=C convention."""
+    if not tonic_semis:
+        return s
+    return _TOKEN_RE.sub(
+        lambda m: detranspose_note_token(m.group(0), tonic_semis), s)

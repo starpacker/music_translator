@@ -393,6 +393,9 @@ def main(image_path, bpm_override=False):
               f"{len(treble_measures)} treble measures, {len(bass_measures)} bass measures")
 
     # ── 10. Format & Save Output ──
+    # carry end-of-page bpm forward for continuation pages
+    if pair_data and pair_data[-1].get('timesig_anchors'):
+        CFG.duration.beats_per_measure = pair_data[-1]['timesig_anchors'][-1][1]
     _print_and_save_output(pair_data, accidentals_map, dy, key_sig=key_sig)
 
     # ── 11. Visualization ──
@@ -1234,7 +1237,14 @@ def _main_single_staff(image_path, systems, staff_lines, music_symbols, binary, 
         _ts_detections = _dts(binary, systems[0], [], dy)
         if _ts_detections:
             _ts_x_single = _ts_detections[0].get('match_x')
-    key_sig = detect_key_signature(binary, systems[0], dy, time_sig_x=_ts_x_single)
+    _first_note_x = min((n['x'] for n in all_notes
+                         if _nearest_staff(n['y_center'], systems) == 0),
+                        default=None)
+    # Use the staff-removed image: staff lines corrupt sharp/flat template
+    # matching (the global accidental detector uses it too).
+    key_sig = detect_key_signature(music_symbols, systems[0], dy,
+                                   time_sig_x=_ts_x_single,
+                                   first_note_x=_first_note_x)
     if key_sig:
         print(f"   Key signature: {key_sig['count']}{key_sig['type']} → "
               f"notes {key_sig['notes']}")
@@ -1365,6 +1375,10 @@ def _main_single_staff(image_path, systems, staff_lines, music_symbols, binary, 
     # skip_empty=True: legitimate empty measures are filled with rests
     # by fill_to_measure (so they format as "0 0 0 0" and pass through),
     # while false-barline narrow empties remain as "0 0" and get dropped.
+    # Carry the bpm in effect at the END of this page forward: continuation
+    # pages usually have no time signature of their own.
+    if staff_data and staff_data[-1].get('timesig_anchors'):
+        CFG.duration.beats_per_measure = staff_data[-1]['timesig_anchors'][-1][1]
     _print_and_save_single_staff_output(staff_data, accidentals_map, dy,
                                         skip_empty=has_chords, key_sig=key_sig)
 
