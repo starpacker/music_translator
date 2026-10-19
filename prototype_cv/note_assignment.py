@@ -65,6 +65,12 @@ def filter_false_positive_notes(notes, dy, clef='treble'):
     """
     filtered = []
     for note in notes:
+        # cross noteheads were validated by a dedicated x-template; their
+        # correlation score is not comparable to the oval-head scores, so
+        # the score-based false-positive rules must not touch them.
+        if note.get('xhead'):
+            filtered.append(note)
+            continue
         system = note.get('system')
         if system is None:
             filtered.append(note)

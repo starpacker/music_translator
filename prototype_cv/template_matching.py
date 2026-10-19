@@ -676,3 +676,79 @@ def find_noteheads(binary_img, dy, threshold=0.55, staff_systems=None, music_sym
     return picked_boxes, create_notehead_template(dy), exclusion_zones
 
 
+
+
+# ============================================================
+# X-noteheads (cross heads: 噪音/拨弦/刮风 effects)
+# ============================================================
+def create_xhead_template(dy):
+    """Synthetic template for a cross (x) notehead."""
+    s = int(round(2.6 * dy)) | 1
+    t = np.zeros((s, s), np.uint8)
+    c = s // 2
+    hw = int(round(0.58 * dy))     # half width
+    hh = int(round(0.48 * dy))     # half height
+    th = max(1, int(round(0.30 * dy)))
+    cv2.line(t, (c - hw, c - hh), (c + hw, c + hh), 255, th, cv2.LINE_AA)
+    cv2.line(t, (c - hw, c + hh), (c + hw, c - hh), 255, th, cv2.LINE_AA)
+    return t
+
+
+def _xhead_zone(ms, cx, cy, ox, oy, half):
+    h, w = ms.shape
+    x0 = int(max(0, cx + ox - half)); x1 = int(min(w, cx + ox + half))
+    y0 = int(max(0, cy + oy - half)); y1 = int(min(h, cy + oy + half))
+    reg = ms[y0:y1, x0:x1]
+    return reg.mean() / 255.0 if reg.size else 1.0
+
+
+def _is_x_shape(music_symbols, cx, cy, dy):
+    """Shape test separating a cross head from solid blobs & line crossings.
+
+    An x-head has its ink on the four diagonals while the north / south /
+    west notches stay empty.  A filled oval head fills every zone; a
+    stem×beam crossing fills north & south (the stem) and thus fails.
+    """
+    r = 0.42 * dy
+    half = 0.14 * dy
+    n = _xhead_zone(music_symbols, cx, cy, 0, -r, half)
+    s = _xhead_zone(music_symbols, cx, cy, 0, r, half)
+    w = _xhead_zone(music_symbols, cx, cy, -r, 0, half)
+    diag = [_xhead_zone(music_symbols, cx, cy, sx * r * 0.71, sy * r * 0.71, half)
+            for sx in (1, -1) for sy in (1, -1)]
+    return max(n, s, w) < 0.30 and min(diag) > 0.40
+
+
+def find_x_noteheads(music_symbols, staff_systems, dy, threshold=None,
+                     exclude=()):
+    """Detect cross-shaped (x) noteheads, which oval templates never match.
+
+    Returns boxes in the same (x, y, w, h, score) format as find_noteheads.
+    ``exclude`` is a list of (cx, cy) centres of already-detected regular
+    noteheads so we never report an x-head on top of a real oval head.
+    """
+    from config import CFG
+    if music_symbols is None or not staff_systems:
+        return []
+    thr = threshold if threshold is not None else CFG.notehead.x_match_threshold
+    tpl = create_xhead_template(dy)
+    th, tw = tpl.shape
+    if music_symbols.shape[0] < th or music_symbols.shape[1] < tw:
+        return []
+    res = cv2.matchTemplate(music_symbols, tpl, cv2.TM_CCOEFF_NORMED)
+    boxes = []
+    ys, xs = np.where(res >= thr)
+    for y, x in zip(ys, xs):
+        cx = x + tw / 2.0
+        cy = y + th / 2.0
+        if not any(s[0] - 3 * dy <= cy <= s[4] + 3 * dy for s in staff_systems):
+            continue
+        if any(abs(ecx - cx) < 0.8 * dy and abs(ecy - cy) < 0.8 * dy
+               for ecx, ecy in exclude):
+            continue
+        if not _is_x_shape(music_symbols, cx, cy, dy):
+            continue
+        boxes.append((int(x), int(y), tw, th, float(res[y, x])))
+    boxes = non_max_suppression(boxes, 0.3)
+    boxes = _deduplicate_by_center(boxes, dy * 0.5)
+    return boxes

@@ -13,10 +13,13 @@ from pitch_detection import y_to_jianpu
 def _is_hollow(music_symbols, note, dy):
     """Check if a notehead is hollow by examining fill ratio of center region.
 
-    For half notes, the stem passes through the center and inflates
-    overall fill. Split the center into left and right halves — if
-    EITHER half has low fill, the notehead is hollow (half or whole).
+    Cross (x) noteheads are never hollow — their centre is the crossing of
+    the two strokes, but the left/right quadrants look empty and would
+    fool the fill-ratio test below.
     """
+    if note.get('xhead'):
+        return False
+
     cx = note['x'] + note['w'] // 2
     cy = note['y_center']
     r = max(1, int(dy * 0.2))
@@ -683,12 +686,14 @@ def detect_duration_per_note(note, binary, dy, music_symbols=None, all_notes=Non
     # For stemmed notes, always verify with _is_hollow to avoid
     # misclassifying low-confidence filled noteheads as hollow.
     score = note.get('score', 1.0)
-    likely_hollow_template = 0.78 <= score < 0.85
+    likely_hollow_template = 0.78 <= score < 0.85 and not note.get('xhead')
 
     stem = note['stem']
     if stem['stem_dir'] is None:
         if likely_hollow_template:
             return 4.0  # whole note (no stem + hollow template match)
+        if note.get('xhead'):
+            return 1.0
         is_hollow = _is_hollow(music_symbols, note, dy) if music_symbols is not None else False
         return 4.0 if is_hollow else 1.0
 
@@ -758,6 +763,10 @@ def build_note_units(notes, music_symbols, binary, dy, single_staff=False):
     # Notes far from the staff require higher fill (dynamic markings, ornaments, etc.).
     verified_notes = []
     for n in notes:
+        if n.get('xhead'):
+            # cross noteheads: shape verified by the x-template already
+            verified_notes.append(n)
+            continue
         cx = n['x'] + n['w'] // 2
         cy = n['y_center']
         pad = max(2, int(dy * 0.15))

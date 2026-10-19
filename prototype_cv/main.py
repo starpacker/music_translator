@@ -52,6 +52,25 @@ def _timesig_to_bpm(num, den):
     return num * (4.0 / den)
 
 
+# ── Tonic (1=X) selection ────────────────────────────────────
+# 'auto'  → derive from the detected key signature (major convention)
+# 'C'…    → force that tonic regardless of the detected signature
+KEY_OPTION = 'auto'
+
+_TONIC_NAMES = {0: 'C', 1: '#C', 2: 'D', 3: 'bE', 4: 'E', 5: 'F', 6: '#F',
+                7: 'G', 8: 'bA', 9: 'A', 10: 'bB', 11: 'B'}
+
+
+def _apply_tonic(key_sig):
+    """Resolve KEY_OPTION against the detected key signature and install it."""
+    from jianpu_transpose import parse_tonic, tonic_from_key_sig, set_target_tonic
+    semis = parse_tonic(KEY_OPTION)
+    if semis is None:
+        semis = tonic_from_key_sig(key_sig)
+    set_target_tonic(semis)
+    return semis
+
+
 def _build_system_timesig_anchors(binary, system, barlines, dy, current_bpm,
                                    clef_roi_x1=None, clef_roi_x2=None):
     """Build time-signature anchors for one staff system.
@@ -91,6 +110,14 @@ from note_unit import (build_note_units, segment_into_measures,
 from jianpu_formatter import format_measure, format_output
 
 OUTPUT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output")
+
+
+def set_output_dir(path):
+    """Redirect all pipeline outputs (jianpu.txt, visualisations, …)."""
+    global OUTPUT_DIR
+    OUTPUT_DIR = path
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    return OUTPUT_DIR
 
 
 def _output_path(filename):
@@ -168,6 +195,8 @@ def main(image_path, bpm_override=False):
               f"notes {key_sig['notes']}")
     else:
         print("   Key signature: none detected (C major / A minor)")
+    _tonic = _apply_tonic(key_sig)
+    print(f"   Jianpu tonic: 1={_TONIC_NAMES[_tonic]}")
 
     # ── 3. Detect Barlines ──
     print("3. Detecting barlines...")
@@ -196,6 +225,18 @@ def main(image_path, bpm_override=False):
         for x, y, w, h, score in boxes
     ]
     print(f"   Detected {len(all_notes)} noteheads total")
+
+    # Cross (x) noteheads — oval templates never match them
+    from template_matching import find_x_noteheads
+    xboxes = find_x_noteheads(
+        music_symbols, systems, dy,
+        exclude=[(n['x'] + n['w'] / 2.0, n['y_center']) for n in all_notes])
+    if xboxes:
+        all_notes += [{'x': x, 'y': y, 'w': w, 'h': h, 'y_center': y + h // 2,
+                       'score': score, 'xhead': True}
+                      for x, y, w, h, score in xboxes]
+        all_notes.sort(key=lambda n: n['x'])
+        print(f"   + {len(xboxes)} x-noteheads (cross heads)")
 
     # Filter clef area — adaptive per-system boundary
     # Line 1 (pair 0) has clef + key-sig + time-sig → wider exclusion (17%)
@@ -726,6 +767,18 @@ def _main_single_staff(image_path, systems, staff_lines, music_symbols, binary, 
     ]
     print(f"   Detected {len(all_notes)} noteheads total")
 
+    # Cross (x) noteheads — oval templates never match them
+    from template_matching import find_x_noteheads
+    xboxes = find_x_noteheads(
+        music_symbols, systems, dy,
+        exclude=[(n['x'] + n['w'] / 2.0, n['y_center']) for n in all_notes])
+    if xboxes:
+        all_notes += [{'x': x, 'y': y, 'w': w, 'h': h, 'y_center': y + h // 2,
+                       'score': score, 'xhead': True}
+                      for x, y, w, h, score in xboxes]
+        all_notes.sort(key=lambda n: n['x'])
+        print(f"   + {len(xboxes)} x-noteheads (cross heads)")
+
     # Filter clef area — use first system boundary for line 1, adaptive for rest
     from template_matching import create_notehead_template
     nh_template = create_notehead_template(dy)
@@ -1187,6 +1240,8 @@ def _main_single_staff(image_path, systems, staff_lines, music_symbols, binary, 
               f"notes {key_sig['notes']}")
     else:
         print("   Key signature: none detected (C major / A minor)")
+    _tonic = _apply_tonic(key_sig)
+    print(f"   Jianpu tonic: 1={_TONIC_NAMES[_tonic]}")
 
     # ── 9. Build Note Units & Segment Measures ──
     print("9. Building note units and segmenting measures...")
@@ -2086,15 +2141,45 @@ def _generate_jianpu_cv2(pair_data, accidentals_map, dy, key_sig=None):
 
 
 if __name__ == "__main__":
-    import sys
-    img_path = sys.argv[1] if len(sys.argv) > 1 else "../input/piano_p1.png"
-    # Optional: --bpm N to override beats_per_measure
-    bpm_override = False
-    if '--bpm' in sys.argv:
-        idx = sys.argv.index('--bpm')
-        if idx + 1 < len(sys.argv):
-            from config import CFG
-            CFG.duration.beats_per_measure = float(sys.argv[idx + 1])
-            print(f"Override beats_per_measure = {CFG.duration.beats_per_measure}")
-            bpm_override = True
-    main(img_path, bpm_override=bpm_override)
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Translate a staff-notation image (or PDF) into jianpu.")
+    parser.add_argument("image", nargs="?", default="../input/piano_p1.png",
+                        help="input PNG/JPG, or a PDF (all pages processed)")
+    parser.add_argument("--bpm", type=float, default=None,
+                        help="override beats per measure (e.g. 3.0 for 3/4)")
+    parser.add_argument("--key", default="auto",
+                        help="jianpu tonic: auto | C | G | D | bB | #F ... "
+                             "(default: auto from the detected key signature)")
+    parser.add_argument("--outdir", default=None,
+                        help="directory for output files (default: output/)")
+    parser.add_argument("--dpi", type=int, default=288,
+                        help="rasterisation DPI when the input is a PDF")
+    parser.add_argument("--pages", default=None,
+                        help="comma-separated 1-based PDF pages to process")
+    args = parser.parse_args()
+
+    if args.bpm is not None:
+        from config import CFG
+        CFG.duration.beats_per_measure = args.bpm
+        print(f"Override beats_per_measure = {CFG.duration.beats_per_measure}")
+
+    KEY_OPTION = args.key
+
+    if args.outdir:
+        set_output_dir(args.outdir)
+
+    if args.image.lower().endswith(".pdf"):
+        from pdf_tools import render_pdf
+        pages = render_pdf(args.image, dpi=args.dpi)
+        if args.pages:
+            want = {int(p) for p in args.pages.split(",")}
+            pages = [p for i, p in enumerate(pages, 1) if i in want]
+        for i, page_png in enumerate(pages, 1):
+            print(f"\n{'#' * 60}\n# PDF page {i}/{len(pages)}: {page_png}\n{'#' * 60}")
+            if args.outdir:
+                set_output_dir(os.path.join(args.outdir, f"p{i}"))
+            main(page_png, bpm_override=args.bpm is not None)
+    else:
+        main(args.image, bpm_override=args.bpm is not None)

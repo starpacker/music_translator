@@ -62,6 +62,7 @@ class NoteheadConfig:
     exclusion_zone_margin_dy: float = 0.3   # exclusion zone margin
     exclusion_match_threshold: float = 0.55 # exclusion zone template threshold
     exclusion_nms_overlap: float = 0.3
+    x_match_threshold: float = 0.42     # cross (x) notehead template threshold
 
 
 # ── Clef & Key Signature ─────────────────────────────────────

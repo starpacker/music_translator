@@ -163,7 +163,12 @@ def format_measure(measure, accidentals_map, measure_idx=0, dy=21.0,
     result = " ".join(parts)
     if multi_count is not None:
         result += f" ×{multi_count}"
-    return result
+
+    # Final step: renumber into the user-requested tonic (1=X).  The string
+    # produced above encodes absolute pitches in the 1=C convention, so the
+    # renumbering is exact and lossless.
+    from jianpu_transpose import transpose_string
+    return transpose_string(result)
 
 
 def format_output(measures, accidentals_map, dy=21.0,
