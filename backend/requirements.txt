@@ -1,0 +1,5 @@
+fastapi>=0.110
+uvicorn[standard]>=0.27
+python-multipart>=0.0.9
+# The OMR + jianpu pipeline itself is provided by the SumisoraOMR repo
+# (install its requirements into the same 'sumisora' conda env).

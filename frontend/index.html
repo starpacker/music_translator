@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>简谱转换 · SumisoraOMR</title>
+<link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <main class="card">
+    <header class="head">
+      <h1>五线谱 → 简谱</h1>
+      <p class="sub">上传 PDF，选择调号，下载 <code>jianpu.pdf</code> 与原位对照谱</p>
+    </header>
+
+    <form id="form">
+      <label id="drop" class="drop">
+        <input id="file" type="file" accept=".pdf,.png,.jpg,.jpeg" hidden />
+        <span id="dropText" class="drop__text">
+          <strong>点击选择</strong> 或拖拽文件到这里
+          <small>支持 PDF / PNG / JPG</small>
+        </span>
+      </label>
+
+      <div class="row">
+        <label class="field">
+          <span>调号 (1 = ?)</span>
+          <select id="tonic"></select>
+        </label>
+        <label class="field">
+          <span>调式</span>
+          <select id="mode"></select>
+        </label>
+        <label class="field">
+          <span>输出</span>
+          <select id="format">
+            <option value="both">简谱 + 原位（zip）</option>
+            <option value="jianpu">仅简谱 PDF</option>
+            <option value="insitu">仅原位 PDF</option>
+          </select>
+        </label>
+      </div>
+
+      <label class="check">
+        <input id="transpose" type="checkbox" checked />
+        <span>真正移调（按所选调号重写音高）</span>
+      </label>
+
+      <button id="go" type="submit" disabled>生成简谱</button>
+      <p id="status" class="status" role="status"></p>
+    </form>
+
+    <footer class="foot">
+      <span id="backendNote"></span>
+    </footer>
+  </main>
+  <script src="config.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
