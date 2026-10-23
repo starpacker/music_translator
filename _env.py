@@ -4,8 +4,9 @@ Everything that used to be hard-coded to one machine lives here.  Resolution
 order for the OMR library:
 
 1. ``$SUMISORA_ROOT``
-2. ``<repo>/vendor/SumisoraOMR``
-3. a sibling directory next to this repo: ``../SumisoraOMR-main/SumisoraOMR-main``
+2. bundled ``<repo>/core``
+3. ``<repo>/vendor/SumisoraOMR``
+4. a sibling directory next to this repo: ``../SumisoraOMR-main/SumisoraOMR-main``
    or ``../SumisoraOMR``
 
 The jianpu renderer is invoked with the *same* interpreter that runs this
@@ -22,6 +23,7 @@ from typing import Optional
 HERE = Path(__file__).resolve().parent
 
 _CANDIDATES = (
+    HERE,  # bundled, locally maintained core
     HERE / 'vendor' / 'SumisoraOMR',
     HERE.parent / 'SumisoraOMR-main' / 'SumisoraOMR-main',
     HERE.parent / 'SumisoraOMR',

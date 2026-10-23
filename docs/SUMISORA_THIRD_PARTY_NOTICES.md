@@ -1,0 +1,203 @@
+# Third-Party Notices
+
+This file provides license and attribution notices for third-party components distributed with this product, where such notices are required by the applicable licenses. It does not attempt to document every development or build dependency.
+
+## Audiveris
+- Version: `5.11.0`
+- License: `AGPL-3.0`
+- Upstream: <https://github.com/Audiveris/audiveris>
+- Official site: <https://audiveris.github.io/audiveris/>
+
+## LilyPond
+- Version: `2.24.4`
+- License: GPL-2.0
+- Upstream: <https://lilypond.org/>
+
+## music21
+- Version: `10.5.0`
+- License: BSD-3-Clause
+- Upstream: <https://github.com/cuthbertLab/music21>
+- Documentation: <https://www.music21.org/music21docs/>
+
+## Pillow
+- Version: `12.3.0`
+- License: HPND (Historical Permission Notice and Disclaimer)
+- Upstream: <https://github.com/python-pillow/Pillow>
+- Documentation: <https://pillow.readthedocs.io/>
+- Note: Used for sheet music image preprocessing (noise reduction, deskewing,
+  sharpening, brightness/contrast enhancement) before OMR recognition.
+
+## ReportLab
+- Version: `5.0.0`
+- License: BSD-3-Clause
+- Official site: <https://www.reportlab.com/>
+
+## PyMuPDF
+- Version: `1.28.2`
+- License: Dual-licensed — GNU AGPL-3.0 or Artifex commercial license. This
+  product is itself AGPL-3.0, so it is distributed under the AGPL-3.0 branch.
+- Upstream: <https://github.com/pymupdf/pymupdf>
+- Documentation: <https://pymupdf.readthedocs.io/>
+- Note: PDF page count, vector/bitmap type detection, and page → PNG rendering
+  (`core/utils.py`, `core/omr/engine_router.py`, `core/omr/homr_runner.py`).
+  Imported as `pymupdf`; the legacy `fitz` alias is deprecated as of 1.28.
+
+## OpenCV
+- Version: `4.13.0` (via `opencv-python` 4.13.0.92)
+- License: Apache-2.0
+- Upstream: <https://github.com/opencv/opencv>
+- Note: Used for advanced image preprocessing and line/staff detection in the OMER pipeline.
+
+## ONNX Runtime (DirectML)
+- Version: `1.24.4` (the highest `onnxruntime-directml` release; the
+  development/CI target uses `onnxruntime-gpu` 1.26.0 instead)
+- License: MIT
+- Upstream: <https://github.com/microsoft/onnxruntime>
+- Note: Windows DirectML backend for GPU-accelerated inference used by the Homr engine.
+
+## Homr
+- Version: upstream `v0.7.0` plus post-release commits through `93e17ba`, plus fork commits (submodule pinned at `a54bc37`); transformer model 465
+- License: AGPL-3.0
+- Upstream (original): <https://github.com/liebharc/homr>
+- Fork used by this project: <https://github.com/Tsukamotoshio/homr>
+- Modifications: DirectML GPU inference support (provider order CUDA → ROCm → DirectML → CoreML), ORT thread limits, configurable SegNet batch size, explicit resource teardown, safe XML output preservation on post-write exceptions, a weight catalog with SHA256 verification and a `HOMR_MODELS_DIR` override, a ModelScope download mirror with resume support, `preload_dlls()` guarded for non-CUDA runtimes, `homr.pdf_utils` imported lazily so `pypdfium2` stays optional (PDF rasterisation is done by this project with PyMuPDF instead — see `core/omr/homr_runner.py:_pdf_pages_to_png`), and `<voice>` emitted in the position the MusicXML DTD requires.
+- Note: End-to-end optical music recognition engine integrated as a local repository under `omr_engine/homr`.
+- Upstream foundations: Homr builds upon two prior works whose models and segmentation code are embedded in the homr package:
+  - **oemer** (MIT) — segmentation models for staff lines, note heads, and bar lines.
+    Copyright © BreezeWhite. <https://github.com/BreezeWhite/oemer>
+  - **Polyphonic-TrOMR** (MIT) — transformer model for end-to-end symbol sequence recognition.
+    Copyright © NetEase. <https://github.com/NetEase/Polyphonic-TrOMR>
+
+## scikit-learn
+- License: BSD-3-Clause
+- Upstream: <https://github.com/scikit-learn/scikit-learn>
+- Note: A transitive dependency of `homr` for runtime inference.
+
+## SciPy
+- License: BSD-3-Clause
+- Upstream: <https://github.com/scipy/scipy>
+- Note: A transitive dependency of `homr` for numerical computation and matrix operations.
+
+## NumPy
+- License: BSD-3-Clause
+- Upstream: <https://github.com/numpy/numpy>
+- Note: Core numerical array library required by `homr` for image tensor operations and model inference.
+
+## tqdm
+- License: MPL-2.0 AND MIT
+- Upstream: <https://github.com/tqdm/tqdm>
+- Note: Progress-bar library; a transitive dependency of `homr`. Only `homr` internals use it directly; no tqdm source is modified by this project, so MPL-2.0 file-level copyleft is not triggered.
+
+## jianpu-ly
+- Version: `1.866`
+- License: Apache-2.0
+- Home: <https://ssb22.user.srcf.net/mwrhome/jianpu-ly.html>
+- Upstream: <https://github.com/ssb22/jianpu-ly>
+
+## Real-ESRGAN (realesrgan-ncnn-vulkan)
+- License: BSD-3-Clause
+- Copyright: © 2021 Xintao Wang, Liangbin Xie, Chao Dong, Ying Shan, Xiaohu Qie
+- Upstream (Python): <https://github.com/xinntao/Real-ESRGAN>
+- Upstream (ncnn-vulkan binary): <https://github.com/xinntao/Real-ESRGAN-ncnn-vulkan>
+- Note: **Default** GPU-accelerated (Vulkan) super-resolution pre-processor bundled
+  under `realesrgan-runtime/`. Invoked as an external subprocess; not linked or
+  modified. Supports models: `realesrgan-x4plus`, `realesrgan-x4plus-anime`,
+  `realesr-animevideov3`. Used for high-fidelity upscaling of low-resolution sheet
+  music images before OMR; waifu2x is available as a secondary option.
+
+## waifu2x-ncnn-vulkan
+- Version: `20250915`
+- License: MIT
+- Copyright: © 2019 nihui
+- Upstream: <https://github.com/nihui/waifu2x-ncnn-vulkan>
+- Note: GPU-accelerated (Vulkan) super-resolution pre-processor for low-resolution
+  sheet music images. Invoked as an external subprocess; not linked or modified.
+  Selectable as a secondary alternative to Real-ESRGAN (line-art model). License
+  text is included in `waifu2x-runtime/LICENSE`.
+
+## Eclipse Temurin JDK
+- Version: `25.0.4.1+1` (Temurin-25.0.4.1+1)
+- Implementor: Eclipse Adoptium
+- License: GPLv2 with Classpath Exception
+- Official site: <https://adoptium.net/>
+- Source: <https://github.com/adoptium/temurin25-binaries>
+- Note: Bundled as the Java runtime required by Audiveris.
+
+## pywebview
+- Version: `6.2.1`
+- License: BSD-3-Clause
+- Upstream: <https://github.com/r0x0r/pywebview>
+- Official site: <https://pywebview.flowrl.com/>
+- Note: GUI shell for the desktop application — hosts the local web front-end in a
+  WebView2 window. Replaced Flet in v0.5.0; the Flet runtime is no longer shipped.
+
+## Python.NET (pythonnet)
+- Version: `3.1.0`
+- License: MIT
+- Upstream: <https://github.com/pythonnet/pythonnet>
+- Official site: <https://pythonnet.github.io/>
+- Note: Pulled in by pywebview as the .NET bridge used to drive WinForms/WebView2
+  on Windows.
+
+## noteDigger
+- Version: fork submodule pinned at `f72303f`
+- License: `GPL-3.0`
+- Copyright: © madderscientist
+- Upstream (original): <https://github.com/madderscientist/noteDigger>
+- Official site: <https://madderscientist.github.io/noteDigger/>
+- Fork used by this project: <https://github.com/Tsukamotoshio/noteDigger>
+- Note: Browser-based piano-roll transcription and correction editor, vendored
+  as a git submodule under `webui/static/vendor/notedigger/` and loaded in an
+  iframe by the audio-transcription page. Its full license text ships in that
+  directory. This product is AGPL-3.0; GPL-3.0 §13 and AGPL-3.0 §13 are the
+  mutual clauses that permit the two to be combined.
+
+## pdf.js
+- Version: `6.3.289`
+- License: Apache-2.0
+- Upstream: <https://github.com/mozilla/pdf.js>
+- Note: Client-side PDF rendering for the in-app preview panes, vendored
+  unmodified at `webui/static/vendor/pdfjs/`. It replaced the Python-side
+  PDFium renderer in v0.5.0, so no PDF rasterisation happens in-process for
+  preview anymore.
+
+## webaudio-tinysynth
+- License: Apache-2.0
+- Copyright: © g200kg
+- Upstream: <https://github.com/g200kg/webaudio-tinysynth>
+- Note: Self-contained General MIDI synthesiser powering the built-in MIDI
+  player on the jianpu and staff preview pages. Vendored unmodified at
+  `webui/static/vendor/tinysynth/`.
+
+---
+
+## Important note
+
+If you redistribute this package, applicable open-source license obligations still apply.
+
+### Audiveris (AGPL-3.0)
+
+This tool invokes Audiveris as an **external subprocess**; it does not embed,
+link against, or modify Audiveris source code. Only the Audiveris binary itself
+is subject to AGPL-3.0. If you have not modified Audiveris, your redistribution
+obligations are:
+
+1. Keep Audiveris’ original copyright and license notices intact.
+2. Provide recipients with the upstream source link: <https://github.com/Audiveris/audiveris>
+3. If you have modified Audiveris itself, you must make those modifications
+   available under AGPL-3.0.
+
+### Eclipse Temurin JDK (GPLv2 with Classpath Exception)
+
+The Classpath Exception means that applications running on this JDK are **not**
+required to be GPL-licensed. You must retain the JDK’s copyright and license
+notices, and provide the source link: <https://github.com/adoptium/temurin25-binaries>
+
+### General obligations
+
+- Do not remove or obscure any copyright or license notices from any component.
+- Retain this `THIRD_PARTY_NOTICES.md` file in all redistributed copies.
+
+> This notice is practical guidance, not legal advice. If the package will be
+> sold or delivered externally, consult a qualified lawyer for a final compliance
+> decision.

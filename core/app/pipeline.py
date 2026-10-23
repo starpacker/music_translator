@@ -1,0 +1,712 @@
+# core/app/pipeline.py — Batch conversion pipeline and entry point.
+# Split from convert.py.
+import hashlib
+import logging
+import shutil
+import sys
+from pathlib import Path
+from typing import Optional
+
+from ..omr.audiveris_runner import run_audiveris_sliced_batch
+from ..config import (
+    LOGGER,
+    SUPPORTED_AUDIO_SUFFIXES,
+    AppConfig,
+    ConversionSummary,
+    OMREngine,
+)
+from ..omr.homr_runner import check_homr_available, run_homr_batch
+from ..render.renderer import generate_jianpu_pdf_from_mxl
+from ..utils import (
+    build_runtime_paths,
+    cleanup_old_temporary_paths,
+    cleanup_output_directory,
+    collect_duplicate_names,
+    confirm_skip_all_existing,
+    find_first_musicxml_file,
+    get_app_base_dir,
+    is_supported_score_file,
+    load_conversion_history,
+    log_message,
+    print_conversion_summary,
+    safe_remove_tree,
+    save_conversion_history,
+    update_conversion_history,
+)
+
+# ── 子进度回调（由 worker_main.py 在子进程模式下注入）──────────────────────────
+# 调用签名：_subprogress_fn(value: float 0.0-1.0, message: str)
+# 在各主要流程节点处调用 _report_subprogress() 以向 GUI 报告文件内子步骤进度。
+_subprogress_fn: Optional[object] = None
+
+# 音频转录产物暂不归档到 xml-scores/（= 暂时关闭「五线谱预览」/「移调」对音频结果
+# 的可见性）：MIDI→music21 转出的 MusicXML 缺少 OMR 输出具备的声部/休止位移信息，
+# lilypond_runner 里大量的"OMR 伪影清洗"逻辑是针对 OMR 特征调的，套在音频产物上
+# 排版会很乱。简谱预览/编辑不受影响（走 editor_workspace_dir，与此无关）。
+# 待音频→MusicXML 的量化/结构质量进一步提升后再打开。
+_ARCHIVE_AUDIO_TO_XML_SCORES = False
+
+
+def _report_subprogress(value: float, message: str = '') -> None:
+    """Report intra-file processing sub-step progress (0.0–1.0) to the GUI."""
+    fn = _subprogress_fn
+    if fn is not None:
+        try:
+            fn(value, message)  # type: ignore[operator]
+        except Exception:
+            pass
+
+
+def _force_xml_element(raw: str, tag: str, value: str) -> tuple[str, bool]:
+    """Set the first <tag>...</tag> (or <tag/>) to `value`; delete any later duplicates.
+
+    Returns (new_raw, found_any). Matching both the paired and the self-closing
+    spelling is the point: homr writes `<work-title />` whenever title detection is
+    off (`ProcessingConfig(title_detection=False)`, which core/omr/homr_runner.py
+    passes), and the old paired-only regex missed it, fell through to the insert
+    branch and produced a *second* work-title.
+    """
+    import re as _re
+    # (?![\w-]) not \b: \b also matches before a hyphen, so tag='work' would
+    # otherwise match <work-title> too.
+    pat = _re.compile(
+        rf'<{tag}(?![\w-])[^>]*/>|<{tag}(?![\w-])[^>]*>.*?</{tag}\s*>', _re.DOTALL)
+    seen = 0
+
+    def _repl(_m: object) -> str:
+        nonlocal seen
+        seen += 1
+        return f'<{tag}>{value}</{tag}>' if seen == 1 else ''
+
+    return pat.sub(_repl, raw), seen > 0
+
+
+def _insert_work_block(raw: str, work_xml: str) -> str:
+    """Insert a <work> block at the only position MusicXML allows for it.
+
+    score-partwise content order is `work?, movement-number?, movement-title?,
+    identification?, defaults?, ...` — so <work> goes before the *first* of those
+    that is present, not merely before <identification>. The old code anchored on
+    <identification> alone, which put <work> after a music21-written
+    <movement-title> and produced an invalidly ordered document.
+    """
+    import re as _re
+    for anchor in ('<movement-number', '<movement-title', '<identification', '<defaults'):
+        i = raw.find(anchor)
+        if i >= 0:
+            return raw[:i] + work_xml + raw[i:]
+    m = _re.search(r'<score-(?:partwise|timewise)\b[^>]*>', raw)
+    return raw[:m.end()] + '\n' + work_xml + raw[m.end():] if m else raw
+
+
+def _inject_musicxml_metadata(xml_path: Path, title: str = '', tempo_bpm: int = 0) -> None:
+    """Inject title and tempo into an uncompressed MusicXML file via direct XML text editing.
+
+    Always overwrites <work-title> and <movement-title> with the supplied title so that
+    OMR-generated filenames (e.g. "homr_input") are replaced by the source file stem.
+    """
+    import re as _re
+    try:
+        raw = xml_path.read_text(encoding='utf-8', errors='ignore')
+
+        if title:
+            safe = title.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+            raw, had_work_title = _force_xml_element(raw, 'work-title', safe)
+            if not had_work_title:
+                block = f'<work-title>{safe}</work-title>'
+                if _re.search(r'<work\s*/>', raw):
+                    # bare <work/>: expand it rather than adding a sibling <work>
+                    raw = _re.sub(r'<work\s*/>', f'<work>\n  {block}\n</work>', raw, count=1)
+                elif _re.search(r'<work\s*>', raw):
+                    raw = _re.sub(r'<work\s*>', f'<work>\n    {block}', raw, count=1)
+                else:
+                    raw = _insert_work_block(raw, f'<work>\n  {block}\n</work>\n')
+            # Also replace <movement-title> — music21 reads this field as score.metadata.title
+            # when <work-title> is absent, and OMR engines often write their input filename here.
+            # Replaced only, never inserted: an absent movement-title is not a defect.
+            raw, _ = _force_xml_element(raw, 'movement-title', safe)
+
+        if tempo_bpm > 0 and '<sound' not in raw:
+            # Inject a minimal <direction> with <sound tempo="..."> into the first measure
+            tempo_xml = (
+                f'<direction placement="above">'
+                f'<direction-type><metronome><beat-unit>quarter</beat-unit>'
+                f'<per-minute>{tempo_bpm}</per-minute></metronome></direction-type>'
+                f'<sound tempo="{tempo_bpm}"/></direction>'
+            )
+            raw = _re.sub(r'(<measure\b[^>]*>)', r'\1\n      ' + tempo_xml, raw, count=1)
+
+        xml_path.write_text(raw, encoding='utf-8')
+    except Exception as exc:
+        log_message(f'  [警告] MusicXML 元数据注入失败: {exc}', logging.WARNING)
+
+
+def _archive_mxl_to_xml_scores(
+    mxl_path: Path,
+    source_stem: str,
+    xml_scores_dir: Path,
+    engine_label: str = '',
+    title: str = '',
+    tempo_bpm: int = 0,
+) -> None:
+    """Copy the staff-notation MusicXML to xml_scores_dir for use by the transposer.
+
+    命名规则：
+      - 单引擎或融合后选出的唯一文件：``{source_stem}{ext}``
+      - 双引擎均成功，需区分来源：``{source_stem}.{engine_label}{ext}``
+
+    title / tempo_bpm 非空时直接注入到归档副本，与渲染管线元数据保持一致。
+    """
+    try:
+        xml_scores_dir.mkdir(parents=True, exist_ok=True)
+        # 始终以 .musicxml（非压缩）格式归档，方便后续移调引擎直接使用
+        dest_name = f'{source_stem}.{engine_label}.musicxml' if engine_label else f'{source_stem}.musicxml'
+        dest = xml_scores_dir / dest_name
+        if mxl_path.suffix.lower() == '.mxl':
+            # 解压 .mxl（ZIP 包）中的 XML 文件并保存为 .musicxml
+            import zipfile
+            with zipfile.ZipFile(mxl_path, 'r') as zf:
+                xml_names = [n for n in zf.namelist() if n.lower().endswith('.xml') and not n.startswith('META-INF')]
+                if not xml_names:
+                    # 兜底：直接复制原文件
+                    shutil.copy2(str(mxl_path), str(dest.with_suffix('.mxl')))
+                    log_message(f'  ↳ MusicXML 已归档（无法解压）→ xml-scores/{dest.with_suffix(".mxl").name}')
+                    return
+                # 优先取不含路径分隔符的顶级 XML，否则取第一个
+                top_level = [n for n in xml_names if '/' not in n and '\\' not in n]
+                chosen = top_level[0] if top_level else xml_names[0]
+                dest.write_bytes(zf.read(chosen))
+        else:
+            shutil.copy2(str(mxl_path), str(dest))
+        # Enrich the archived copy with the resolved metadata
+        if title or tempo_bpm > 0:
+            _inject_musicxml_metadata(dest, title=title, tempo_bpm=tempo_bpm)
+        log_message(f'  ↳ MusicXML 已归档 → xml-scores/{dest_name}')
+    except OSError as exc:
+        log_message(f'  [警告] MusicXML 归档失败: {exc}', logging.WARNING)
+
+
+def _quick_read_mxl_title(mxl_path: Path) -> str:
+    """Quick regex read of <work-title> from an MXL/MusicXML file without music21 overhead."""
+    import re as _re
+    import zipfile as _zf
+    _GENERIC = {'', 'music21', 'untitled', 'title', 'score', 'new score', 'unknown'}
+    try:
+        if mxl_path.suffix.lower() == '.mxl':
+            with _zf.ZipFile(mxl_path, 'r') as zf:
+                names = [n for n in zf.namelist() if n.lower().endswith('.xml') and 'META-INF' not in n]
+                raw = zf.read(names[0]).decode('utf-8', errors='ignore') if names else ''
+        else:
+            raw = mxl_path.read_text(encoding='utf-8', errors='ignore')
+        for pattern in (r'<work-title>([^<]+)</work-title>', r'<movement-title>([^<]+)</movement-title>'):
+            m = _re.search(pattern, raw)
+            if m and m.group(1).strip().lower() not in _GENERIC:
+                return m.group(1).strip()
+    except Exception as exc:
+        LOGGER.debug('_quick_read_mxl_title(%s) 读取失败，返回空标题: %s', mxl_path.name, exc)
+    return ''
+
+
+def process_single_input_to_jianpu(
+    source_file: Path,
+    file_temp_dir: Path,
+    output_pdf: Path,
+    output_midi: Optional[Path],
+    engine: Optional[OMREngine] = None,
+    editor_workspace_dir: Optional[Path] = None,
+    xml_scores_dir: Optional[Path] = None,
+    use_gpu_inference: Optional[bool] = None,
+    melody_only: bool = False,
+) -> bool:
+    """Process one input file through the chosen OMR engine → MXL → jianpu PDF.
+
+    Routing strategy
+    ----------------
+    AUTO (default)  :  PDF + images → Audiveris.
+    AUDIVERIS       :  Always use Audiveris (PDF and images).
+    HOMR            :  Use Homr (images and multi-page PDF).
+
+    For all image inputs a display-friendly reference image (white-border crop +
+    rotation correction + light contrast, RGB color) is saved to the editor
+    workspace so the user can proofread with a clear, readable image.
+
+
+    Parameters
+    ----------
+    source_file:          Input score file (PDF / PNG / JPG).
+    file_temp_dir:        Per-job temporary directory.
+    output_pdf:           Destination jianpu PDF path.
+    output_midi:          Destination MIDI path, or None to skip MIDI generation.
+    engine:               OMR engine to use.
+    editor_workspace_dir: When provided, intermediate .jianpu.txt and source file
+                          are preserved there for manual proofreading.
+    """
+    if engine is None:
+        engine = OMREngine.AUTO
+
+    # ── Audio inputs → basic-pitch transcription (auto-routed by suffix) ─────
+    # 音频没有 OMR 概念，engine 参数对其无意义：按后缀自动分流到 basic-pitch。
+    # 该分支自成闭环，复用下游的 find_first_musicxml_file + generate_jianpu_pdf_from_mxl，
+    # 不与图像/PDF 的参考图逻辑交织；音频无源图，source_path=None（隐藏参考图）。
+    if source_file.suffix.lower() in SUPPORTED_AUDIO_SUFFIXES:
+        from ..omr.audio_runner import run_audio_transcription
+
+        log_message(f'  [引擎] {source_file.name} 为音频格式 → basic-pitch 转录引擎。')
+        _report_subprogress(0.05, '[basic-pitch] 启动音频转录…')
+        omr_out = run_audio_transcription(
+            source_file,
+            file_temp_dir,
+            use_gpu_inference=use_gpu_inference,
+            melody_only=melody_only,
+            progress_fn=_report_subprogress,
+        )
+        if omr_out is None:
+            log_message(f'  ✗ 音频转录失败，跳过 {source_file.name}。', logging.WARNING)
+            return False
+
+        mxl_file = find_first_musicxml_file(omr_out, source_file.stem)
+        if mxl_file is None:
+            log_message(
+                f'  ✗ 未找到音频转录输出的 MusicXML，跳过 {source_file.name}。',
+                logging.WARNING,
+            )
+            return False
+
+        _report_subprogress(0.70, '正在生成简谱 PDF…')
+        preferred_title = source_file.stem
+        if xml_scores_dir is not None and _ARCHIVE_AUDIO_TO_XML_SCORES:
+            _archive_mxl_to_xml_scores(
+                mxl_file, source_file.stem, xml_scores_dir, title=preferred_title,
+            )
+        return generate_jianpu_pdf_from_mxl(
+            mxl_file,
+            output_pdf,
+            file_temp_dir,
+            output_midi,
+            preferred_title=preferred_title,
+            source_path=None,  # 音频无源图，编辑器隐藏参考图（决策 A）
+            editor_workspace_dir=editor_workspace_dir,
+        )
+
+    # ── MIDI inputs → music21 → MusicXML → jianpu（noteDigger 扒谱导出回流）──────
+    # MIDI 无 OMR 概念：music21 直接解析为 MusicXML，复用与音频同一条简谱尾链；无源图。
+    if source_file.suffix.lower() in {'.mid', '.midi'}:
+        from music21 import converter  # noqa: PLC0415
+
+        log_message(f'  [引擎] {source_file.name} 为 MIDI → music21 直转 MusicXML。')
+        _report_subprogress(0.15, '正在将 MIDI 转换为 MusicXML…')
+        mxl_file = file_temp_dir / f'{source_file.stem}.musicxml'
+        try:
+            score = converter.parse(str(source_file))
+            score.write('musicxml', fp=str(mxl_file))
+        except Exception as exc:  # noqa: BLE001
+            log_message(f'  ✗ MIDI → MusicXML 失败：{exc}，跳过 {source_file.name}。', logging.WARNING)
+            return False
+
+        _report_subprogress(0.55, '正在生成简谱 PDF…')
+        preferred_title = source_file.stem
+        if xml_scores_dir is not None and _ARCHIVE_AUDIO_TO_XML_SCORES:
+            _archive_mxl_to_xml_scores(
+                mxl_file, source_file.stem, xml_scores_dir, title=preferred_title,
+            )
+        return generate_jianpu_pdf_from_mxl(
+            mxl_file,
+            output_pdf,
+            file_temp_dir,
+            output_midi,
+            preferred_title=preferred_title,
+            source_path=None,  # MIDI 无源图，编辑器隐藏参考图
+            editor_workspace_dir=editor_workspace_dir,
+        )
+
+    is_image = source_file.suffix.lower() in {'.png', '.jpg', '.jpeg'}
+    _is_auto = engine is OMREngine.AUTO
+
+    # ── 路由：AUTO 智能选择 ────────────────────────────────────────────────
+    # 图片格式 → Homr
+    # PDF + 矢量图 → Audiveris
+    # PDF + 位图 → Homr
+    if _is_auto:
+        if is_image:
+            effective_engine = OMREngine.HOMR
+            log_message(f'  [自动选择] {source_file.name} 为图片格式 → Homr 引擎。')
+        elif source_file.suffix.lower() == '.pdf':
+            from ..omr.engine_router import is_pdf_vector
+            if is_pdf_vector(source_file):
+                effective_engine = OMREngine.AUDIVERIS
+                log_message(f'  [自动选择] {source_file.name} 检测为矢量 PDF → Audiveris 引擎。')
+            else:
+                effective_engine = OMREngine.HOMR
+                log_message(f'  [自动选择] {source_file.name} 检测为位图 PDF → Homr 引擎。')
+        else:
+            effective_engine = OMREngine.AUDIVERIS
+            log_message(f'  [自动选择] {source_file.name} 格式未知 → Audiveris 引擎。')
+    else:
+        effective_engine = engine
+
+    log_message(
+        f'  [引擎] {source_file.name} → 使用 '
+        f'{"Homr" if effective_engine is OMREngine.HOMR else "Audiveris"} 引擎。'
+    )
+
+    # ── Image geometry preprocessing (rotation + gradient correction) ────────
+    # Apply before OMR so the engine receives a deskewed, contrast-normalised image.
+    # preprocess_geometry_for_omr() is lightweight (no denoising/SR) and safe for
+    # both Homr (which does its own ML preprocessing) and Audiveris.
+    _omr_source = source_file
+    if is_image:
+        try:
+            from ..image.image_preprocess import preprocess_geometry_for_omr
+            _preprocessed = preprocess_geometry_for_omr(source_file, file_temp_dir)
+            if _preprocessed is not None:
+                _omr_source = _preprocessed
+        except Exception as _pre_exc:
+            log_message(f'  [几何预处理] 预处理失败，使用原始图像：{_pre_exc}', logging.WARNING)
+
+    # ── Helper: try to run Homr (used for fallback) ─────────────────────────
+    def _try_run_homr() -> Optional[Path]:
+        """尝试运行 Homr，返回输出目录或 None 失败。"""
+        if not is_image and _omr_source.suffix.lower() != '.pdf':
+            return None
+        if not check_homr_available():
+            return None
+        _report_subprogress(0.05, '[Homr] 启动 OMR 识别…')
+        # 超时控制在 homr_runner._run_with_heartbeat 内部（每次推理调用限
+        # MAX_HOMR_SECONDS）。此前这里用 ThreadPoolExecutor + result(timeout)
+        # 是假超时：cancel() 对运行中任务无效，with 退出还会阻塞到任务跑完。
+        try:
+            return run_homr_batch(
+                _omr_source,
+                file_temp_dir,
+                use_gpu_inference=use_gpu_inference,
+                progress_fn=_report_subprogress,
+            )
+        except Exception as _exc:
+            log_message(f'  [Homr] 识别异常：{_exc}', logging.WARNING)
+            return None
+
+    # ── Homr (single-engine mode, with validation fallback) ─────────────────
+    if effective_engine is OMREngine.HOMR:
+        if not is_image and source_file.suffix.lower() != '.pdf':
+            log_message(
+                f'  ✗ Homr 仅支持图片或 PDF 首页，跳过 {source_file.name}。',
+                logging.WARNING,
+            )
+            return False
+        omr_out = _try_run_homr()
+        engine_label = 'Homr'
+
+        if omr_out is None:
+            log_message(f'  ✗ Homr 处理失败，跳过 {source_file.name}。', logging.WARNING)
+            return False
+
+    # ── Audiveris (with fallback to Homr) ──────────────────────────────────
+    else:
+        _report_subprogress(0.05, '[Audiveris] 启动 OMR 识别…')
+        omr_out = run_audiveris_sliced_batch(_omr_source, output_dir=file_temp_dir)
+        if omr_out is not None:
+            _report_subprogress(0.65, 'OMR 完成，正在生成简谱…')
+        engine_label = 'Audiveris'
+
+        # ── Audiveris 失败时回退到 Homr ─────────────────────────────────────
+        # 注意：这一步只是"尝试回退"，不是终态失败，不能用 ✗ 标记——
+        # worker_main.py 的 GUI 结算页面把日志里的 ✗ 当作文件失败信号扫描，
+        # 若这里用 ✗ 会导致回退成功的文件被误判为"失败"（同时又出现在成功列表里）。
+        if omr_out is None:
+            log_message('  [回退] Audiveris 处理失败，正在尝试 Homr 引擎作为回退...')
+            omr_out = _try_run_homr()
+            if omr_out is not None:
+                engine_label = 'Homr'
+                log_message('  ✓ Homr 回退成功。')
+            else:
+                log_message(f'  ✗ Audiveris 和 Homr 均处理失败，跳过 {source_file.name}。', logging.WARNING)
+                return False
+
+    # ── Resolve MusicXML path ──────────────────────────────────────────────────
+    mxl_file = find_first_musicxml_file(omr_out, source_file.stem)
+
+    if mxl_file is None:
+        log_message(
+            f'  ✗ 未找到 {engine_label} 输出的 MXL 文件，跳过 {source_file.name}。\n'
+            '    → 可能原因：乐谱无法被识别（图像质量过低或版式过于复杂）\n'
+            '    → 解决方案：尝试使用更高分辨率的扫描件，或手动检查 omr-temp 目录',
+            logging.WARNING,
+        )
+        return False
+
+    # 参考图（单引擎路径）
+    if is_image:
+        omr_ref = file_temp_dir / '_omr_reference.png'
+        if not omr_ref.exists():
+            omr_ref = omr_out / '_omr_reference.png'
+        if omr_ref.exists():
+            effective_source = omr_ref
+        else:
+            from ..image.image_preprocess import create_display_reference
+            effective_source = create_display_reference(source_file, file_temp_dir) or source_file
+    else:
+        effective_source = source_file
+
+    # ── Homr 后处理：结构清洗 + 简谱时值对齐──────────────────────────────────────
+    if engine_label == 'Homr':
+        try:
+            from ..omr.dl_fix import fix_homr_output
+            # 为简谱转换启用时值对齐：jianpu-ly 的拍号检查对浮点差敏感
+            _cleaned = fix_homr_output(mxl_file, file_temp_dir, align_for_jianpu=True)
+            if _cleaned is not None:
+                mxl_file = _cleaned
+        except Exception as _fix_exc:
+            log_message(f'  [Homr 后处理] 结构清洗异常（不影响输出）：{_fix_exc}', logging.WARNING)
+
+        # Homr 不输出 <tie> 符号（只有 <slur>），启发式重建延音线
+        try:
+            from ..notation.tie_reconstruction import reconstruct_ties_in_mxl
+            _tie_count = reconstruct_ties_in_mxl(mxl_file)
+            if _tie_count:
+                log_message(f'  [Homr 后处理] 重建延音线 {_tie_count} 对')
+        except Exception as _tie_exc:
+            log_message(f'  [Homr 后处理] 延音线重建异常（不影响输出）：{_tie_exc}', logging.WARNING)
+
+    _report_subprogress(0.70, '正在生成简谱 PDF…')
+
+    preferred_title = source_file.stem
+
+    if xml_scores_dir is not None:
+        _archive_mxl_to_xml_scores(
+            mxl_file, source_file.stem, xml_scores_dir,
+            title=preferred_title,
+        )
+
+    return generate_jianpu_pdf_from_mxl(
+        mxl_file,
+        output_pdf,
+        file_temp_dir,
+        output_midi,
+        preferred_title=preferred_title,
+        source_path=effective_source,
+        editor_workspace_dir=editor_workspace_dir,
+    )
+
+
+def process_single_pdf_to_jianpu(
+    pdf_file: Path,
+    file_temp_dir: Path,
+    output_pdf: Path,
+    output_midi: Optional[Path],
+    engine: OMREngine = OMREngine.AUDIVERIS,
+    editor_workspace_dir: Optional[Path] = None,
+    xml_scores_dir: Optional[Path] = None,
+) -> bool:
+    """Backward-compatible alias for process_single_input_to_jianpu."""
+    return process_single_input_to_jianpu(
+        pdf_file, file_temp_dir, output_pdf, output_midi, engine,
+        editor_workspace_dir=editor_workspace_dir,
+        xml_scores_dir=xml_scores_dir,
+    )
+
+
+def _prompt(question: str, *, valid_yes: tuple[str, ...] = ('Y',),
+            valid_no: tuple[str, ...] = ('N',)) -> bool | None:
+    """Print *question*, read a line, handle H/? (help) and Q (quit).
+
+    Returns True for yes, False for no.
+    Raises SystemExit on Q.
+    Re-prompts on unrecognised input or H/? (after printing help).
+    """
+    while True:
+        try:
+            raw = input(question + ' ').strip().upper()
+        except (EOFError, KeyboardInterrupt):
+            raise
+        if raw in valid_yes:
+            return True
+        if raw in valid_no:
+            return False
+        if raw in ('Q', 'QUIT', 'EXIT'):
+            log_message('\n已退出。', logging.WARNING)
+            raise SystemExit(0)
+        if raw in ('H', '?', 'HELP'):
+            _print_help()
+            continue
+        log_message('  → 请输入 Y 或 N（输入 H 查看帮助，输入 Q 退出）。')
+
+
+def _print_help() -> None:
+    """Print an in-app help/usage guide."""
+    log_message(
+        '\n'
+        '╔══════════════════════════════════════════════════════╗\n'
+        '║        简谱转换工具  操作指引                        ║\n'
+        '╠══════════════════════════════════════════════════════╣\n'
+        '║  Y / N      确认 / 拒绝当前操作                      ║\n'
+        '║  H 或 ?     显示本帮助信息                           ║\n'
+        '║  Q          退出程序                                 ║\n'
+        '╠══════════════════════════════════════════════════════╣\n'
+        '║  使用步骤：                                          ║\n'
+        '║  1. 将五线谱文件放入 Input 文件夹                    ║\n'
+        '║     支持格式：PDF  PNG  JPG / JPEG                   ║\n'
+        '║  2. 运行本程序，按提示回答 Y/N                       ║\n'
+        '║  3. 转换结果（简谱 PDF / MIDI）保存在 Output 文件夹  ║\n'
+        '║  4. 日志保存在 logs 文件夹                           ║\n'
+        '╠══════════════════════════════════════════════════════╣\n'
+        '║  常见问题：                                          ║\n'
+        '║  • 转换失败 → 检查 logs 目录中的日志文件             ║\n'
+        '║  • 没有输出 → 确认 Input 文件夹中有支持的文件        ║\n'
+        '║  • 程序缓慢 → 多页 PDF 识别需要数分钟，请耐心等待    ║\n'
+        '╚══════════════════════════════════════════════════════╝'
+    )
+
+
+def process_bulk_input_to_jianpu(
+    config: AppConfig | None = None,
+    editor_workspace_dir: Optional[Path] = None,
+) -> ConversionSummary:
+    """
+    Batch-process all supported files in Input/.
+    Prompts the user to confirm and choose MIDI output, skips existing files, and cleans up temp files.
+
+    If *editor_workspace_dir* is provided, each successfully converted score will
+    have its .jianpu.txt and source file preserved there for the editor workflow.
+    """
+    config = config or AppConfig()
+    script_dir = get_app_base_dir()
+    input_dir, output_dir, temp_dir = build_runtime_paths(script_dir, config)
+    history = load_conversion_history(script_dir)
+    summary = ConversionSummary()
+
+    cleanup_old_temporary_paths([script_dir / 'build', temp_dir], max_age_days=7)
+    # 日志目录保留 30 天：此前每次启动新建时间戳日志、从不清理，无限累积。
+    # frozen 版日志在 %LOCALAPPDATA%\SumisoraOMR\logs，必须经 _get_logs_dir 解析。
+    from ..utils import _get_logs_dir
+    cleanup_old_temporary_paths([_get_logs_dir(script_dir)], max_age_days=30)
+
+    if not input_dir.exists() or not input_dir.is_dir():
+        input_dir.mkdir(parents=True, exist_ok=True)
+        log_message(
+            '\n[提示] Input 文件夹已自动创建。\n'
+            '  → 请将 PDF / JPG / PNG 乐谱文件放入 Input 文件夹，然后重新运行程序。\n'
+            f'  → 文件夹位置：{input_dir}',
+            logging.WARNING,
+        )
+        return summary
+
+    source_files = sorted([p for p in input_dir.iterdir() if is_supported_score_file(p)])
+    if not source_files:
+        log_message(
+            '\n[提示] Input 文件夹中未找到可处理的文件。\n'
+            '  → 支持的格式：.pdf  .png  .jpg  .jpeg\n'
+            f'  → 请将文件放入：{input_dir}',
+            logging.WARNING,
+        )
+        return summary
+
+    summary.total = len(source_files)
+    log_message('\n待转换乐谱文件列表：')
+    for source_file in source_files:
+        log_message(f'  - {source_file.name}')
+    log_message(f'共 {len(source_files)} 个文件  （输入 H 查看帮助）')
+
+    try:
+        if not _prompt('是否转换以上所有乐谱为简谱 PDF？（Y/N）'):
+            log_message('已取消转换。')
+            return summary
+
+        generate_midi = _prompt('是否同时生成 MIDI 文件？（Y/N）') or False
+    except SystemExit:
+        return summary
+
+    engine = config.omr_engine
+    if engine is OMREngine.AUTO:
+        log_message('[引擎选择] 自动模式（图片/位图 PDF → Homr，矢量 PDF → Audiveris）。')
+    else:
+        log_message(f'[引擎选择] 使用 {engine.value.capitalize()} 引擎。')
+
+
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    duplicate_names = collect_duplicate_names(source_files, output_dir, generate_midi, history)
+    skip_all_existing = confirm_skip_all_existing(duplicate_names)
+
+    safe_remove_tree(temp_dir)
+    temp_dir.mkdir(parents=True, exist_ok=True)
+
+    for index, source_file in enumerate(source_files, start=1):
+        log_message(f'\n[{index}/{summary.total}] 正在处理：{source_file.name}')
+        output_pdf = output_dir / f'{source_file.stem}.jianpu.pdf'
+        output_midi = output_dir / f'{source_file.stem}.mid' if generate_midi else None
+
+        if skip_all_existing and source_file.name in duplicate_names:
+            log_message(f'  已跳过（输出文件已存在）：{source_file.name}')
+            summary.skipped += 1
+            summary.skipped_files.append(source_file.name)
+            continue
+
+        # File will be (re-)processed — remove any stale editor-workspace entries for
+        # this title so the workspace always reflects the latest recognition result.
+        # Files that were *skipped* above are intentionally left untouched.
+        if editor_workspace_dir is not None and editor_workspace_dir.exists():
+            safe_title = source_file.stem
+            for _ch in r'\/:*?"<>|':
+                safe_title = safe_title.replace(_ch, '_')
+            for _stale in editor_workspace_dir.glob(f'{safe_title}.*'):
+                try:
+                    _stale.unlink()
+                except OSError:
+                    pass
+
+        job_token = hashlib.sha1(str(source_file).encode('utf-8', errors='ignore')).hexdigest()[:8]
+        file_temp_dir = temp_dir / f'job_{index:03d}_{job_token}'
+        safe_remove_tree(file_temp_dir)
+        file_temp_dir.mkdir(parents=True, exist_ok=True)
+
+        if process_single_input_to_jianpu(
+            source_file, file_temp_dir, output_pdf, output_midi, engine,
+            editor_workspace_dir=editor_workspace_dir,
+            xml_scores_dir=script_dir / 'xml-scores',
+        ):
+            log_message(f'  ✓ 已生成简谱 PDF：{output_pdf.name}')
+            summary.success += 1
+            summary.generated_pdfs.append(output_pdf.name)
+            update_conversion_history(history, source_file, output_pdf, output_midi)
+            save_conversion_history(script_dir, history)
+        else:
+            summary.failed += 1
+            summary.failed_files.append(source_file.name)
+            log_message(
+                f'  ✗ 转换失败：{source_file.name}\n'
+                '    → 可能原因：乐谱扫描质量较低、格式不支持或引擎异常\n'
+                f'    → 请查阅日志文件了解详情（logs 文件夹）',
+                logging.WARNING,
+            )
+
+    log_message('\n正在清理临时文件...')
+    safe_remove_tree(temp_dir)
+    cleanup_output_directory(output_dir)
+    print_conversion_summary(summary, generate_midi, output_dir)
+    return summary
+
+
+def process_bulk_pdf_to_jianpu(config: AppConfig | None = None) -> ConversionSummary:
+    """Backward-compatible alias for process_bulk_input_to_jianpu."""
+    return process_bulk_input_to_jianpu(config)
+
+
+def wait_for_exit_key(prompt: str = '按任意键退出...') -> None:
+    """Wait for a keypress before exiting (msvcrt on Windows, falls back to input())."""
+    try:
+        import msvcrt
+
+        print(prompt, end='', flush=True)
+        msvcrt.getwch()
+        print()
+    except Exception:
+        try:
+            input(prompt)
+        except EOFError:
+            print('\n程序已退出。')
+
+
+def main() -> None:
+    """命令行入口（已废弃）。请使用 GUI：python -m webui.main"""
+    print('此命令行入口已停用，请运行 python -m webui.main 启动 GUI。')
+    sys.exit(0)

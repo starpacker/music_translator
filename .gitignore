@@ -42,3 +42,10 @@ repo/
 
 # ---- 旧版 prototype_cv 的输出 ----
 prototype_cv/output/
+
+# Local pipeline artifacts
+.batch_work/
+output/
+workspace/
+!tests/fixtures/*.musicxml
+!tests/fixtures/*.pdf

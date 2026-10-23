@@ -1,0 +1,342 @@
+# core/omr/worker_main.py — Subprocess worker entry point.
+# Reads one JSON task from stdin, runs the OMR conversion pipeline,
+# and writes JSON progress/log/result messages to stdout (one per line).
+# Launched by run_webui.py with "--worker"; no GUI-toolkit dependency.
+
+from __future__ import annotations
+
+import io
+import json
+import logging
+import os
+import sys
+import tempfile
+from pathlib import Path
+from typing import Any, Optional
+
+# ── IPC 管道输出 ─────────────────────────────────────────────────────────────
+# stdout 在打包模式 console=False 时原本是 devnull，
+# 但 app.py 会在检测到 --worker 后跳过 devnull 重定向，
+# 所以此处 sys.stdout 就是与 GUI 通信的管道。
+# 获取二进制流，方便写入 UTF-8 JSON 行。
+_ipc_out: Optional[Any] = None
+_current_file_detail: dict[str, str | bool] = {}  # 每文件重置，由 _log_ipc 填充；fallback_used 是 bool，其余是 str
+
+
+def _send(msg: dict[str, Any]) -> None:
+    """Write a JSON message to the IPC pipe (stdout)."""
+    global _ipc_out
+    if _ipc_out is None:
+        return
+    try:
+        line = json.dumps(msg, ensure_ascii=False) + '\n'
+        if isinstance(_ipc_out, io.TextIOBase):
+            _ipc_out.write(line)
+        else:
+            _ipc_out.write(line.encode('utf-8', errors='replace'))
+        _ipc_out.flush()
+    except Exception:
+        pass
+
+
+class _IPCErrorWriter(io.TextIOBase):
+    """Wrap stderr so all line-based error output is forwarded via IPC."""
+
+    def __init__(self, original: Any) -> None:
+        self._original = original
+
+    def write(self, text: str) -> int:
+        if not text:
+            return 0
+        try:
+            self._original.write(text)
+        except Exception:
+            pass
+        try:
+            for line in text.splitlines(True):
+                if line.endswith('\n'):
+                    _send({'type': 'log', 'text': line.rstrip('\r\n')})
+        except Exception:
+            pass
+        return len(text)
+
+    def flush(self) -> None:
+        try:
+            self._original.flush()
+        except Exception:
+            pass
+
+    def isatty(self) -> bool:
+        return False
+
+
+def _patch_log_message() -> None:
+    """Replace core.utils.log_message with a version that forwards log lines via IPC.
+
+    日志文件写入行为同时保留。
+    """
+    import core.utils as _utils
+
+    def _log_ipc(message: str, level: int = logging.INFO) -> None:
+        _send({'type': 'log', 'text': message})
+        # 从日志文本中提取当前文件的引擎和图像类型信息
+        if '[引擎]' in message:
+            if 'Homr' in message:
+                _current_file_detail['engine_used'] = 'Homr'
+            elif 'Audiveris' in message:
+                _current_file_detail['engine_used'] = 'Audiveris'
+        if '[自动选择]' in message:
+            if '矢量' in message:
+                _current_file_detail['image_type'] = '矢量图'
+            elif '位图' in message:
+                _current_file_detail['image_type'] = '位图'
+            elif '图片格式' in message:
+                _current_file_detail['image_type'] = '位图'
+        # 引擎回退（如 Audiveris 失败后改用 Homr）：标记 fallback_used，
+        # 并把实际生效的引擎更新为回退成功后使用的那个，而不是最初选择的引擎
+        if '[回退]' in message:
+            _current_file_detail['fallback_used'] = True
+        if '回退成功' in message and 'Homr' in message:
+            _current_file_detail['engine_used'] = 'Homr'
+        # 记录本文件第一条 "✗" 失败日志作为具体失败原因——process_single_input_to_jianpu
+        # 返回值只是个 bool，下面 else 分支原本只能写死 "转换失败"，看不出真实原因
+        # （例如 "No module named 'matplotlib'"）。只取第一条，因为同一文件失败时
+        # 往往会连续打印多条 ✗（具体原因 → 上层"已跳过"总结），第一条最具体。
+        if '✗' in message and 'reason' not in _current_file_detail:
+            _current_file_detail['reason'] = message.strip().lstrip('✗').strip()
+        # 继续写入日志文件
+        if not _utils.LOGGER.handlers:
+            try:
+                _utils.setup_logging(_utils.get_app_base_dir())
+            except OSError:
+                pass
+        if _utils.LOGGER.handlers:
+            _utils.LOGGER.log(level, message)
+
+    _original_log_message = _utils.log_message  # capture BEFORE replacing
+    _utils.log_message = _log_ipc
+
+    # 同步修补所有已加载模块中通过 from ... import 绑定的 log_message 引用。
+    # 触发 core.pipeline 及其依赖（audiveris_runner、homr_runner、renderer 等）的导入，
+    # 确保它们在下面的扫描前都已加载。
+    try:
+        import importlib as _importlib
+        _importlib.import_module('core.app.pipeline')
+    except Exception:
+        pass
+
+    import sys as _sys_patch
+    for _mod in list(_sys_patch.modules.values()):
+        try:
+            if getattr(_mod, 'log_message', None) is _original_log_message:
+                _mod.log_message = _log_ipc  # type: ignore[attr-defined]
+        except Exception:
+            pass
+
+
+def _restore_stdio_fds() -> None:
+    """Ensure stdin/stdout/stderr are available for worker IPC in frozen console=False mode."""
+    if sys.stdin is None:
+        try:
+            sys.stdin = open(0, 'rb', closefd=False)
+        except Exception:
+            pass
+    if sys.stdout is None:
+        try:
+            sys.stdout = open(1, 'w', encoding='utf-8', errors='replace', closefd=False)
+        except Exception:
+            try:
+                sys.stdout = open(1, 'wb', closefd=False)
+            except Exception:
+                sys.stdout = open(os.devnull, 'w', encoding='utf-8', errors='replace')
+    if sys.stderr is None:
+        try:
+            sys.stderr = open(2, 'w', encoding='utf-8', errors='replace', closefd=False)
+        except Exception:
+            sys.stderr = open(os.devnull, 'w', encoding='utf-8', errors='replace')
+
+
+def run_worker() -> None:
+    """Main function for the worker process; called by run_webui.py in --worker mode."""
+    global _ipc_out
+
+    _restore_stdio_fds()
+
+    # ── SSL：走系统证书库（truststore），修复 MITM 代理 / 本地根证书验证失败 ──
+    # 必须在任何下载（HOMR / 钢琴模型权重）创建 SSL 上下文之前注入。
+    from core.app.ssl_setup import setup_system_ssl  # noqa: PLC0415
+    setup_system_ssl()
+
+    # ── 保存 IPC 管道引用，然后把 stdout 重定向到 stderr
+    # 防止 pipeline 中残余的 print() / sys.stdout.write() 污染 JSON 流
+    stdout_obj = getattr(sys.stdout, 'buffer', None) or getattr(sys.__stdout__, 'buffer', None)
+    if stdout_obj is not None:
+        _ipc_out = stdout_obj
+    else:
+        # 极少数情况：无 buffer 属性（文本流 wrap）
+        _ipc_out = sys.stdout
+
+    # Wrap stderr so homr / third-party libraries that log to stderr
+    # also emit IPC log messages in the GUI.
+    sys.stderr = _IPCErrorWriter(sys.stderr)
+    # 将 stdout 重定向到 stderr，后续 print() 不会污染 IPC 流
+    sys.stdout = sys.stderr
+
+    try:
+        # ── 读取任务 ──────────────────────────────────────────────────────────
+        # 必须从 sys.stdin.buffer 读取原始字节后手动 UTF-8 解码，
+        # 避免 Windows 默认 cp936 编码把 UTF-8 多字节字符（如 em-dash）解析乱码。
+        raw_bytes = sys.stdin.buffer.readline()
+        raw = raw_bytes.decode('utf-8', errors='replace')
+        if not raw.strip():
+            _send({'type': 'error', 'message': 'Worker 未收到任务，stdin 为空'})
+            sys.exit(1)
+
+        try:
+            task = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            _send({'type': 'error', 'message': f'Worker 任务 JSON 格式错误: {exc}（前 200 字节: {raw[:200]!r}）'})
+            sys.exit(1)
+
+        files = [Path(f) for f in task.get('files', [])]
+        engine_str = task.get('engine', 'auto')
+        sr_engine_str = task.get('sr_engine', 'waifu2x')
+        output_dir_path = Path(task['output_dir'])
+        gen_midi: bool = task.get('gen_midi', True)
+        skip_dup: bool = task.get('skip_dup', False)
+        dup_files: set[str] = set(task.get('dup_files', []))
+        base_dir = Path(task['base_dir'])        # GPU 崩溃重试时传入的偏移量——确保进度条不会重置
+        _file_start_offset: int = task.get('files_offset', 0)
+        _total_files_orig: int = task.get('total_files_orig', 0)  # 0 = 会在下面用 total 充实
+        # ── 修补日志函数 ──────────────────────────────────────────────────────
+        _patch_log_message()
+
+        # ── 注入超分辨率引擎选择 ───────────────────────────────────────────────
+        from core.image.sr_upscale import set_sr_engine  # noqa: PLC0415
+        set_sr_engine(sr_engine_str)
+
+        # ── 导入（延迟，避免在修补前触发 import-time 副作用）──────────────────
+        from core.config import OMREngine  # noqa: PLC0415
+        from core.app.pipeline import process_single_input_to_jianpu  # noqa: PLC0415
+        import core.app.pipeline as _pipeline
+
+        # ── 注入子进度回调——pipeline 内部调用时发送 IPC sub_progress 消息 ───────
+        _pipeline._subprogress_fn = lambda v, m: _send({'type': 'sub_progress', 'value': v, 'message': m})
+
+        engine_map = {
+            'auto': OMREngine.AUTO,
+            'audiveris': OMREngine.AUDIVERIS,
+            'homr': OMREngine.HOMR,
+        }
+        engine = engine_map.get(engine_str, OMREngine.AUTO)
+
+        total = len(files)
+        if _total_files_orig == 0:
+            _total_files_orig = _file_start_offset + total
+        if total == 0:
+            _send({'type': 'done', 'success_count': 0, 'fail_count': 0, 'message': '没有需要处理的文件。'})
+            return
+
+        success_count = 0
+        fail_count = 0
+        skip_count = 0
+
+        for idx, src in enumerate(files):
+            base_progress = ((_file_start_offset + idx) / _total_files_orig) * 0.9
+            _send({'type': 'progress', 'value': base_progress, 'message': f'[{_file_start_offset+idx+1}/{_total_files_orig}] {src.name}'})
+            _send({'type': 'sub_progress', 'value': 0.0, 'message': ''})
+            _send({'type': 'log', 'text': f'▶ 开始处理: {src.name}'})
+
+            if skip_dup and src.name in dup_files:
+                _send({'type': 'log', 'text': f'  ⏭ 已跳过（输出已存在）: {src.name}'})
+                skip_count += 1
+                continue
+
+            (base_dir / 'build').mkdir(parents=True, exist_ok=True)
+            temp_dir = Path(tempfile.mkdtemp(prefix='convert_', dir=base_dir / 'build'))
+            out_pdf = output_dir_path / (src.stem + '_jianpu.pdf')
+            out_midi: Optional[Path] = (output_dir_path / (src.stem + '.mid')) if gen_midi else None
+
+            _current_file_detail.clear()
+            try:
+                ok = process_single_input_to_jianpu(
+                    source_file=src,
+                    file_temp_dir=temp_dir,
+                    output_pdf=out_pdf,
+                    output_midi=out_midi,
+                    engine=engine,
+                    editor_workspace_dir=base_dir / 'editor-workspace',
+                    xml_scores_dir=base_dir / 'xml-scores',
+                    use_gpu_inference=task.get('use_gpu') if isinstance(task.get('use_gpu'), bool) else None,
+                    melody_only=bool(task.get('melody_only', False)),
+                )
+            except Exception as exc:
+                fail_count += 1
+                reason = str(exc)[:150]
+                _send({'type': 'log', 'text': f'  ✗ 异常: {exc}'})
+                _send({'type': 'result', 'success': False, 'output_pdf': None, 'archived_mxl': None,
+                       'reason': f'异常: {reason}'})
+                continue
+            finally:
+                # 无论成功还是失败，立即清理当前文件的临时目录
+                import shutil as _shutil
+                _shutil.rmtree(temp_dir, ignore_errors=True)
+
+            if ok:
+                success_count += 1
+                _send({'type': 'log', 'text': f'  ✓ 完成 → {out_pdf.name}'})
+
+                # 在 xml-scores 中定位刚归档的五线谱 MusicXML
+                xml_scores_dir_path = base_dir / 'xml-scores'
+                archived_mxl: Optional[Path] = None
+                for candidate_name in (
+                    src.stem + '.musicxml',
+                    src.stem + '.mxl',
+                    src.stem + '.audiveris.musicxml',
+                    src.stem + '.audiveris.mxl',
+                ):
+                    c = xml_scores_dir_path / candidate_name
+                    if c.exists():
+                        archived_mxl = c
+                        break
+
+                _send({
+                    'type': 'result',
+                    'success': True,
+                    'output_pdf': str(out_pdf),
+                    'archived_mxl': str(archived_mxl) if archived_mxl else None,
+                    'engine_used': _current_file_detail.get('engine_used', ''),
+                    'image_type': _current_file_detail.get('image_type', ''),
+                    'fallback_used': _current_file_detail.get('fallback_used', False),
+                })
+            else:
+                fail_count += 1
+                _send({'type': 'log', 'text': f'  ✗ 失败: {src.name}'})
+                _send({'type': 'result', 'success': False, 'output_pdf': None, 'archived_mxl': None,
+                       'reason': _current_file_detail.get('reason') or '转换失败'})
+
+        # ── 发送最终完成消息 ──────────────────────────────────────────────────
+        parts: list[str] = []
+        if success_count > 0:
+            parts.append(f'{success_count} 个成功')
+        if fail_count > 0:
+            parts.append(f'{fail_count} 个失败')
+        if skip_count > 0:
+            parts.append(f'{skip_count} 个已跳过')
+        if parts:
+            msg = '完成：' + '，'.join(parts) + '。'
+        elif fail_count > 0:
+            msg = f'全部 {fail_count} 个文件转换失败，请查看日志。'
+        else:
+            msg = '没有需要处理的文件。'
+        _send({
+            'type': 'done',
+            'success_count': success_count,
+            'fail_count': fail_count,
+            'skip_count': skip_count,
+            'message': msg,
+        })
+
+    except Exception as exc:
+        _send({'type': 'error', 'message': str(exc)})
+        sys.exit(1)

@@ -131,36 +131,45 @@ brew install lilypond
 export LILYPOND=/usr/local/bin/lilypond
 ```
 
-### 3. OMR 后端（SumisoraOMR）
+### 3. 内置 OMR 与排版核心
 
-OMR 部分复用 [SumisoraOMR](https://github.com/Tsukamotoshio/SumisoraOMR)（AGPL-3.0），本项目不复制其代码，而是按路径引用：
+仓库现在包含维护过的 SumisoraOMR `core/` 和 `scripts/jianpu-ly.py`，无需另行克隆上游。
+`homr_shim.py` 适配官方 pip 版 Homr；首次识谱需要下载模型权重。
+需要测试其他上游版本时，可以用 `SUMISORA_ROOT` 显式覆盖内置核心。
+
+只想排版时，用 `--mxl` 传入 MusicXML，跳过 OMR。
+
+### 4. NVIDIA GPU（可选）
+
+默认安装由 Homr 解析 ONNX Runtime 依赖。CPU 环境可直接运行。
+NVIDIA CUDA 环境需要兼容的 CUDA、cuDNN 运行库，以及 GPU 版 ONNX Runtime：
 
 ```bash
-git clone https://github.com/Tsukamotoshio/SumisoraOMR.git
-export SUMISORA_ROOT=/absolute/path/to/SumisoraOMR        # 指向含 core/ 的那一级目录
+pip uninstall -y onnxruntime onnxruntime-directml
+pip install onnxruntime-gpu
+python -c "import onnxruntime as rt; print(rt.get_available_providers())"
 ```
 
-也可以直接把仓库放进任一默认识别的位置，脚本会依次尝试：
-
-```
-./vendor/SumisoraOMR
-../SumisoraOMR-main/SumisoraOMR-main
-../SumisoraOMR
-../SumisoraOMR-main
-```
-
-校验方式是找 `core/notation/jianpu/__init__.py`，找不到会直接报错并提示设置 `SUMISORA_ROOT`。
-
-> `homr_shim.py` 会把 SumisoraOMR 的 `homr_runner` 桥接到官方 pip 版 `homr`，
-> 自动去掉 fork 独有的 `segnet_batch_size` / `title_detection` 参数 —— 所以你不一定要装 fork。
-
-> **只想排版、不想跑 OMR？** 用 `--mxl` 直接喂一个 MusicXML 文件，整条 OMR 流程会被跳过。
+输出应包含 `CUDAExecutionProvider`。同一环境只安装一种 ONNX Runtime 后端。
+`--gpu auto` 同时检测 CUDA 和 Windows DirectML；`--gpu off` 强制使用 CPU。
+GPU 推理初始化失败时，识谱流程会按现有逻辑尝试回退 CPU，实际设备以日志为准。
 
 ---
 
 <a id="usage"></a>
 
 ## 🚀 用法
+
+### 串行处理整个目录
+
+```bash
+python batch.py input/吹管 -o output --mode both --engine strip --gpu auto
+```
+
+逐份处理目录内 PDF，输出 `<曲名>.jianpu.pdf`、`<曲名>.insitu.pdf` 和逐份日志。
+批处理默认使用与当前吹管生成流程相同的 `strip` 引擎；单文件命令保留 `stamp` 默认值。
+单份失败后继续处理其他输入，最后汇总并返回非零退出码。
+中间识谱结果保存在 `output/work/<曲名>/`，再次运行会复用缓存；需要重新识谱时指定新的 `--work` 目录。
 
 ### 最常用的一条命令
 
@@ -342,6 +351,10 @@ python jianpu.py 曲笛.pdf --mode jianpu -o out/曲笛-简谱.pdf
 ```
 music_translator/
 ├── jianpu.py                 # 唯一入口：PDF → 整页简谱 / 原位简谱
+├── batch.py                  # 目录级串行批处理，两种 PDF 与逐份日志
+├── core/                     # 内置 SumisoraOMR 核心及本地修复
+├── scripts/jianpu-ly.py       # 含合音八度与升降号修复的排版预处理器
+├── tests/                    # 回归测试和固定输入样本
 ├── _env.py                   # 环境探测：SUMISORA_ROOT、lilypond、python
 ├── homr_shim.py              # SumisoraOMR homr_runner ↔ pip 版 homr 的适配层
 ├── requirements.txt          # 新管线依赖
@@ -396,3 +409,16 @@ python main.py ../input/erhu_p1.png
 <p align="center">
   <sub>如果这个项目帮到了你，点个 ⭐ 让更多人看到。</sub>
 </p>
+
+## 本次识谱修复与验证
+
+- 保留合音中每个音的八度和临时升降号，隐藏简谱辅助谱表的加线。
+- 不因 OMR 拍号不可靠而截断实际音符。
+- 多小节休止重排出现音符槽位数量歧义时抛错，避免猜测性补休止。
+- 对 Maestro 矢量 PDF 中无调号、4/4、可明确判断的全音符合音，按谱面小节几何恢复音高和归属。其他节奏、字体、调号仍依赖 OMR；这不是全谱正确性的保证。
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+测试使用 `tests/fixtures/` 中的固定样本，不依赖本机批处理缓存。

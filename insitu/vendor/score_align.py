@@ -134,27 +134,44 @@ def detect_staff_systems(document: pymupdf.Document) -> list[StaffSystem]:
                         left_edges.append(min(a.x, b.x))
                 elif abs(a.x - b.x) < 0.4:
                     y0, y1 = sorted((a.y, b.y))
-                    # A barline spans the staff: its top end sits on the upper
-                    # rule, its bottom end meets or slightly overshoots the
-                    # lower one.  The overshoot differs between engravers
-                    # (0.24 pt in MuseScore exports, more in others), so accept
-                    # a range instead of one exact value.  Note stems stop
-                    # short of both outer rules and are still rejected.
-                    if abs(y0 - top) < 0.8 and bottom - 0.8 <= y1 <= bottom + 1.8:
+                    # Barlines touch the top staff rule and extend 0.24 pt
+                    # beyond the bottom rule in these source PDFs.
+                    if abs(y0 - top) < 0.10 and abs((y1 - bottom) - 0.24) < 0.10:
                         raw_bars.append(round(a.x, 2))
 
-            bars = tuple(
+            bars = [
                 sum(cluster) / len(cluster)
                 for cluster in cluster_sorted(raw_bars, tolerance=5.5)
-            )
+            ]
+            left = min(left_edges) if left_edges else 36.0
+            # A ``|:`` repeat sign drawn at the head of a system puts a *thick*
+            # barline (line width ~2.6pt) ~26pt right of the staff's left edge,
+            # before the clef's indent is over.  That stroke is the system
+            # opener, not a measure separator: counting it slices a 26pt sliver
+            # off the first measure, and every jianpu cell afterwards lands one
+            # column too far right.  Only drop it when it really is a repeat
+            # sign (a thick stroke of staff height sits right next to it) and
+            # when it is close enough to the edge that no real bar could fit.
+            start_repeat = [
+                d["rect"].x0 for d in page.get_drawings()
+                if d["type"] == "s"
+                and (d.get("width") or 0) >= 1.5
+                and d["rect"].width < 1.2
+                and d["rect"].height > 8.0
+                and abs(d["rect"].y0 - top) < 1.0
+            ]
+            if (len(bars) > 1
+                    and bars[0] - left < 45.0
+                    and any(abs(tx - bars[0]) < 8.0 for tx in start_repeat)):
+                bars = bars[1:]
             systems.append(
                 StaffSystem(
                     page_index=page_index,
                     row_index=row_index,
                     top=top,
                     bottom=bottom,
-                    left=min(left_edges) if left_edges else 36.0,
-                    bars=bars,
+                    left=left,
+                    bars=tuple(bars),
                 )
             )
     return systems
@@ -175,6 +192,14 @@ def _ink_boxes(page: pymupdf.Page) -> list[tuple[float, float, float, float]]:
                 if not span["text"].strip() and not span["font"].startswith("Emmentaler"):
                     continue
                 x0, y0, x1, y1 = span["bbox"]
+                # Emmentaler's NUL glyph is not jianpu ink: it is the spacer the
+                # engraver emits for a tie/dash continuation, and its box can run
+                # 60-150pt tall while being barely a point wide (a run of them
+                # stretched a cell to two whole rows: 中音笙's band came out at
+                # 387pt instead of ~108pt).  No real jianpu glyph is NUL-only.
+                if (span["font"].startswith("Emmentaler")
+                        and not span["text"].replace("\x00", "").strip()):
+                    continue
                 # The measure number printed in the left margin ("137", "2")
                 # is set in C059 and sits left of the first cell.  It is not
                 # jianpu ink: including it made the first cell of a line look
@@ -228,6 +253,18 @@ def detect_jianpu_cells(document: pymupdf.Document, config: Config) -> list[Jian
 
         ink = _ink_boxes(page)
         band = config.row_band_pt
+        # Guard against a page whose lines are unevenly spaced.  The midpoint
+        # rules below are correct for evenly spaced lines, but 中音笙 has a stretch
+        # where the engraver stacked twelve digits of one measure at a single x,
+        # leaving a 370pt hole between two lines; the midpoints then handed that
+        # whole hole to both neighbours and one cell ("185pt of ink") made every
+        # band 387pt tall.  A cap derived from the page's median line pitch can
+        # only ever *shrink* the window, so evenly spaced pages are untouched and
+        # a chord's octave dots (≈45pt) still fit inside it.
+        pitches = [b - a for a, b in zip([r[0] for r in rows], [r[0] for r in rows][1:])]
+        pitches.sort()
+        pitch = pitches[len(pitches) // 2] if pitches else 60.0
+        cap = max(2.0 * band, 0.62 * pitch)
 
         for row_index, (y, dividers, divider_bottom) in enumerate(rows):
             # Window with which ink is attributed to this row: never reach into
@@ -235,11 +272,50 @@ def detect_jianpu_cells(document: pymupdf.Document, config: Config) -> list[Jian
             # page title or the "1=C" header.
             lo = y - band if row_index == 0 else (rows[row_index - 1][0] + y) / 2.0
             hi = y + band if row_index == len(rows) - 1 else (y + rows[row_index + 1][0]) / 2.0
+            lo = max(lo, y - cap)
+            hi = min(hi, y + cap)
 
             if page_index == 0 and row_index == 0:
                 previous_x = config.jianpu_first_left_pt
             else:
                 previous_x = config.jianpu_other_left_pt
+
+            # The barline that opens a line is drawn as a thin *filled* rectangle,
+            # not as a stroked segment, so it is neither in `dividers` nor kept by
+            # _ink_boxes.  Unless the crop of the line's first cell reaches it,
+            # the "|" that begins a line disappears from the in-situ output (this
+            # is what made measure 270 look barless).  Find it and shift the crop's
+            # left edge onto it; the row's own ink is never that far left.
+            start_bar_x: float | None = None
+            for drawing in page.get_drawings():
+                rect = drawing["rect"]
+                if (rect.width < 2.5 and rect.height > 12.0
+                        and abs(rect.y0 - y) < 0.4
+                        and rect.x0 < dividers[0] - 1.0):
+                    start_bar_x = rect.x0 if start_bar_x is None else min(start_bar_x, rect.x0)
+            if start_bar_x is not None:
+                # Whatever is set in the strip between the opening bar and the
+                # cell's usual left edge belongs to the *header*, not to the
+                # measure: on the first line that is the key/time header
+                # ("1=C", "6=A 4/4").  Swallowing it would drag non-measure
+                # glyphs into the cell and inflate the band, so instead the crop
+                # starts just after it — that also stops the fixed first-cell
+                # margin from slicing the leading time signature in half.
+                blocking = [
+                    (bx0, by0, bx1, by1)
+                    for bx0, by0, bx1, by1 in ink
+                    if start_bar_x - 0.4 <= (bx0 + bx1) / 2 <= previous_x + 0.2
+                    and lo < (by0 + by1) / 2 < hi
+                    and bx1 - bx0 > 2.5
+                ]
+                if not blocking:
+                    # 0.25pt covers the half of the bar's 0.5pt outline stroke
+                    # that lies outside the filled rectangle.
+                    previous_x = min(previous_x, start_bar_x - 0.25) - 0.35
+                else:
+                    after_header = max(b[2] for b in blocking) + 0.35
+                    if dividers[0] - after_header > 3.0:
+                        previous_x = max(previous_x, after_header)
 
             for x in dividers:
                 if x - previous_x > 2:
@@ -257,20 +333,24 @@ def detect_jianpu_cells(document: pymupdf.Document, config: Config) -> list[Jian
                     # The cell's own barlines always run the full row height.
                     top = min(top, y)
                     bottom = max(bottom, divider_bottom)
-                    # A fermata / slur / accidental can reach a few points past
-                    # the barline the cell ends at.  Widening the crop to that
-                    # ink (capped at the neighbour's halfway point so two cells
-                    # can never claim the same glyph) keeps it from being cut.
+                    # A fermata / accidental can reach a point or two past the
+                    # barline the cell ends at, so the crop follows the cell's
+                    # own ink — but only within a small slack of the cell's OWN
+                    # column.  A slur or tie that runs from the last note of
+                    # this measure into the next one has a bbox reaching well
+                    # past the divider; following it used to drag the opening
+                    # note of the following measure into this cell's crop (e.g.
+                    # measure 273 pulled in the first note of 274).  Clamping to
+                    # the divider keeps a cell strictly inside its measure.
                     left_x, right_x = x0, x1
                     for bx0, by0, bx1, by1 in own:
                         left_x = min(left_x, bx0 - config.cell_pad_pt)
                         right_x = max(right_x, bx1 + config.cell_pad_pt)
-                    neighbours = [d for d in dividers if d < x0 - 1 or d > x1 + 1]
-                    if neighbours:
-                        left_lim = max([d for d in neighbours if d < x0] or [0.0])
-                        right_lim = min([d for d in neighbours if d > x1] or [page.rect.width])
-                        left_x = max(left_x, (left_lim + x0) / 2.0)
-                        right_x = min(right_x, (x1 + right_lim) / 2.0)
+                    # x0/x1 are the column edges (previous divider / own divider),
+                    # both already offset by a fraction of a point.  Allow the
+                    # crop to reach at most cell_pad_pt beyond them.
+                    left_x = max(left_x, x0 - config.cell_pad_pt)
+                    right_x = min(right_x, x1 + config.cell_pad_pt)
                     clip = pymupdf.Rect(
                         left_x,
                         max(0.0, top - config.cell_pad_pt),
@@ -451,7 +531,10 @@ def cell_vertical_extents(cells: list[JianpuCell]) -> tuple[float, float]:
     Returns the worst case over the whole document: a chord cell with octave
     dots stacked on its upper digit reaches ~24pt up, and the underlines of the
     lowest octave reach ~22pt down.  Sizing the band from these measured values
-    (instead of a fixed 29/40pt) is what guarantees no more overlap.
+    (instead of a fixed 29/40pt) is what guarantees no more overlap.  The crops
+    themselves are already bounded by their own jianpu line (see
+    detect_jianpu_cells), so a plain maximum cannot be inflated by a crop that
+    accidentally reached into the next line.
     """
     above = max((c.anchor_y - c.clip.y0 for c in cells), default=23.6)
     below = max((c.clip.y1 - c.anchor_y for c in cells), default=21.7)

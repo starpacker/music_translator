@@ -1,0 +1,360 @@
+# core/notation/jianpu/__init__.py — Public API for Jianpu conversion.
+# Orchestration functions live here; sub-modules provide the building blocks.
+import logging as _logging
+from typing import Literal, Optional, overload
+
+from ...utils import log_message
+from .primitives import (
+    _get_score_key_tonic,
+    build_lyric_lines,
+    clone_jianpu_note,
+    duration_suffix,
+    format_jianpu_note_text,
+    get_duration_render,
+    infer_duration_dots,
+    jianpu_note_token,
+    jianpu_octave_symbol,
+    normalize_jianpu_duration,
+    note_to_jianpu,
+    split_duration_chunks,
+    MAX_SANE_BARS,
+    _DIATONIC_SEMITONES,
+    _CHROMATIC_SHARP,
+    _CHROMATIC_FLAT,
+    _FLAT_KEY_SEMITONES,
+    _QL_TO_ANACRUSIS_CODE,
+)
+from .measure import (
+    _parse_bar_units,
+    layout_time_word,
+    measure_units,
+)
+from .extract import (
+    _extract_part_repeat_barlines,
+    _get_voice_ids_in_part,
+    _secondary_voice_overlaps_primary,
+    extract_jianpu_measures,
+    extract_strict_jianpu_measures,
+    strip_grace_notes,
+)
+
+from ...config import JianpuNote  # re-export for callers that import it from here
+
+
+def choose_measures_per_line(measures: list[list[JianpuNote]]) -> int:
+    """Choose measures per line based on average note density (dense → 3, otherwise 4)."""
+    if not measures:
+        return 4
+    sample = measures[: min(len(measures), 24)]
+    avg_notes = sum(len(measure) for measure in sample) / max(len(sample), 1)
+    if avg_notes >= 9:
+        return 3
+    return 4
+
+
+def _header_time_signature(time_sig: str) -> str:
+    """The signature word written in the jianpu-ly header.
+
+    Only the bar length of the *first* measure is set by it (any later measure
+    whose notes add up to something else gets its own layout ``\\time``), and the
+    anacrusis suffix must go: it makes jianpu-ly pre-advance ``barPos`` by
+    ``\\partial``, which would offset every barline in the piece.  The pickup bar
+    now simply lasts as long as its notes do.
+    """
+    word = (time_sig or '').split(',')[0].strip()
+    return word or '4/4'
+
+
+def layout_time_tokens(measures, header_units: int) -> dict[int, str]:
+    """Map measure index → the ``\\time`` word that must precede it.
+
+    jianpu-ly aborts ("barcheck fail") the moment its running ``barPos`` crosses
+    ``barLength``, so every measure has to be introduced with a bar length that
+    matches the notes we actually emit for it.  This is *not* a meter: the word
+    produced by :func:`layout_time_word` is derived from the measure's own note
+    total, it is only listed where that total differs from the previous measure's,
+    and the TimeSignature glyph is suppressed in the staff (see
+    ``jianpu_staff_start``) so nothing is printed.  That is what makes the notes
+    authoritative instead of the meter: nothing is padded or trimmed to fit a
+    signature, and no guessed signature can appear in the score.
+    """
+    if not measures:
+        return {}
+    tokens: dict[int, str] = {}
+    previous = header_units
+    for index, measure in enumerate(measures):
+        units = measure_units(measure)
+        if units <= 0:
+            # Nothing to lay out (an empty measure) — leave the bar length alone
+            # rather than emitting a degenerate \time 0/… word.
+            continue
+        if units != previous:
+            word = layout_time_word(units)
+            if word:
+                tokens[index] = word
+                previous = units
+    return tokens
+
+
+def _with_time_signatures(measure_texts: list[str], start: int,
+                          time_sig_tokens: dict[int, str]) -> list[str]:
+    """Prepend the ``\\time`` word to the measures that need one."""
+    if not time_sig_tokens:
+        return measure_texts
+    return [
+        f'{time_sig_tokens[start + offset]} {text}' if (start + offset) in time_sig_tokens
+        else text
+        for offset, text in enumerate(measure_texts)
+    ]
+
+
+def parse_score_to_jianpu(score) -> tuple[list[list[JianpuNote]], list[str], str]:
+    """Parse a score into jianpu format; return (measures, header_lines, time_sig)."""
+    key_tonic_semitone, key_header = _get_score_key_tonic(score)
+
+    measures, time_signature = extract_jianpu_measures(score, key_tonic_semitone)
+    header_lines: list[str] = [f'{key_header} {time_signature}', '']
+
+    measures_per_line = choose_measures_per_line(measures)
+    log_message(f'[jianpu] parse_score_to_jianpu: {len(measures)} 个小节（每行 {measures_per_line} 个）', _logging.DEBUG)
+
+    for i in range(0, len(measures), measures_per_line):
+        line_measures = measures[i:i + measures_per_line]
+        try:
+            measure_texts = [' '.join(format_jianpu_note_text(note) for note in measure) for measure in line_measures]
+            header_lines.append(' | '.join(measure_texts) + ' |')
+        except Exception as exc:
+            log_message(f'[jianpu] parse_score_to_jianpu 处理小节组 [{i}:{i+measures_per_line}] 失败: {exc}', _logging.WARNING)
+            raise
+
+    return measures, header_lines, time_signature
+
+
+def build_jianpu_ly_text_from_measures(
+    measures: 'list[list[JianpuNote]]',
+    time_sig: str,
+    key_header: str,
+    title: str,
+    composer: str = '',
+    tempo: int = 0,
+) -> str:
+    """Build jianpu-ly plain-text from pre-computed JianpuNote measures (bypassing score parsing).
+
+    Equivalent to ``build_jianpu_ly_text`` but accepts already-parsed note data
+    instead of a music21 Score object.  Used by the dual-engine fusion path.
+
+    *key_header* is the already-formatted jianpu-ly key line (e.g. ``'1=F'``
+    or ``'6=D'`` for minor — see ``_get_score_key_tonic``), not a bare tonic name.
+    """
+    header = ['% jianpu-ly.py', f'title={title}']
+    if composer:
+        header.append(f'composer={composer}')
+    header.append(key_header)
+    header.append(_header_time_signature(time_sig))
+    if tempo > 0:
+        header.append(f'4={tempo}')
+    # 合音的高/低八度点需明确归属位置（见 build_jianpu_ly_text 中的同名注释）
+    header.append('OctavesAfter')
+    header.append('')
+    bar_units = _parse_bar_units(time_sig)
+    time_sig_tokens = layout_time_tokens(measures, bar_units)
+    for i in range(0, len(measures), 4):
+        line_measures = measures[i:i + 4]
+        # The notes are emitted exactly as extracted: no padding, no trimming.
+        measure_texts = [
+            ' '.join(jianpu_note_token(note) for note in m)
+            for m in line_measures
+        ]
+        header.append(' | '.join(_with_time_signatures(measure_texts, i, time_sig_tokens)) + ' |')
+    header.extend(build_lyric_lines(measures))
+    return '\n'.join(header)
+
+
+@overload
+def build_jianpu_ly_text(score, title: str, use_strict_timing: bool = False,
+                          composer: str = '', tempo: int = 0,
+                          _return_groups: Literal[False] = False) -> str: ...
+@overload
+def build_jianpu_ly_text(score, title: str, use_strict_timing: bool = False,
+                          composer: str = '', tempo: int = 0,
+                          *, _return_groups: Literal[True],
+                          ) -> tuple[str, list[list[int]], dict[int, dict[str, bool]]]: ...
+def build_jianpu_ly_text(score, title: str, use_strict_timing: bool = False,
+                          composer: str = '', tempo: int = 0,
+                          _return_groups: bool = False):
+    """Build jianpu-ly plain-text for all parts in the score.
+
+    For single-part scores the output is identical to the previous behaviour,
+    except that when the single part contains multiple non-rest voices they are
+    each extracted as a separate ``NextPart`` section (capped at 4 voices).
+
+    For multi-part scores each part becomes a separate jianpu section; parts
+    that contain multiple non-rest voices are further split so each voice gets
+    its own section.
+
+    Parameters
+    ----------
+    _return_groups
+        When *True* the function returns ``(text, voice_groups)`` instead of
+        just *text*.  ``voice_groups`` is a ``list[list[int]]`` where each
+        inner list contains the 0-based section indices that belong to the same
+        Part and should therefore be rendered on the *same* jianpu staff as
+        simultaneous polyphonic voices.  Sections with a group of length 1 are
+        monophonic and need no merging.
+    """
+    key_tonic_semitone, key_header_line = _get_score_key_tonic(score)
+
+    if tempo <= 0:
+        try:
+            from music21 import tempo as m21tempo
+            tempos = list(score.flatten().getElementsByClass(m21tempo.MetronomeMark))
+            if tempos:
+                tempo = int(round(tempos[0].number))
+        except Exception:
+            pass
+
+    # ── Collect one measures-list per output section ──────────────────────────
+    _parts = list(score.parts) if score.parts else []
+    _sections: list[list[list[JianpuNote]]] = []
+    _voice_groups: list[list[int]] = []   # parallel to _sections groups
+    _time_sig: str = '4/4'
+    _ts_set = False
+
+    if len(_parts) <= 1:
+        part = _parts[0] if _parts else None
+        # Detect multiple voices in the single part (skip in strict mode which flattens)
+        _v_ids = _get_voice_ids_in_part(part) if (not use_strict_timing and part is not None) else []
+
+        if len(_v_ids) <= 1:
+            # Single voice (or strict mode) — existing behaviour
+            fn = extract_strict_jianpu_measures if use_strict_timing else extract_jianpu_measures
+            measures, _time_sig = fn(score, key_tonic_semitone)
+            _sections = [measures]
+            _voice_groups = [[0]]
+        else:
+            # Multiple voices within a single part — extract each voice separately
+            log_message(
+                f'[jianpu] 单声部多声道: {len(_v_ids)} 个声道 ({", ".join(str(v) for v in _v_ids[:4])})',
+                _logging.DEBUG,
+            )
+            _primary_vid = _v_ids[0]
+            _group_idxs: list[int] = []
+            for i, vid in enumerate(_v_ids[:4]):
+                # 跳过伪复声部：次声部音符 onset 严格落在主声部音符时值内 → OMR 误判
+                if i > 0 and part is not None and _secondary_voice_overlaps_primary(part, _primary_vid, vid):
+                    log_message(
+                        f'[jianpu] 跳过伪复声部 voice={vid}（音符与主声部重叠，判定为 OMR 误判）',
+                        _logging.DEBUG,
+                    )
+                    continue
+                measures, ts = extract_jianpu_measures(
+                    score, key_tonic_semitone, _part=part, _voice_id=vid,
+                    _multi_voice_mode=True, _is_primary_voice=(i == 0))
+                if not _ts_set:
+                    _time_sig, _ts_set = ts, True
+                if measures:
+                    _group_idxs.append(len(_sections))
+                    _sections.append(measures)
+            _voice_groups = [_group_idxs] if _group_idxs else [[0]]
+    else:
+        # Multi-part path: one section per part / voice combination
+        for part in _parts:
+            if use_strict_timing:
+                # Strict mode flattens all voices; emit one section per part
+                measures, ts = extract_strict_jianpu_measures(score, key_tonic_semitone, _part=part)
+                if not _ts_set:
+                    _time_sig, _ts_set = ts, True
+                if measures:
+                    _voice_groups.append([len(_sections)])
+                    _sections.append(measures)
+            else:
+                voice_ids = _get_voice_ids_in_part(part)
+                if len(voice_ids) <= 1:
+                    # No multi-voice structure — one section for the whole part
+                    measures, ts = extract_jianpu_measures(score, key_tonic_semitone, _part=part)
+                    if not _ts_set:
+                        _time_sig, _ts_set = ts, True
+                    if measures:
+                        _voice_groups.append([len(_sections)])
+                        _sections.append(measures)
+                else:
+                    # Multiple voices: one section per voice (max 4).
+                    # In a multi-part score each Part already maps to a separate staff;
+                    # when a Part contains multiple voice IDs (e.g. due to OMR chord
+                    # encoding), each voice is an independent melodic line and should
+                    # get its own staff row — NOT be merged into a shared polyphonic
+                    # staff (that path is reserved for the single-part case above).
+                    _primary_vid_mp = voice_ids[0]
+                    for i, vid in enumerate(voice_ids[:4]):
+                        # 跳过伪复声部：次声部音符 onset 严格落在主声部音符时值内 → OMR 误判
+                        if i > 0 and _secondary_voice_overlaps_primary(part, _primary_vid_mp, vid):
+                            log_message(
+                                f'[jianpu] 跳过伪复声部 voice={vid}（音符与主声部重叠，判定为 OMR 误判）',
+                                _logging.DEBUG,
+                            )
+                            continue
+                        measures, ts = extract_jianpu_measures(
+                            score, key_tonic_semitone, _part=part, _voice_id=vid,
+                            _multi_voice_mode=True, _is_primary_voice=(i == 0))
+                        if not _ts_set:
+                            _time_sig, _ts_set = ts, True
+                        if measures:
+                            _voice_groups.append([len(_sections)])
+                            _sections.append(measures)
+
+    # ── Assemble jianpu-ly text ───────────────────────────────────────────────
+    header = ['% jianpu-ly.py', f'title={title}']
+    if composer:
+        header.append(f'composer={composer}')
+    header.append(key_header_line)
+    header.append(_header_time_signature(_time_sig))
+    if tempo > 0:
+        header.append(f'4={tempo}')
+    # 合音（,135 形式）内部的高/低八度点必须明确归属，否则 jianpu-ly 报
+    # "Ambiguous octave marks"。OctavesAfter = 记号作用于其前面的音（默认约定）。
+    header.append('OctavesAfter')
+    header.append('')
+
+    bar_units   = _parse_bar_units(_time_sig)
+    measures_per_line = 4
+
+    log_message(
+        f'[jianpu] build_jianpu_ly_text: {len(_sections)} 个声部段落，共 '
+        f'{sum(len(s) for s in _sections)} 个小节', _logging.DEBUG,
+    )
+
+    for section_idx, measures in enumerate(_sections):
+        if section_idx > 0:
+            header.append('NextPart')
+            # jianpu-ly resets barLength per part; repeat the header signature so
+            # the reset value is the same one the tokens below are measured from.
+            header.append(_header_time_signature(_time_sig))
+        # Each section gets its own staff and its own barLength, so the layout
+        # tokens restart from the header's bar length for every section.
+        section_time_sigs = layout_time_tokens(measures, bar_units)
+        for i in range(0, len(measures), measures_per_line):
+            line_measures = measures[i:i + measures_per_line]
+            try:
+                # Emitted exactly as extracted: no padding, no trimming.
+                measure_texts = [
+                    ' '.join(jianpu_note_token(note) for note in m)
+                    for m in line_measures
+                ]
+                header.append(
+                    ' | '.join(_with_time_signatures(measure_texts, i, section_time_sigs)) + ' |')
+            except Exception as exc:
+                log_message(
+                    f'[jianpu] 处理声部 {section_idx} 小节组 [{i}:{i+measures_per_line}] 失败: {exc}',
+                    _logging.WARNING,
+                )
+                raise
+        header.extend(build_lyric_lines(measures))
+
+    text = '\n'.join(header)
+    if _return_groups:
+        _first_part = _parts[0] if _parts else None
+        _repeat_barlines: dict[int, dict[str, bool]] = (
+            _extract_part_repeat_barlines(_first_part) if _first_part is not None else {}
+        )
+        return text, _voice_groups, _repeat_barlines
+    return text

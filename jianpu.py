@@ -38,6 +38,8 @@ def omr_to_musicxml(score_pdf: Path, work: Path, use_gpu: Optional[bool] = None)
         return cached
 
     ensure_sumisora()
+    import homr_shim
+    homr_shim.install()
     from core.omr.homr_runner import run_homr_batch          # noqa: PLC0415
     from core.utils import find_first_musicxml_file          # noqa: PLC0415
 
