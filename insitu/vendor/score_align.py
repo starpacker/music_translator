@@ -134,9 +134,13 @@ def detect_staff_systems(document: pymupdf.Document) -> list[StaffSystem]:
                         left_edges.append(min(a.x, b.x))
                 elif abs(a.x - b.x) < 0.4:
                     y0, y1 = sorted((a.y, b.y))
-                    # Barlines touch the top staff rule and extend 0.24 pt
-                    # beyond the bottom rule in these source PDFs.
-                    if abs(y0 - top) < 0.10 and abs((y1 - bottom) - 0.24) < 0.10:
+                    # A barline spans the staff: its top end sits on the upper
+                    # rule, its bottom end meets or slightly overshoots the
+                    # lower one.  The overshoot differs between engravers
+                    # (0.24 pt in MuseScore exports, more in others), so accept
+                    # a range instead of one exact value.  Note stems stop
+                    # short of both outer rules and are still rejected.
+                    if abs(y0 - top) < 0.8 and bottom - 0.8 <= y1 <= bottom + 1.8:
                         raw_bars.append(round(a.x, 2))
 
             bars = tuple(
