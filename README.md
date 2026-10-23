@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/social-preview.png" alt="jianpu-insitu" width="100%">
+  <img src="assets/social-preview.png" alt="music_translator：五线谱 PDF 转简谱" width="100%">
 </p>
 
 <h1 align="center">music_translator</h1>
@@ -106,9 +106,12 @@ OMR 用的是 **Homr**（端到端光学乐谱识别，也可切到 Audiveris）
 
 ## 📦 安装
 
-### 1. Python 环境
+### 1. 本项目 + Python 环境
 
 ```bash
+git clone https://github.com/starpacker/music_translator.git
+cd music_translator
+
 python -m venv .venv && source .venv/bin/activate      # 建议 Python 3.10+
 pip install -r requirements.txt
 ```
