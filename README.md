@@ -58,8 +58,10 @@ OMR 用的是 **Homr**（端到端光学乐谱识别，也可切到 Audiveris）
 
 每一行五线谱下方，就是这一行的简谱。半个字都不挪动原谱的位置。
 
+下图取自梆笛分谱 `梆笛.pdf`（6 页 A4 矢量谱，51 行谱表）的实测输出：
+
 <p align="center">
-  <img src="docs/screenshots/insitu.png" alt="原位简谱：每行五线谱下方对齐一行简谱" width="88%">
+  <img src="docs/screenshots/insitu.png" alt="梆笛原位简谱：每行五线谱下方对齐一行简谱" width="88%">
 </p>
 
 ### 整页简谱（`--mode jianpu`）
