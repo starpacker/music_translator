@@ -17,6 +17,40 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class PiecewiseCutTest(unittest.TestCase):
+    def test_piecewise_cut_preserves_disjoint_interleaved_source_ink(self):
+        from insitu.render_insitu import (_blank_cut, _copy_with_column_cuts,
+                                          _cut_has_ink, _piecewise_blank_cut)
+        source = pymupdf.open()
+        page = source.new_page(width=200, height=160)
+        page.draw_rect(pymupdf.Rect(25, 35, 50, 90), color=None, fill=(0, 0, 0))
+        page.draw_rect(pymupdf.Rect(120, 65, 150, 120), color=None, fill=(0, 0, 0))
+        self.assertTrue(_cut_has_ink(page, _blank_cut(page, 50, 105)))
+        result = _piecewise_blank_cut(page, 50, 105)
+        self.assertIsNotNone(result)
+        cut, overrides = result
+        self.assertTrue(overrides)
+        output = pymupdf.open()
+        target = output.new_page(width=200, height=200)
+        _copy_with_column_cuts(target, source, 0, [(cut, 40, 0, None, None, None, None, overrides)])
+        pix = target.get_pixmap(matrix=pymupdf.Matrix(2, 2), colorspace=pymupdf.csGRAY, alpha=False)
+        pixels = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.stride)
+        # Each rectangle must remain a single continuous rectangle at its
+        # original size, even though they receive different translations.
+        for x in (35, 130):
+            ys = np.flatnonzero(pixels[:, x * 2] < 128)
+            self.assertEqual(len(ys), 110)
+            self.assertTrue(np.all(np.diff(ys) == 1))
+        output.close()
+        source.close()
+
+    def test_no_safe_cut_through_ink_spanning_the_whole_gap(self):
+        from insitu.render_insitu import _piecewise_blank_cut
+        source = pymupdf.open()
+        page = source.new_page(width=200, height=160)
+        page.draw_rect(pymupdf.Rect(50, 35, 60, 120), color=None, fill=(0, 0, 0))
+        self.assertIsNone(_piecewise_blank_cut(page, 50, 105))
+        source.close()
+
     def test_tempo_moves_with_next_staff_while_previous_dynamic_stays(self):
         from insitu.render_insitu import _copy_with_column_cuts, _tempo_cut_overrides
         with tempfile.TemporaryDirectory() as tmp:
@@ -58,6 +92,54 @@ class PiecewiseCutTest(unittest.TestCase):
 
 @unittest.skipUnless(shutil.which('lilypond'), 'LilyPond is required')
 class SpacedInsituTest(unittest.TestCase):
+    def test_interleaved_marks_use_piecewise_cut_in_real_build(self):
+        import insitu.render_insitu as renderer
+        from test_vector_tempos import make_sources
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            original, xml = make_sources(root)
+            source, output = root / 'interleaved.pdf', root / 'out.insitu.pdf'
+            with pymupdf.open(original) as doc:
+                page = doc[0]
+                page.draw_rect(pymupdf.Rect(200, 125, 215, 155), color=None, fill=(0, 0, 0))
+                page.draw_rect(pymupdf.Rect(400, 145, 415, 180), color=None, fill=(0, 0, 0))
+                doc.save(source)
+            renderer.build(source, xml, output, expand=True)
+            report = json.loads((root / 'out.insitu.report.json').read_text())
+            self.assertEqual(report['status'], 'needs_review')
+            self.assertEqual(report['piecewise_source_cut_count'], 1)
+            self.assertEqual(report['rows'][0]['source_cut'], 'piecewise')
+            self.assertTrue(report['rows'][0]['rendered'])
+            with pymupdf.open(output) as doc:
+                pix = doc[0].get_pixmap(matrix=pymupdf.Matrix(2, 2), colorspace=pymupdf.csGRAY, alpha=False)
+                pixels = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.stride)
+                for x, height in [(207, 60), (407, 70)]:
+                    ys = np.flatnonzero(pixels[:, 2 * x] < 128)
+                    runs = np.split(ys, np.where(np.diff(ys) > 1)[0] + 1)
+                    self.assertTrue(any(len(run) == height for run in runs), (x, [len(run) for run in runs]))
+
+    def test_unsafe_cut_keeps_source_and_marks_row_incomplete(self):
+        import insitu.render_insitu as renderer
+        from test_vector_tempos import make_sources
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source, xml = make_sources(root)
+            output = root / 'out.insitu.pdf'
+            with mock.patch.object(renderer, '_cut_has_ink', return_value=True), \
+                 mock.patch.object(renderer, '_piecewise_blank_cut', return_value=None):
+                renderer.build(source, xml, output, expand=True)
+            report = json.loads((root / 'out.insitu.report.json').read_text())
+            self.assertEqual(report['status'], 'incomplete')
+            self.assertEqual(report['rendered_staff_count'], 0)
+            self.assertEqual(report['rows'][0]['voices'][0]['error'], 'no_safe_source_cut')
+            with pymupdf.open(source) as original, pymupdf.open(output) as result:
+                before = original[0].get_pixmap(colorspace=pymupdf.csGRAY, alpha=False)
+                after = result[0].get_pixmap(colorspace=pymupdf.csGRAY, alpha=False)
+                self.assertEqual(before.samples, after.samples)
+                self.assertEqual(len(result), 2)
+                self.assertEqual(report['rows'][0]['voices'][0]['detached_page'], 2)
+                self.assertIn('Source page 1, staff 1', result[1].get_text())
+
     def test_spaced_layout_preserves_source_and_inserts_rows(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

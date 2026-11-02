@@ -261,8 +261,74 @@ def _blank_cut(page, low: float, high: float) -> float:
     middle = (len(counts) - 1) / 2
     row = min(choices, key=lambda i: abs(i - middle))
     if best:
-        print(f'  ! 无完全空白的插入位置，使用墨迹最少的横线（{best} 像素）')
+        print(f'  ! 无完全空白的插入位置，尝试按列寻找安全切线（最少 {best} 像素）')
     return (start + int(row)) / 2
+
+
+def _cut_has_ink(page, cut: float) -> bool:
+    """Check the exact half-point raster row selected by _blank_cut."""
+    import numpy as np
+    clip = fitz.Rect(0, cut, page.rect.width, min(page.rect.height, cut + .5))
+    pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), clip=clip,
+                          alpha=False, colorspace=fitz.csGRAY)
+    pixels = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.stride)
+    return not pix.height or bool(np.any(pixels[:, :pix.width] < 245))
+
+
+def _piecewise_blank_cut(page, low: float, high: float):
+    """Find a blank cut per column region, changing height only in blank columns.
+
+    A region spanning the entire gap without a blank row cannot safely be
+    divided; in that case return None rather than tear original score ink.
+    """
+    import numpy as np
+    scale = 2
+    low = max(0.0, min(low, page.rect.height - 1))
+    high = max(low + .5, min(high, page.rect.height))
+    pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale),
+                          clip=fitz.Rect(0, low, page.rect.width, high),
+                          alpha=False, colorspace=fitz.csGRAY)
+    pixels = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.stride)[:, :pix.width]
+    if not pix.height or not pix.width:
+        return None
+    occupied = np.any(pixels < 245, axis=0)
+    # Treat each source glyph and vector drawing as indivisible even if its
+    # ink contains empty columns or rows. Otherwise separate components of a
+    # single symbol could be translated to opposite sides of the new gap.
+    boxes = []
+    for block in page.get_text('rawdict')['blocks']:
+        for line in block.get('lines', []):
+            for span in line.get('spans', []):
+                boxes.extend(fitz.Rect(char['bbox']) for char in span['chars']
+                             if char.get('c', '').strip())
+    boxes.extend(fitz.Rect(drawing['rect']) for drawing in page.get_drawings())
+    boxes = [box for box in boxes if box.y1 > low and box.y0 < high and box.x1 > box.x0]
+    for box in boxes:
+        left = max(0, int(box.x0 * scale) - pix.x)
+        right = min(pix.width, int(np.ceil(box.x1 * scale)) - pix.x)
+        occupied[left:right] = True
+    indices = np.flatnonzero(occupied)
+    if not len(indices):
+        return None
+    regions = np.split(indices, np.where(np.diff(indices) > 1)[0] + 1)
+    chosen = []
+    center = (pix.height - 1) / 2
+    for region in regions:
+        left, right = int(region[0]), int(region[-1]) + 1
+        clear_rows = np.flatnonzero(np.all(pixels[:, left:right] >= 245, axis=1))
+        region_left = (pix.x + left) / scale
+        region_right = (pix.x + right) / scale
+        overlapping = [box for box in boxes if box.x0 < region_right and box.x1 > region_left]
+        clear_rows = [y for y in clear_rows
+                      if all(not box.y0 - .25 <= (pix.y + y) / scale <= box.y1 + .25
+                             for box in overlapping)]
+        if not len(clear_rows):
+            return None
+        row = int(min(clear_rows, key=lambda y: abs(y - center)))
+        chosen.append((region_left, region_right, (pix.y + row) / scale))
+    base = max(y for _, _, y in chosen)
+    overrides = [(left, right, y) for left, right, y in chosen if y < base]
+    return base, overrides
 
 
 def _tempo_cut_overrides(page, low: float, base_cut: float, next_top: float):
@@ -665,6 +731,7 @@ def build(pdf_path: Path, mxl_path: Path, out_path: Path,
     tmpdir = Path(tempfile.mkdtemp(prefix='insitu_ly_'))
     placed = 0
     fallback_rows = 0
+    piecewise_rows = 0
     incomplete_voice_rows = 0
     tiles = {}
     row_reports = []
@@ -737,6 +804,7 @@ def build(pdf_path: Path, mxl_path: Path, out_path: Path,
 
     if expand:
         output = fitz.open()
+        detached_tiles = []
         for page_index, page in enumerate(doc):
             all_page_rows = [(i, layout) for i, layout in enumerate(staves)
                              if layout.staff.page == page_index + 1]
@@ -753,9 +821,31 @@ def build(pdf_path: Path, mxl_path: Path, out_path: Path,
                 next_top = next_tops[index]
                 low = min(staff.bottom + 6, next_top - 1)
                 high = min(next_top - 5, staff.bottom + 55)
-                cut = _blank_cut(page, low, max(low + 1, high))
-                overrides = (_tempo_cut_overrides(page, low, cut, next_top)
-                             if next_top < page.rect.height else [])
+                high = max(low + 1, high)
+                cut = _blank_cut(page, low, high)
+                if _cut_has_ink(page, cut):
+                    safe_cut = _piecewise_blank_cut(page, low, high)
+                    if safe_cut is None:
+                        # Preserve the uncut source and continue with the
+                        # other rows; keep its already-rendered Jianpu on an
+                        # appendix page instead of losing it altogether.
+                        row_reports[index]['rendered'] = False
+                        row_reports[index]['source_cut'] = 'unsafe'
+                        for voice in row_reports[index]['voices']:
+                            if voice['rendered']:
+                                voice.update(rendered=False, placement=None, error='no_safe_source_cut')
+                        detached_tiles.append((page_index + 1, index + 1, tiles[index]))
+                        placed -= 1
+                        print(f'  ! 第 {page_index + 1} 页谱表 {index + 1}: 无法安全切开原谱，'
+                              '该行简谱将附在文件末尾，原谱保持完整，请校对。')
+                        continue
+                    cut, overrides = safe_cut
+                    piecewise_rows += 1
+                    row_reports[index]['source_cut'] = 'piecewise'
+                else:
+                    overrides = (_tempo_cut_overrides(page, low, cut, next_top)
+                                 if next_top < page.rect.height else [])
+                    row_reports[index]['source_cut'] = 'tempo_piecewise' if overrides else 'blank'
                 line_tiles = tiles[index]
                 total_ink = sum(ink.height for _, ink, _, _ in line_tiles) + 9 * (len(line_tiles) - 1)
                 spread = max([0.0] + [cut - y for _, _, y in overrides])
@@ -776,6 +866,18 @@ def build(pdf_path: Path, mxl_path: Path, out_path: Path,
                         print(f'  ! 第 {page_index + 1} 页谱表 {index + 1}: 对齐回退 ({placement})')
                     top += ink.height + 9
                 shift += height
+        for source_page, staff_index, line_tiles in detached_tiles:
+            width = max([doc[source_page - 1].rect.width] + [ink.width + 60 for _, ink, _, _ in line_tiles])
+            height = max(120.0, sum(ink.height + 9 for _, ink, _, _ in line_tiles) + 70)
+            appendix = output.new_page(width=width, height=height)
+            appendix.insert_text((30, 25), f'Source page {source_page}, staff {staff_index}', fontsize=10)
+            top = 40.0
+            for tile, ink, _, voice_report in line_tiles:
+                with fitz.open(str(tile)) as src:
+                    target = fitz.Rect(30, top, 30 + ink.width, top + ink.height)
+                    appendix.show_pdf_page(target, src, 0, clip=ink, keep_proportion=False)
+                voice_report['detached_page'] = len(output)
+                top += ink.height + 9
         output.save(str(out_path), garbage=3, deflate=True)
         output.close()
     else:
@@ -791,7 +893,7 @@ def build(pdf_path: Path, mxl_path: Path, out_path: Path,
                   or any(not voice['rendered'] for voice in row['voices']) for row in row_reports)
     mismatches = sum(row['pdf_measures'] != row['musicxml_measures'] for row in row_reports)
     status = ('incomplete' if not staves or missing else
-              'needs_review' if fallback_rows or mismatches or len(score.parts) > 1 else 'rendered')
+              'needs_review' if fallback_rows or mismatches or piecewise_rows or len(score.parts) > 1 else 'rendered')
     try:
         def digest(path):
             hasher = hashlib.sha256()
@@ -806,6 +908,7 @@ def build(pdf_path: Path, mxl_path: Path, out_path: Path,
                   'staff_count': len(staves), 'rendered_staff_count': placed,
                   'incomplete_staff_count': missing, 'alignment_mismatch_count': mismatches,
                   'placement_fallback_count': fallback_rows,
+                  'piecewise_source_cut_count': piecewise_rows,
                   'musicxml_part_count': len(score.parts), 'rows': row_reports}
         _write_json_report(report_path, report)
         print(f'[insitu] 逐行报告: {report_path}（{status}）')
