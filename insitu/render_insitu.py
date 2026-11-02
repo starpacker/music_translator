@@ -259,6 +259,135 @@ def _blank_cut(page, low: float, high: float) -> float:
     return (start + int(row)) / 2
 
 
+def _tile_barlines(page, ink: fitz.Rect, count: int) -> list[float] | None:
+    """Find one rendered row's opening and closing measure dividers."""
+    candidates = []
+    for drawing in page.get_drawings():
+        rect = drawing['rect']
+        if (rect.width < 2.5 and rect.height > 12 and ink.y0 - 1 <= rect.y0
+                and rect.y1 <= ink.y1 + 1 and ink.x0 - 1 <= rect.x0 <= ink.x1 + 1):
+            candidates.append((rect.x0, rect.y0, rect.y1))
+    groups: list[list[tuple[float, float, float]]] = []
+    for candidate in candidates:
+        group = next((g for g in groups if abs(g[0][1] - candidate[1]) < 0.6
+                      and abs(g[0][2] - candidate[2]) < 0.6), None)
+        if group is None:
+            groups.append([candidate])
+        else:
+            group.append(candidate)
+    possible = []
+    for group in groups:
+        xs = []
+        for x, _, _ in sorted(group):
+            if not xs or x - xs[-1] > 5.5:
+                xs.append(x)
+        if len(xs) == count + 1:
+            possible.append(xs)
+    return possible[0] if len(possible) == 1 else None
+
+
+def _blank_column_runs(page, clip: fitz.Rect) -> list[tuple[float, float]]:
+    """Find empty columns where horizontal spacing can change without cutting ink."""
+    import numpy as np
+    scale = 2
+    pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), clip=clip,
+                          alpha=False, colorspace=fitz.csGRAY)
+    pixels = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.stride)
+    clear = np.all(pixels[:, :pix.width] >= 245, axis=0)
+    runs = []
+    start = None
+    for index, blank in enumerate(clear):
+        if blank and start is None:
+            start = index
+        elif not blank and start is not None:
+            if index - start >= 3 and start > 0 and index < len(clear):
+                # Pixmaps are aligned to the device pixel grid, which may
+                # start slightly before the requested floating-point clip.
+                left = (pix.x + start + 0.5) / scale
+                right = (pix.x + index - 0.5) / scale
+                if right > left:
+                    runs.append((left, right))
+            start = None
+    return runs
+
+
+def _place_cell(target_page, source_doc, clip: fitz.Rect, target: fitz.Rect) -> bool:
+    """Fit a cell by changing blank gaps, preserving glyph proportions when possible."""
+    delta = target.width - clip.width
+    gaps = _blank_column_runs(source_doc[0], clip)
+    if abs(delta) < 0.1:
+        target_page.show_pdf_page(target, source_doc, 0, clip=clip, keep_proportion=False)
+        return True
+    if delta > 0 and gaps:
+        cuts = [clip.x0, *[(left + right) / 2 for left, right in gaps], clip.x1]
+        shift = 0.0
+        extra = delta / len(gaps)
+        for left, right in zip(cuts, cuts[1:]):
+            dest = fitz.Rect(target.x0 + left - clip.x0 + shift, target.y0,
+                             target.x0 + right - clip.x0 + shift, target.y1)
+            target_page.show_pdf_page(dest, source_doc, 0,
+                                     clip=fitz.Rect(left, clip.y0, right, clip.y1), keep_proportion=False)
+            shift += extra
+        return True
+    if delta < 0 and gaps:
+        capacity = [max(0.0, right - left - 1.5) for left, right in gaps]
+        total = sum(capacity)
+        if total > 0:
+            # Remove safe whitespace first. If that is insufficient, the
+            # remaining scale is smaller than scaling the entire cell directly.
+            remove = min(-delta, total)
+            scale = target.width / (clip.width - remove)
+            removed = 0.0
+            previous = clip.x0
+            for (left, right), available in zip(gaps, capacity):
+                amount = remove * available / total
+                mid = (left + right) / 2
+                cut_start, cut_end = mid - amount / 2, mid + amount / 2
+                if cut_start > previous:
+                    dest = fitz.Rect(target.x0 + (previous - clip.x0 - removed) * scale, target.y0,
+                                     target.x0 + (cut_start - clip.x0 - removed) * scale, target.y1)
+                    target_page.show_pdf_page(dest, source_doc, 0,
+                                             clip=fitz.Rect(previous, clip.y0, cut_start, clip.y1),
+                                             keep_proportion=False)
+                removed += amount
+                previous = cut_end
+            if clip.x1 > previous:
+                target_page.show_pdf_page(fitz.Rect(target.x0 + (previous - clip.x0 - removed) * scale, target.y0,
+                                                    target.x1, target.y1), source_doc, 0,
+                                          clip=fitz.Rect(previous, clip.y0, clip.x1, clip.y1),
+                                          keep_proportion=False)
+            return scale >= 0.999
+    # No safe blank columns: scale only this measure, preserving all ink.
+    target_page.show_pdf_page(target, source_doc, 0, clip=clip, keep_proportion=False)
+    return False
+
+
+def _place_tile(target_page, tile: Path, ink: fitz.Rect, layout, top: float, count: int) -> str:
+    """Place each Jianpu measure below the corresponding engraved measure."""
+    with fitz.open(str(tile)) as src:
+        bars = _tile_barlines(src[0], ink, count)
+        targets = [layout.staff.x0, *layout.barlines]
+        if bars is None or len(targets) != count + 1:
+            target_page.show_pdf_page(fitz.Rect(layout.staff.x0, top, layout.staff.x0 + ink.width,
+                                                top + ink.height), src, 0, clip=ink, overlay=True)
+            return 'line'
+        # Keep the first line's key label and a final double bar outside cells.
+        if bars[0] - ink.x0 > 0.2:
+            clip = fitz.Rect(ink.x0, ink.y0, bars[0], ink.y1)
+            target_page.show_pdf_page(fitz.Rect(targets[0] - clip.width, top, targets[0], top + ink.height),
+                                      src, 0, clip=clip, keep_proportion=False)
+        unscaled = True
+        for left, right, x0, x1 in zip(bars, bars[1:], targets, targets[1:]):
+            clip = fitz.Rect(left, ink.y0, right, ink.y1)
+            target = fitz.Rect(x0, top, x1, top + ink.height)
+            unscaled = _place_cell(target_page, src, clip, target) and unscaled
+        if ink.x1 - bars[-1] > 0.2:
+            clip = fitz.Rect(bars[-1], ink.y0, ink.x1, ink.y1)
+            target_page.show_pdf_page(fitz.Rect(targets[-1], top, targets[-1] + clip.width, top + ink.height),
+                                      src, 0, clip=clip, keep_proportion=False)
+        return 'aligned' if unscaled else 'scaled'
+
+
 def build(pdf_path: Path, mxl_path: Path, out_path: Path,
           title: Optional[str] = None, expand: bool = False) -> Path:
     staves, slices = align_from_files(pdf_path, mxl_path)
@@ -273,6 +402,7 @@ def build(pdf_path: Path, mxl_path: Path, out_path: Path,
     doc = fitz.open(str(pdf_path))
     tmpdir = Path(tempfile.mkdtemp(prefix='insitu_ly_'))
     placed = 0
+    fallback_rows = 0
     tiles = {}
 
     for sl, layout in zip(slices, staves):
@@ -301,46 +431,44 @@ def build(pdf_path: Path, mxl_path: Path, out_path: Path,
             continue
 
         if expand:
-            tiles[sl.staff_index] = (tile_pdf, ink)
+            tiles[sl.staff_index] = (tile_pdf, ink, len(chunk))
             placed += 1
             continue
 
         page = doc[staff.page - 1]
-        # Natural size, left-aligned at the staff's own left edge.  No rescaling,
-        # so every line keeps the reference 10.96pt glyph size.
         top = staff.bottom + Y_OFFSET
-        target = fitz.Rect(staff.x0, top, staff.x0 + ink.width, top + ink.height)
-
-        src = fitz.open(str(tile_pdf))
-        page.show_pdf_page(target, src, 0, clip=ink, overlay=True)
-        src.close()
+        placement = _place_tile(page, tile_pdf, ink, layout, top, len(chunk))
+        if placement != 'aligned':
+            fallback_rows += 1
+            print(f'  ! 第 {staff.page} 页谱表 {sl.staff_index + 1}: 对齐回退 ({placement})')
         placed += 1
 
     if expand:
         output = fitz.open()
         for page_index, page in enumerate(doc):
-            page_rows = [(i, layout.staff) for i, layout in enumerate(staves)
+            page_rows = [(i, layout) for i, layout in enumerate(staves)
                          if layout.staff.page == page_index + 1 and i in tiles]
             insertions = []
-            for row, (index, staff) in enumerate(page_rows):
-                next_top = page_rows[row + 1][1].top if row + 1 < len(page_rows) else page.rect.height
+            for row, (index, layout) in enumerate(page_rows):
+                staff = layout.staff
+                next_top = page_rows[row + 1][1].staff.top if row + 1 < len(page_rows) else page.rect.height
                 low = min(staff.bottom + 6, next_top - 1)
                 high = min(next_top - 5, staff.bottom + 55)
                 cut = _blank_cut(page, low, max(low + 1, high))
-                tile, ink = tiles[index]
-                insertions.append((cut, max(34.0, ink.height + 18.0), staff.x0, tile, ink))
+                tile, ink, count = tiles[index]
+                insertions.append((cut, max(34.0, ink.height + 18.0), index, layout, tile, ink, count))
             added = sum(item[1] for item in insertions)
             target_page = output.new_page(width=page.rect.width, height=page.rect.height + added)
             previous = shift = 0.0
-            for cut, height, left, tile, ink in insertions:
+            for cut, height, index, layout, tile, ink, count in insertions:
                 if cut > previous:
                     clip = fitz.Rect(0, previous, page.rect.width, cut)
                     target_page.show_pdf_page(fitz.Rect(0, previous + shift, page.rect.width, cut + shift),
                                               doc, page_index, clip=clip)
-                with fitz.open(str(tile)) as src:
-                    target_page.show_pdf_page(fitz.Rect(left, cut + shift + 9,
-                                                        left + ink.width, cut + shift + 9 + ink.height),
-                                              src, 0, clip=ink, overlay=True)
+                placement = _place_tile(target_page, tile, ink, layout, cut + shift + 9, count)
+                if placement != 'aligned':
+                    fallback_rows += 1
+                    print(f'  ! 第 {page_index + 1} 页谱表 {index + 1}: 对齐回退 ({placement})')
                 shift += height
                 previous = cut
             if previous < page.rect.height:
@@ -354,6 +482,8 @@ def build(pdf_path: Path, mxl_path: Path, out_path: Path,
     doc.close()
     shutil.rmtree(tmpdir, ignore_errors=True)
     print(f'placed {placed}/{len(staves)} lines')
+    if fallback_rows:
+        print(f'  ! {fallback_rows} 行因分隔线不明确或空间不足，使用整体放置或压缩；请校对。')
     return out_path
 
 
