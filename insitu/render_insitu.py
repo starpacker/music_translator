@@ -129,7 +129,10 @@ def _jianpu_ly_source(lines: list[str], key_header: str, time_sig: str, title: s
     # Chord cells are written `,135`; a `'`/`,` inside them must know which
     # digit it belongs to or jianpu-ly aborts with "Ambiguous octave marks".
     # The library's own header sets this too (see core/notation/jianpu).
-    head.append('OctavesAfter')
+    # Each tile starts a new LilyPond score. Its automatically restarted bar
+    # numbers would therefore label the fifth bar of every source staff "5",
+    # regardless of the actual measure number, and can resemble musical ink.
+    head += ['OctavesAfter', 'NoBarNums']
     # Layout time signatures are inserted per measure and hidden below.
     head += ['']
     body = [' | '.join(ln) + ' |' for ln in lines if ln]

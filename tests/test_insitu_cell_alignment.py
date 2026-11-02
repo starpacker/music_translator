@@ -9,6 +9,35 @@ import pymupdf
 
 @unittest.skipUnless(shutil.which('lilypond'), 'LilyPond is required by the renderer')
 class CellAlignmentTest(unittest.TestCase):
+    def test_insitu_tile_does_not_restart_bar_numbers_on_each_staff(self):
+        from insitu.render_insitu import _jianpu_ly_source, _render_ly_tile, _run_jianpu_ly
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            measures = ['1 - - -'] * 8
+            ly = _run_jianpu_ly(_jianpu_ly_source([measures], '', '4/4', 'test'), work)
+            tile, _ = _render_ly_tile(ly, work)
+            with pymupdf.open(tile) as doc:
+                # Eight bars of "1" contain no genuine printed "5". LilyPond
+                # otherwise adds a misleading number 5 on every tile.
+                self.assertNotIn('5', doc[0].get_text())
+
+    def test_fifth_bar_number_no_longer_blocks_tie_alignment(self):
+        from insitu.render_insitu import (_jianpu_ly_source, _place_cell, _render_ly_tile,
+                                          _run_jianpu_ly, _tile_barlines)
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            measures = ["- - - 3'", "2'. q1' - -", '- - - #4', '7 - - -',
+                        '- - - -', "6' - - -", "- - - 3'", "5' - - -"]
+            ly = _run_jianpu_ly(_jianpu_ly_source([measures], '', '4/4', 'test'), work)
+            tile, ink = _render_ly_tile(ly, work)
+            with pymupdf.open(tile) as source, pymupdf.open() as target:
+                bars = _tile_barlines(source[0], ink, len(measures))
+                self.assertIsNotNone(bars)
+                clip = pymupdf.Rect(bars[3], ink.y0, bars[4], ink.y1)
+                output = target.new_page(width=200, height=100)
+                self.assertTrue(_place_cell(output, source, clip,
+                                            pymupdf.Rect(20, 20, 72.44, 20 + clip.height)))
+
     def test_real_lilypond_tie_retains_digit_width(self):
         from insitu.render_insitu import (_jianpu_ly_source, _place_cell, _render_ly_tile,
                                           _run_jianpu_ly, _tile_barlines)
