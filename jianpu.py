@@ -282,6 +282,51 @@ def write_pdf_notehead_audit(score_pdf: Path, mxl: Path, work: Path, stem: str) 
     return report
 
 
+def recover_pdf_keys(score_pdf: Path, mxl: Path, work: Path, stem: str) -> Path:
+    """Move corroborated delayed keys in a derived XML, preserving the input."""
+    report = work / f'{stem}.pdf-keys.json'
+    enriched = work / f'{stem}.pdf-keys.musicxml'
+    protected = {score_pdf.resolve(), mxl.resolve()}
+    while report.resolve() in protected:
+        report = report.with_name(report.stem + '.report.json')
+    while enriched.resolve() in protected:
+        enriched = enriched.with_name(enriched.stem + '.derived.musicxml')
+    def write(data):
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=report.parent,
+                                             prefix='.key-report-', suffix='.json', delete=False) as f:
+                temporary = Path(f.name)
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            temporary.replace(report)
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+    try:
+        write({'status': 'in_progress', 'source_pdf': str(score_pdf), 'source_musicxml': str(mxl)})
+        from core.omr.vector_key_changes import discover_pdf_key_changes, write_enriched_keys
+        candidates, decisions = discover_pdf_key_changes(score_pdf, mxl)
+        inserted, skipped = (write_enriched_keys(mxl, enriched, candidates) if candidates else ([], []))
+        write({'status': 'inferred' if inserted else 'no_safe_changes', 'source_pdf': str(score_pdf),
+               'source_pdf_sha256': _sha256_file(score_pdf), 'source_musicxml': str(mxl),
+               'source_musicxml_sha256': _sha256_file(mxl), 'inserted': inserted,
+               'skipped': skipped, 'decisions': decisions})
+        if inserted:
+            print(f'[key] 根据 PDF 字体、符头与相邻谱表推断修正 {len(inserted)} 处调号位置；'
+                  f'请对照原谱，原始 MusicXML 未修改。详情：{report}')
+        if skipped or any(item.get('reason') == 'ambiguous_candidates' for item in decisions):
+            print(f'[key] 部分调号候选无法安全应用，请参阅 {report}。')
+        return enriched if inserted else mxl
+    except Exception as exc:
+        try:
+            write({'status': 'error', 'source_pdf': str(score_pdf), 'source_musicxml': str(mxl),
+                   'inserted': [], 'error': str(exc)})
+        except Exception:
+            pass
+        print(f'[key] PDF 调号位置核对失败，保留已有识谱结果继续：{exc}')
+        return mxl
+
+
 def musicxml_to_jianpu(mxl: Path, out_pdf: Path, title: Optional[str] = None) -> Path:
     """MusicXML → 整页简谱 PDF（music21 → jianpu-ly → LilyPond）。"""
     ensure_sumisora()
@@ -354,6 +399,8 @@ def main(argv: list[str]) -> int:
                     help='不从 PDF 矢量线条推断渐强渐弱线')
     ap.add_argument('--no-pdf-audit', action='store_true',
                     help='不生成 PDF 符头位置和多小节休止数字核对报告')
+    ap.add_argument('--no-vector-keys', action='store_true',
+                    help='不依据 PDF 推断识谱中延迟的调号位置')
     ap.add_argument('--work', type=Path, default=None,
                     help='OMR 中间结果目录（默认 <输出目录>/work）')
     ap.add_argument('--title', default=None, help='标题（默认取输入文件名）')
@@ -392,6 +439,8 @@ def main(argv: list[str]) -> int:
     title = args.title or score.stem
     if not args.no_pdf_audit:
         write_pdf_notehead_audit(score, mxl, work, base.name)
+    if not args.no_vector_keys:
+        mxl = recover_pdf_keys(score, mxl, work, base.name)
     jianpu_mxl = mxl
     if not args.no_vector_tempos and (args.mode in ('jianpu', 'both') or args.engine == 'strip'):
         jianpu_mxl = recover_pdf_tempos(score, mxl, work, base.name)
