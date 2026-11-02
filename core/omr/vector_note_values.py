@@ -14,7 +14,7 @@ _BEAMS_BY_TYPE = {'quarter': 0, 'eighth': 1, '16th': 2, '32nd': 3, '64th': 4,
                   '128th': 5, '256th': 6, '512th': 7, '1024th': 8}
 
 
-def verified_notehead_glyphs(doc, page):
+def verified_music_glyphs(doc, page, codes):
     """Return glyphs only when codepoint and embedded music-font GID agree."""
     fonts, seen = [], set()
     for entry in page.get_fonts(full=True):
@@ -41,13 +41,18 @@ def verified_notehead_glyphs(doc, page):
             continue
         for cp, glyph, (x, y), bbox in span['chars']:
             code = cp - 0xF000 if 0xF000 <= cp <= 0xF0FF else cp
-            if code not in _HEAD_KIND:
+            if code not in codes:
                 continue
             matching = [font for font in fonts if glyph and font.has_glyph(0xF000 + code) == glyph]
             if len(matching) == 1 and _is_engraver(matching[0]):
                 result.append({'x': float(x), 'y': float(y), 'size': float(span['size']),
-                               'bbox': tuple(float(value) for value in bbox), 'kind': _HEAD_KIND[code]})
+                               'bbox': tuple(float(value) for value in bbox), 'code': code})
     return result
+
+
+def verified_notehead_glyphs(doc, page):
+    return [{**glyph, 'kind': _HEAD_KIND[glyph['code']]}
+            for glyph in verified_music_glyphs(doc, page, _HEAD_KIND)]
 
 
 def _beam_vertical_range(drawing, x):

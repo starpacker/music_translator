@@ -279,6 +279,10 @@ def write_pdf_notehead_audit(score_pdf: Path, mxl: Path, work: Path, stem: str) 
                              + values.get('fewer_connected_beams_review', 0))
             if value_reviews:
                 print(f'[audit] {value_reviews} 处符头、装饰音尺寸或符杠证据需核对：{report}')
+            dots = result.get('augmentation_dot_summary', {})
+            if dots.get('dot_count_reviews') or dots.get('unverified_dotted_noteheads'):
+                print(f"[audit] {dots.get('dot_count_reviews', 0)} 处附点数量待复核，"
+                      f"{dots.get('unverified_dotted_noteheads', 0)} 个识别出的附点符头缺少唯一证据：{report}")
     except Exception as exc:
         try:
             write({'status': 'error', 'source_pdf': str(score_pdf), 'source_musicxml': str(mxl),

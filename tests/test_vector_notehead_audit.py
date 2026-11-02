@@ -5,6 +5,7 @@ from pathlib import Path
 import tempfile
 import unittest
 from unittest import mock
+import xml.etree.ElementTree as ET
 
 import jianpu
 import core.omr.vector_notehead_audit as audit
@@ -39,6 +40,29 @@ class NoteheadAuditTest(unittest.TestCase):
             self.assertEqual(result['summary']['supported_head_positions_agree'], 1)
             self.assertEqual(result['note_value_summary']['head_shape_conflicts'], 1)
             self.assertEqual(result['measures'][0]['note_value_evidence']['head_shape_conflicts'][0]['musicxml_type'], 'half')
+            self.assertEqual(xml.read_bytes(), before)
+
+    def test_dot_evidence_is_aggregated_without_rewriting_notes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pdf, xml = make_sources(Path(tmp))
+            tree = ET.parse(xml)
+            first = tree.find('./part/measure/note')
+            divisions = int(tree.findtext('./part/measure/attributes/divisions'))
+            first.find('duration').text = str(3 * divisions)
+            first.insert(list(first).index(first.find('type')) + 1, ET.Element('dot'))
+            tree.write(xml)
+            before = xml.read_bytes()
+            heads = [(100, 125, 20), (200, 122.5, 20)]
+            glyphs = [{'x': 100., 'y': 125., 'size': 20., 'kind': 'half', 'bbox': (100, 110, 107, 127)},
+                      {'x': 200., 'y': 122.5, 'size': 20., 'kind': 'half', 'bbox': (200, 108, 207, 125)}]
+            dots = [{'x': 110., 'y': 123., 'size': 20., 'code': 46, 'bbox': (110, 110, 112, 125)}]
+            with mock.patch.object(audit, '_page_marks', return_value=([], heads, [])), \
+                 mock.patch.object(audit, 'verified_notehead_glyphs', return_value=glyphs), \
+                 mock.patch.object(audit, 'verified_dot_glyphs', return_value=dots):
+                result = audit.audit_pdf_noteheads(pdf, xml)
+            self.assertEqual(result['augmentation_dot_summary']['consistent_dotted_noteheads'], 1)
+            self.assertEqual(result['augmentation_dot_summary']['dot_count_reviews'], 0)
+            self.assertEqual(result['augmentation_dot_summary']['unverified_dotted_noteheads'], 0)
             self.assertEqual(xml.read_bytes(), before)
 
     def test_missing_or_different_heads_are_review_not_guessed_corrections(self):
@@ -96,6 +120,19 @@ class NoteheadAuditTest(unittest.TestCase):
             with mock.patch.object(audit, 'audit_pdf_noteheads', side_effect=RuntimeError('failure')):
                 self.assertEqual(jianpu.write_pdf_notehead_audit(pdf, xml, root, 'out'), report)
             self.assertEqual(json.loads(report.read_text())['status'], 'error')
+
+    def test_dot_disagreement_is_visible_but_does_not_stop_generation(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            pdf, xml = make_sources(root)
+            evidence = {'status': 'partial_evidence', 'summary': {}, 'unmapped_musicxml_indices': [],
+                        'duplicate_musicxml_indices': [], 'note_value_summary': {},
+                        'augmentation_dot_summary': {'dot_count_reviews': 1, 'unverified_dotted_noteheads': 2}}
+            with mock.patch.object(audit, 'audit_pdf_noteheads', return_value=evidence), \
+                 mock.patch('builtins.print') as printed:
+                path = jianpu.write_pdf_notehead_audit(pdf, xml, root, 'out')
+            self.assertEqual(json.loads(path.read_text())['augmentation_dot_summary']['dot_count_reviews'], 1)
+            self.assertTrue(any('附点数量待复核' in str(call) for call in printed.call_args_list))
 
     def test_saved_report_records_input_hashes_and_does_not_modify_sources(self):
         with tempfile.TemporaryDirectory() as tmp:
