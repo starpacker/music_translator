@@ -248,6 +248,8 @@ OMR 结果默认缓存在 `<输出目录>/work/<曲名>.musicxml`，输入内容
 
 整页简谱默认尝试从 PDF 中恢复位于小节起点的矢量四分音符速度标记。程序要求该小节音符的数量与谱表位置能够和 MusicXML 对应，或能确认多小节休止线及其数字；无法确认的标记不会写入。恢复结果是推断，需对照原谱校对；已有 MusicXML 速度不会覆盖。原始 MusicXML 不会修改，派生文件及逐项依据保存在 `work/<输出前缀>.pdf-tempos.musicxml` 和 `.pdf-tempos.json`。如不需要推断，可加 `--no-vector-tempos`。
 
+默认还会写入 `work/<输出前缀>.pdf-noteheads.json`，记录支持的 PDF 矢量符头与 MusicXML 的小节位置对照，以及可唯一定位的多小节休止数字。该报告只提供部分证据，不验证升降号、节奏、其他字体和全局小节对齐，也不能证明识谱准确；不支持的谱面和无法确认的项目会明确标出。多小节休止数量记录在报告中，不写入折叠后的 MusicXML。可用 `--no-pdf-audit` 跳过此报告。
+
 对于带嵌入式 `EngraverFontSet` 的矢量 PDF，整页简谱也会尝试恢复少数可确认的力度字形，并用整小节音符位置核对其对应拍点。已有 MusicXML 力度不会覆盖，无法唯一定位的标记只记录在 `work/<输出前缀>.pdf-dynamics.json`，不自动写入；派生 MusicXML 为 `.pdf-dynamics.musicxml`。这仍是推断，其他字体及扫描谱尚未覆盖；可加 `--no-vector-dynamics` 禁用。
 
 整页简谱会保留 MusicXML 中起止位置能准确对应简谱事件的渐强、渐弱线；无法准确排版的线会提示校对。对于原 PDF 中独立的双线渐强渐弱记号，还会尝试用音符位置和小节边界推断其端点，写入派生的 `.pdf-wedges.musicxml`，报告保存在 `work/<输出前缀>.pdf-wedges.json`。跨行、分离线段或端点不明确的情况不会自动补全；已有 MusicXML 力度线也不会被覆盖。推断结果需对照原谱，可加 `--no-vector-wedges` 禁用。原位版保留原 PDF 的记号，不重复添加这些推断线。

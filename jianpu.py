@@ -235,6 +235,53 @@ def recover_pdf_wedges(score_pdf: Path, source_mxl: Path, input_mxl: Path, work:
         return input_mxl
 
 
+def write_pdf_notehead_audit(score_pdf: Path, mxl: Path, work: Path, stem: str) -> Path:
+    """Record limited vector evidence without modifying either source."""
+    report = work / f'{stem}.pdf-noteheads.json'
+    protected = {score_pdf.resolve(), mxl.resolve()}
+    while report.resolve() in protected:
+        report = report.with_name(report.stem + '.report.json')
+
+    def write(data):
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=report.parent,
+                                             prefix='.notehead-audit-', suffix='.json', delete=False) as f:
+                temporary = Path(f.name)
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            temporary.replace(report)
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+
+    try:
+        write({'status': 'in_progress', 'source_pdf': str(score_pdf), 'source_musicxml': str(mxl)})
+        from core.omr.vector_notehead_audit import audit_pdf_noteheads
+        result = audit_pdf_noteheads(score_pdf, mxl)
+        result.update({'source_pdf': str(score_pdf), 'source_pdf_sha256': _sha256_file(score_pdf),
+                       'source_musicxml': str(mxl), 'source_musicxml_sha256': _sha256_file(mxl)})
+        write(result)
+        if result['status'] == 'unsupported':
+            print(f'[audit] PDF 符头核对不支持此谱面，请人工核对：{report}')
+        else:
+            summary = result['summary']
+            print(f"[audit] PDF 符头位置支持 {summary.get('supported_head_positions_agree', 0)} 个小节，"
+                  f"发现 {summary.get('printed_multirest_count_detected', 0)} 处带数字的多小节休止；"
+                  f'只核对部分证据，不代表识谱准确。详情：{report}')
+            unresolved = sum(n for status, n in summary.items()
+                             if status not in ('supported_head_positions_agree', 'printed_multirest_count_detected'))
+            if unresolved or result['unmapped_musicxml_indices'] or result['duplicate_musicxml_indices']:
+                print(f'[audit] {unresolved} 个谱面位置缺少充分符头证据，或存在未映射/重复小节，请参阅报告。')
+    except Exception as exc:
+        try:
+            write({'status': 'error', 'source_pdf': str(score_pdf), 'source_musicxml': str(mxl),
+                   'error': str(exc)})
+        except Exception:
+            pass
+        print(f'[audit] PDF 符头核对失败，不影响生成，请人工核对：{exc}')
+    return report
+
+
 def musicxml_to_jianpu(mxl: Path, out_pdf: Path, title: Optional[str] = None) -> Path:
     """MusicXML → 整页简谱 PDF（music21 → jianpu-ly → LilyPond）。"""
     ensure_sumisora()
@@ -305,6 +352,8 @@ def main(argv: list[str]) -> int:
                     help='不从 PDF 字体和音符位置推断力度记号')
     ap.add_argument('--no-vector-wedges', action='store_true',
                     help='不从 PDF 矢量线条推断渐强渐弱线')
+    ap.add_argument('--no-pdf-audit', action='store_true',
+                    help='不生成 PDF 符头位置和多小节休止数字核对报告')
     ap.add_argument('--work', type=Path, default=None,
                     help='OMR 中间结果目录（默认 <输出目录>/work）')
     ap.add_argument('--title', default=None, help='标题（默认取输入文件名）')
@@ -341,6 +390,8 @@ def main(argv: list[str]) -> int:
     use_gpu = {'auto': None, 'on': True, 'off': False}[args.gpu]
     mxl = args.mxl or omr_to_musicxml(score, work, use_gpu=use_gpu)
     title = args.title or score.stem
+    if not args.no_pdf_audit:
+        write_pdf_notehead_audit(score, mxl, work, base.name)
     jianpu_mxl = mxl
     if not args.no_vector_tempos and (args.mode in ('jianpu', 'both') or args.engine == 'strip'):
         jianpu_mxl = recover_pdf_tempos(score, mxl, work, base.name)

@@ -101,8 +101,8 @@ def _matched_first_note_x(measure, staff, left, right, heads):
     return events[0][0][0], events[1][0][0] if len(events) > 1 else None
 
 
-def _matched_multirest_x(page, measure, staff, left, right, numbers):
-    """Require a whole rest, a thick middle-line stroke and a printed count."""
+def _matched_multirest_info(page, measure, staff, left, right, numbers):
+    """Return the stroke position and unique printed count, if corroborated."""
     events = list(measure.recurse().notesAndRests)
     if len(events) != 1 or not isinstance(events[0], note.Rest) or events[0].fullMeasure is not True:
         return None
@@ -121,7 +121,13 @@ def _matched_multirest_x(page, measure, staff, left, right, numbers):
               and staff.top - 3 * staff.line_spacing <= y < staff.top]
     if len(counts) != 1:
         return None
-    return float(stroke.x0), None
+    return float(stroke.x0), counts[0]
+
+
+def _matched_multirest_x(page, measure, staff, left, right, numbers):
+    """Return a tempo-compatible first-onset tuple for a confirmed multirest."""
+    info = _matched_multirest_info(page, measure, staff, left, right, numbers)
+    return (info[0], None) if info is not None else None
 
 
 def discover_pdf_tempos(pdf_path: Path, mxl_path: Path):
