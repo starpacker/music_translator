@@ -908,7 +908,8 @@ def _write_json_report(path: Path, report: dict) -> None:
 
 
 def build(pdf_path: Path, mxl_path: Path, out_path: Path,
-          title: Optional[str] = None, expand: bool = False) -> Path:
+          title: Optional[str] = None, expand: bool = False,
+          pitch_mode: str = 'movable') -> Path:
     report_path = out_path.with_suffix('.report.json')
     protected = {pdf_path.resolve(), mxl_path.resolve(), out_path.resolve()}
     while report_path.resolve() in protected:
@@ -925,19 +926,24 @@ def build(pdf_path: Path, mxl_path: Path, out_path: Path,
     staves, slices = align_from_files(pdf_path, mxl_path)
 
     score = parse_musicxml_compatible(mxl_path)
+    if pitch_mode not in ('movable', 'fixed'):
+        raise ValueError(f'unsupported pitch mode: {pitch_mode}')
     tonic, key_header = _get_score_key_tonic(score)
+    if pitch_mode == 'fixed':
+        tonic, key_header = 0, '1=C'
     part = score.parts[0] if score.parts else None
     voice_ids = _get_voice_ids_in_part(part) if part is not None else []
     if len(voice_ids) > 1:
         tracks = [extract_jianpu_measures(score, tonic, _part=part, _voice_id=vid,
                                           _multi_voice_mode=True, _is_primary_voice=(index == 0),
-                                          follow_key_changes=True)
+                                          follow_key_changes=True, pitch_mode=pitch_mode)
                   for index, vid in enumerate(voice_ids)]
         print(f'[insitu] 检测到 {len(tracks)} 个声部，逐行分别排版。')
         if not expand:
             print('[insitu] 多声部需要更多行间空间；建议使用 spaced 模式并校对。')
     else:
-        tracks = [extract_jianpu_measures(score, tonic, follow_key_changes=True)]
+        tracks = [extract_jianpu_measures(score, tonic, follow_key_changes=True,
+                                          pitch_mode=pitch_mode)]
     if len(score.parts) > 1:
         print('[insitu] 检测到多个乐器分部；当前原位对齐仅使用第一个分部，请校对。')
     repeat_bars = _extract_part_repeat_barlines(score.parts[0]) if score.parts else {}

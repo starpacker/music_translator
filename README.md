@@ -199,7 +199,7 @@ GPU 推理初始化失败时，识谱流程会按现有逻辑尝试回退 CPU，
 ### 串行处理整个目录
 
 ```bash
-python batch.py input/吹管 -o output --mode both --engine strip --gpu auto
+python batch.py input/吹管 -o output --mode both --engine strip --pitch-mode movable --gpu auto
 ```
 
 逐份处理目录内 PDF，输出 `<曲名>.jianpu.pdf`、`<曲名>.insitu.pdf` 和逐份日志。
@@ -237,6 +237,18 @@ python jianpu.py 曲笛.pdf --mode insitu --engine strip
 
 ```bash
 python jianpu.py 曲笛.pdf --mxl 曲笛.musicxml --mode both
+```
+
+### 简谱唱名模式
+
+默认使用首调（`--pitch-mode movable`）：主音唱作 `1`，调号变化时数字随调性变化，并在需要处标出 `1=G` 等调号提示。
+固定调使用 `--pitch-mode fixed`：C 始终为 `1`、D 为 `2`，按音名拼写显示升降号；调号变化不会改变数字所对应的音名。
+两种模式都适用于整页简谱和 `stamp` / `spaced` 原位简谱；`strip` 通过整页简谱排版，因此也使用同一设置。
+
+```bash
+python jianpu.py 曲笛.pdf --pitch-mode fixed       # 固定调，两种 PDF 都生成
+python jianpu.py 曲笛.pdf --mode insitu --pitch-mode movable  # 首调原位简谱
+python batch.py input/吹管 -o output --pitch-mode fixed  # 批量生成固定调简谱
 ```
 
 OMR 结果默认缓存在 `<输出目录>/work/<曲名>.musicxml`，输入内容、设备选择、Homr 版本及识谱处理代码一致时才复用；没有缓存元数据的旧缓存会重新识谱：
@@ -295,6 +307,7 @@ python jianpu.py 曲笛.pdf --mode jianpu -o out/曲笛-简谱.pdf
 | `-o, --output` | 输出文件；`mode=both` 时作为前缀。默认与输入同名同目录 |
 | `--mode {jianpu,insitu,both}` | 产物类型，默认 `both` |
 | `--engine {spaced,stamp,strip}` | 原位简谱的实现方式，默认 `spaced` |
+| `--pitch-mode {movable,fixed}` | 首调（默认）或固定调（C=1） |
 | `--mxl` | 已有的 MusicXML，给出后跳过 OMR |
 | `--work` | OMR 中间结果目录，默认 `<输出目录>/work` |
 | `--title` | 简谱标题，默认取输入文件名 |
@@ -411,7 +424,7 @@ python jianpu.py 曲笛.pdf --mode jianpu -o out/曲笛-简谱.pdf
 - **OMR 精度决定上限**。识别错音、错时值会原样带到简谱里；原位简谱能让你一眼看出错在哪一行，这正是它的用处。
 - **`strip` 引擎的行检测是针对 MuseScore 矢量导出调的**。其它软件（Finale、Sibelius、Dorico）导出的 PDF 可能需要微调 `score_align.Config` 里的边距参数；`stamp` 引擎依赖 `pdf_structure.py` 读矢量谱线，纯扫描件请先转矢量。
 - **跨页 / 跨行连音线**会在原位谱行首、行尾添加续接标记；部分和弦延音也会在可匹配的端点显示续接弧线。复杂跨行情况仍需核对。
-- **调号**按首调（`1=D` 之类）标注；临时升降号会在音符前带 `#`/`b`。
+- **调号**默认按首调标注（`1=D` 之类）；`--pitch-mode fixed` 固定 C 为 `1` 并按音名显示升降号。临时升降号会在音符前带 `#`/`b`。
 
 ---
 

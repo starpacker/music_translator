@@ -276,11 +276,13 @@ def _measure_text_with_tempos(notes: list[JianpuNote], marks: list[tuple[float, 
     return ' '.join(words)
 
 
-def parse_score_to_jianpu(score) -> tuple[list[list[JianpuNote]], list[str], str]:
+def parse_score_to_jianpu(score, pitch_mode: str = 'movable') -> tuple[list[list[JianpuNote]], list[str], str]:
     """Parse a score into jianpu format; return (measures, header_lines, time_sig)."""
     key_tonic_semitone, key_header = _get_score_key_tonic(score)
+    if pitch_mode == 'fixed':
+        key_tonic_semitone, key_header = 0, '1=C'
 
-    measures, time_signature = extract_jianpu_measures(score, key_tonic_semitone)
+    measures, time_signature = extract_jianpu_measures(score, key_tonic_semitone, pitch_mode=pitch_mode)
     header_lines: list[str] = [f'{key_header} {time_signature}', '']
 
     measures_per_line = choose_measures_per_line(measures)
@@ -341,15 +343,18 @@ def build_jianpu_ly_text_from_measures(
 @overload
 def build_jianpu_ly_text(score, title: str, use_strict_timing: bool = False,
                           composer: str = '', tempo: int = 0,
-                          _return_groups: Literal[False] = False, *, _source_wedges=None) -> str: ...
+                          _return_groups: Literal[False] = False, *, _source_wedges=None,
+                          pitch_mode: str = 'movable') -> str: ...
 @overload
 def build_jianpu_ly_text(score, title: str, use_strict_timing: bool = False,
                           composer: str = '', tempo: int = 0,
                           *, _return_groups: Literal[True], _source_wedges=None,
+                          pitch_mode: str = 'movable',
                           ) -> tuple[str, list[list[int]], dict[int, dict[str, bool]]]: ...
 def build_jianpu_ly_text(score, title: str, use_strict_timing: bool = False,
                           composer: str = '', tempo: int = 0,
-                          _return_groups: bool = False, *, _source_wedges=None):
+                          _return_groups: bool = False, *, _source_wedges=None,
+                          pitch_mode: str = 'movable'):
     """Build jianpu-ly plain-text for all parts in the score.
 
     For single-part scores the output is identical to the previous behaviour,
@@ -369,7 +374,11 @@ def build_jianpu_ly_text(score, title: str, use_strict_timing: bool = False,
         jianpu staff. Explicit independent voices are currently kept on separate
         staves to avoid overlapping numbered notes.
     """
+    if pitch_mode not in ('movable', 'fixed'):
+        raise ValueError(f'unsupported pitch mode: {pitch_mode}')
     key_tonic_semitone, key_header_line = _get_score_key_tonic(score)
+    if pitch_mode == 'fixed':
+        key_tonic_semitone, key_header_line = 0, '1=C'
     if _source_wedges is None:
         from music21 import dynamics as m21dynamics
         if list(score.recurse().getElementsByClass(m21dynamics.DynamicWedge)):
@@ -395,9 +404,10 @@ def build_jianpu_ly_text(score, title: str, use_strict_timing: bool = False,
             # Single voice (or strict mode) — existing behaviour
             fn = extract_strict_jianpu_measures if use_strict_timing else extract_jianpu_measures
             if use_strict_timing:
-                measures, _time_sig = fn(score, key_tonic_semitone)
+                measures, _time_sig = fn(score, key_tonic_semitone, pitch_mode=pitch_mode)
             else:
-                measures, _time_sig = fn(score, key_tonic_semitone, follow_key_changes=True)
+                measures, _time_sig = fn(score, key_tonic_semitone, follow_key_changes=True,
+                                         pitch_mode=pitch_mode)
             _sections = [measures]
             _section_parts = [part if part is not None else score]
             _voice_groups = [[0]]
@@ -411,7 +421,8 @@ def build_jianpu_ly_text(score, title: str, use_strict_timing: bool = False,
             for i, vid in enumerate(_v_ids):
                 measures, ts = extract_jianpu_measures(
                     score, key_tonic_semitone, _part=part, _voice_id=vid,
-                    _multi_voice_mode=True, _is_primary_voice=(i == 0), follow_key_changes=True)
+                    _multi_voice_mode=True, _is_primary_voice=(i == 0), follow_key_changes=True,
+                    pitch_mode=pitch_mode)
                 if not _ts_set:
                     _time_sig, _ts_set = ts, True
                 if measures:
@@ -426,7 +437,8 @@ def build_jianpu_ly_text(score, title: str, use_strict_timing: bool = False,
         for part in _parts:
             if use_strict_timing:
                 # Strict mode flattens all voices; emit one section per part
-                measures, ts = extract_strict_jianpu_measures(score, key_tonic_semitone, _part=part)
+                measures, ts = extract_strict_jianpu_measures(score, key_tonic_semitone, _part=part,
+                                                               pitch_mode=pitch_mode)
                 if not _ts_set:
                     _time_sig, _ts_set = ts, True
                 if measures:
@@ -438,7 +450,7 @@ def build_jianpu_ly_text(score, title: str, use_strict_timing: bool = False,
                 if len(voice_ids) <= 1:
                     # No multi-voice structure — one section for the whole part
                     measures, ts = extract_jianpu_measures(score, key_tonic_semitone, _part=part,
-                                                           follow_key_changes=True)
+                                                           follow_key_changes=True, pitch_mode=pitch_mode)
                     if not _ts_set:
                         _time_sig, _ts_set = ts, True
                     if measures:
@@ -455,7 +467,8 @@ def build_jianpu_ly_text(score, title: str, use_strict_timing: bool = False,
                     for i, vid in enumerate(voice_ids):
                         measures, ts = extract_jianpu_measures(
                             score, key_tonic_semitone, _part=part, _voice_id=vid,
-                            _multi_voice_mode=True, _is_primary_voice=(i == 0), follow_key_changes=True)
+                            _multi_voice_mode=True, _is_primary_voice=(i == 0), follow_key_changes=True,
+                            pitch_mode=pitch_mode)
                         if not _ts_set:
                             _time_sig, _ts_set = ts, True
                         if measures:

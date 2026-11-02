@@ -789,6 +789,7 @@ def render_score_to_jianpu_pdf(
     composer: str = '',
     tempo: int = 0,
     source_wedges=None,
+    pitch_mode: str = 'movable',
 ) -> tuple[bool, list[list[int]], dict[int, dict[str, bool]]]:
     """
     Render a music21 score to jianpu PDF.
@@ -804,7 +805,8 @@ def render_score_to_jianpu_pdf(
     _repeat_barlines: dict = {}
     try:
         _jly_result = build_jianpu_ly_text(score, title, composer=composer, tempo=tempo,
-                                          _return_groups=True, _source_wedges=source_wedges)
+                                          _return_groups=True, _source_wedges=source_wedges,
+                                          pitch_mode=pitch_mode)
         txt_content, _voice_groups, _repeat_barlines = cast(
             tuple[str, list[list[int]], dict], _jly_result
         )
@@ -813,7 +815,7 @@ def render_score_to_jianpu_pdf(
         log_message(f'[jianpu] 标准 jianpu-ly 文本生成失败 ({exc})，尝试使用简化处理', logging.WARNING)
         try:
             from ..notation.jianpu import parse_score_to_jianpu, build_jianpu_ly_text_from_measures
-            measures, header_lines, time_sig = parse_score_to_jianpu(score)
+            measures, header_lines, time_sig = parse_score_to_jianpu(score, pitch_mode=pitch_mode)
             key_header = header_lines[0].split()[0] if header_lines else '1=C'
             txt_content = build_jianpu_ly_text_from_measures(measures, time_sig, key_header, title,
                                                               composer=composer, tempo=tempo)
@@ -827,7 +829,7 @@ def render_score_to_jianpu_pdf(
 
     try:
         from ..notation.jianpu import parse_score_to_jianpu
-        measures, header_lines, _ = parse_score_to_jianpu(score)
+        measures, header_lines, _ = parse_score_to_jianpu(score, pitch_mode=pitch_mode)
     except Exception as exc:
         log_message(f'[jianpu] parse_score_to_jianpu 失败: {exc}，跳过中间产物保存', logging.WARNING)
         measures, header_lines = [], []
@@ -847,7 +849,8 @@ def render_score_to_jianpu_pdf(
         log_message('文本版 jianpu-ly 失败，尝试严格按拍号重建简谱。', logging.WARNING)
 
     strict_txt_content = build_jianpu_ly_text(score, title, use_strict_timing=True,
-                                               composer=composer, tempo=tempo)
+                                               composer=composer, tempo=tempo,
+                                               pitch_mode=pitch_mode)
     txt_path.write_text(strict_txt_content, encoding='utf-8')  # type: ignore[arg-type]
     if render_jianpu_ly(txt_path, ly_path):
         log_message(f'已通过严格拍号重建生成 jianpu-ly 文件: {ly_path.name}')
@@ -1063,6 +1066,7 @@ def generate_jianpu_pdf_from_mxl(
     editor_workspace_dir: Optional[Path] = None,
     composer: str = '',
     tempo_bpm: int = 0,
+    pitch_mode: str = 'movable',
 ) -> bool:
     """
     Generate a jianpu PDF from MusicXML: parse MXL → render jianpu PDF directly.
@@ -1140,6 +1144,7 @@ def generate_jianpu_pdf_from_mxl(
         result, _voice_groups_out, _repeat_barlines_out = render_score_to_jianpu_pdf(
             source_score, title, output_pdf_path, temp_dir, txt_path, ly_path,
             composer=composer, tempo=tempo_bpm, source_wedges=source_wedges,
+            pitch_mode=pitch_mode,
         )
 
         # Preserve editor workspace files when the conversion succeeded

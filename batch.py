@@ -15,6 +15,7 @@ def main(argv=None):
     parser.add_argument('--work', type=Path, default=None)
     parser.add_argument('--mode', choices=('both', 'jianpu', 'insitu'), default='both')
     parser.add_argument('--engine', choices=('spaced', 'strip', 'stamp'), default='spaced')
+    parser.add_argument('--pitch-mode', choices=('movable', 'fixed'), default='movable')
     parser.add_argument('--gpu', choices=('auto', 'on', 'off'), default='auto')
     args = parser.parse_args(argv)
     if not args.input.is_dir():
@@ -30,7 +31,7 @@ def main(argv=None):
         command = [sys.executable, '-u', str(Path(__file__).with_name('jianpu.py')),
                    str(score.resolve()), '-o', str((args.output / score.stem).resolve()),
                    '--work', str((work / score.stem).resolve()), '--mode', args.mode,
-                   '--engine', args.engine, '--gpu', args.gpu]
+                   '--engine', args.engine, '--pitch-mode', args.pitch_mode, '--gpu', args.gpu]
         log = args.output / f'{score.stem}.log'
         with log.open('w', encoding='utf-8') as stream:
             result = subprocess.run(command, stdout=stream, stderr=subprocess.STDOUT)

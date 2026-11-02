@@ -338,7 +338,8 @@ def recover_pdf_keys(score_pdf: Path, mxl: Path, work: Path, stem: str) -> Path:
         return mxl
 
 
-def musicxml_to_jianpu(mxl: Path, out_pdf: Path, title: Optional[str] = None) -> Path:
+def musicxml_to_jianpu(mxl: Path, out_pdf: Path, title: Optional[str] = None,
+                       pitch_mode: str = 'movable') -> Path:
     """MusicXML → 整页简谱 PDF（music21 → jianpu-ly → LilyPond）。"""
     ensure_sumisora()
     from core.render.renderer import generate_jianpu_pdf_from_mxl   # noqa: PLC0415
@@ -347,7 +348,7 @@ def musicxml_to_jianpu(mxl: Path, out_pdf: Path, title: Optional[str] = None) ->
     tmp = Path(tempfile.mkdtemp(prefix='jianpu_'))
     try:
         ok = generate_jianpu_pdf_from_mxl(
-            mxl, out_pdf, tmp, preferred_title=title or mxl.stem)
+            mxl, out_pdf, tmp, preferred_title=title or mxl.stem, pitch_mode=pitch_mode)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     if not ok or not out_pdf.is_file():
@@ -359,13 +360,15 @@ def musicxml_to_jianpu(mxl: Path, out_pdf: Path, title: Optional[str] = None) ->
 # ── 步骤 3：原位简谱 ────────────────────────────────────────────────────────
 
 def insitu_stamp(score_pdf: Path, mxl: Path, out_pdf: Path,
-                 title: Optional[str] = None, expand: bool = False) -> Path:
+                 title: Optional[str] = None, expand: bool = False,
+                 pitch_mode: str = 'movable') -> Path:
     """矢量贴字：把每行简谱贴到对应谱表正下方，页码和原谱完全一致。"""
     sys.path.insert(0, str(HERE / 'insitu'))
     import render_insitu                                     # noqa: PLC0415
 
     out_pdf.parent.mkdir(parents=True, exist_ok=True)
-    render_insitu.build(score_pdf, mxl, out_pdf, title=title or score_pdf.stem, expand=expand)
+    render_insitu.build(score_pdf, mxl, out_pdf, title=title or score_pdf.stem,
+                        expand=expand, pitch_mode=pitch_mode)
     print(f'[insitu] -> {out_pdf}  ({out_pdf.stat().st_size/1024:.0f} KB)')
     return out_pdf
 
@@ -401,6 +404,8 @@ def main(argv: list[str]) -> int:
     ap.add_argument('--engine', choices=('spaced', 'stamp', 'strip'), default='spaced',
                     help='原位简谱：spaced=矢量插入空白（默认）；stamp=矢量贴字；'
                          'strip=插条并加长页面')
+    ap.add_argument('--pitch-mode', choices=('movable', 'fixed'), default='movable',
+                    help='简谱音高：movable=首调（默认），fixed=固定调（C=1）')
     ap.add_argument('--mxl', type=Path, default=None, help='已有的 MusicXML（跳过 OMR）')
     ap.add_argument('--no-vector-tempos', action='store_true',
                     help='不从 PDF 矢量文字推断速度记号')
@@ -461,7 +466,8 @@ def main(argv: list[str]) -> int:
         jianpu_mxl = recover_pdf_wedges(score, mxl, jianpu_mxl, work, base.name)
 
     if args.mode in ('jianpu', 'both'):
-        musicxml_to_jianpu(jianpu_mxl, base.parent / f'{base.name}.jianpu.pdf', title)
+        musicxml_to_jianpu(jianpu_mxl, base.parent / f'{base.name}.jianpu.pdf', title,
+                           pitch_mode=args.pitch_mode)
 
     if args.mode in ('insitu', 'both'):
         out = base.parent / f'{base.name}.insitu.pdf'
@@ -470,10 +476,11 @@ def main(argv: list[str]) -> int:
             # In insitu-only mode an existing PDF may belong to a previous
             # MusicXML or source score; it is not a validated cache.
             if args.mode == 'insitu':
-                musicxml_to_jianpu(jianpu_mxl, ref, title)
+                musicxml_to_jianpu(jianpu_mxl, ref, title, pitch_mode=args.pitch_mode)
             insitu_strip(score, ref, out)
         else:
-            insitu_stamp(score, mxl, out, title, expand=args.engine == 'spaced')
+            insitu_stamp(score, mxl, out, title, expand=args.engine == 'spaced',
+                         pitch_mode=args.pitch_mode)
     return 0
 
 
