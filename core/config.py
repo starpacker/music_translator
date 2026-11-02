@@ -155,3 +155,5 @@ class JianpuNote:
     tuplet_type: Optional[str] = None
     tuplet_start: bool = False
     tuplet_stop: bool = False
+    # Safe, whitelisted LilyPond post-events attached to this exact event.
+    notations: tuple[str, ...] = ()

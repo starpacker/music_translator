@@ -1349,7 +1349,7 @@ def fix_fullwidth(t):
     if type(u"")==type(""): return utext
     else: return utext.encode('utf-8')
 
-def graceNotes_markup(notes,word,line,isAfter,harmonic=False):
+def graceNotes_markup(notes,word,line,isAfter,harmonic=False,marks_by_index=None):
     if lilypond_minor_version()<22: errExit("grace notes requires Lilypond 2.22+, we found 2."+str(lilypond_minor_version()))
     thinspace = u'\u2009'
     if not type("")==type(u""): thinspace = thinspace.encode('utf-8')
@@ -1371,6 +1371,7 @@ def graceNotes_markup(notes,word,line,isAfter,harmonic=False):
     figure = ""
     octave = ""
     mr = []
+    note_index = 0
     if isAfter: mr.append(r"\once \override Score.JianpuGraceCurve.direction = #LEFT ")
     mr.append(r"\jianpuGraceCurveStart ")
     for i in xrange(len(notes)):
@@ -1395,6 +1396,9 @@ def graceNotes_markup(notes,word,line,isAfter,harmonic=False):
             figure = n
             mr.append(notemark(figure, beams, "", octave, accidental, "", "", "")[5])
             if harmonic: mr[-1]+=r" \flageolet " # deal with harmonic articulations
+            if marks_by_index and note_index in marks_by_index:
+                mr[-1] += ' ' + ' '.join(marks_by_index[note_index]) + ' '
+            note_index += 1
             accidental = ""
             beams = 2 # reset after each note
             figure = ""
@@ -1422,12 +1426,13 @@ def grace_octave_fix(notes,word,line):
             else: msg += ":"
             scoreError(msg,word,line)
     return n2.replace(chr(0),"").replace("8","'1").replace("9","'2")
-def gracenotes_western(notes,word,line):
+def gracenotes_western(notes,word,line,marks_by_index=None):
     # for western and MIDI staffs
     notes = grace_octave_fix(notes,word,line)
     nextAcc = "" ; next8ve = "'"
     r = []
     duration = 16
+    note_index = 0
     for i in xrange(len(notes)):
         n = notes[i]
         if n=='#': nextAcc = "is"
@@ -1446,8 +1451,38 @@ def gracenotes_western(notes,word,line):
         else:
             if not n in placeholders: continue # TODO: errExit ?
             r.append(placeholders[n]+nextAcc+next8ve+str(duration))
+            if marks_by_index and note_index in marks_by_index:
+                r[-1] += ' ' + ' '.join(marks_by_index[note_index])
+            note_index += 1
             nextAcc = "" ; next8ve = "'"
     return ' '.join(r)
+
+
+_GRACE_MARK_NAMES = ('accent', 'marcato', 'staccato', 'staccatissimo', 'tenuto',
+                     'fermata', 'trill', 'mordent', 'prall', 'turn', 'reverseturn')
+
+
+def merge_marked_grace_groups(line):
+    """Keep consecutive grace notes in one group while retaining per-note marks."""
+    grace = r"g\[[#b',1-9qsdh]+\]"
+    mark = r"GraceMark:[\^_]?\\(?:" + '|'.join(sorted(_GRACE_MARK_NAMES, key=len, reverse=True)) + r")(?![A-Za-z])"
+    pattern = r'(?<!\S)(?:' + grace + r'(?:\s+' + mark + r')*\s+)+' + grace + r'(?:\s+' + mark + r')*(?=\s|$)'
+    def merge(match):
+        parts = re.findall(grace + '|' + mark, match.group(0))
+        notes, marks, index = [], {}, -1
+        for part in parts:
+            if part.startswith('g['):
+                content = part[2:-1]
+                notes.append(content)
+                index += sum(char in '123456789' for char in content)
+            else:
+                value = part[len('GraceMark:'):].replace('\\', '')
+                marks.setdefault(index, []).append(value)
+        if not marks:
+            return match.group(0)
+        spec = ';'.join(str(i) + '=' + ','.join(values) for i, values in sorted(marks.items()))
+        return 'g[' + ''.join(notes) + ']@' + spec
+    return re.sub(pattern, merge, line)
 def chordNotes_markup(notes,word,line):
     notes = grace_octave_fix(notes,word,line) # ensures octaves and accidentals come before notes
     accidental = ""
@@ -1641,6 +1676,7 @@ def getLY(score,headers=None,have_final_barline=True):
         # First, merge multiple grace notes.  This is needed for the
         # output of some MusicXML conversions, and might be useful to
         # have around anyway:
+        line=merge_marked_grace_groups(line)
         line=re.sub(r"(?<!\S)(g\[[#b',1-9qsdh]+\]\s*)+g\[([#b',1-9qsdh]+)\](?=\s|$)",lambda m:re.sub(r"\]\s*g\[","",m.group()),line)
         # To support multi-word text above/below the stave, we'll
         # replace space with chr(0) inside quoted strings so they
@@ -1798,6 +1834,13 @@ def getLY(score,headers=None,have_final_barline=True):
                 notehead_markup.barPos = oldBarPos
                 repeatStack.append((numBraces,oldBarPos,extraRepeats+1,rStartP))
                 out[rStartP] = out[rStartP].replace(('volta %d ' % (extraRepeats+1)),('volta %d ' % (extraRepeats+2))) # ensure there's enough repeats for the alternatives
+            elif word.startswith('GraceMark:'):
+                mark = word[len('GraceMark:'):]
+                if not re.match(r"^[\^_]?\\(?:accent|marcato|staccato|staccatissimo|tenuto|fermata|trill|mordent|prall|turn|reverseturn)$", mark):
+                    scoreError("Unsupported grace-note mark",word,line)
+                if not out or not out[-1].startswith(r'\grace { ') or not out[-1].endswith(' }'):
+                    scoreError("Grace-note mark has no preceding grace note",word,line)
+                out[-1] = out[-1][:-2] + ' ' + mark + ' }'
             elif word.startswith("\\") or word.startswith('^\\') or word.startswith('_\\') or word in ["(",")","~","->","|"] or word.startswith('^"') or word.startswith('_"'):
                 # Lilypond command, \p, ^"text", barline check (undocumented, see above), etc
                 if re.match(r"\\[.,'cqsdh\\#b]*[0-9x-][0-9x.,'cqsdh\\#b-]*$",word): sys.stderr.write("Warning: '"+word+"' is being interpreted as a Lilypond command.\nIf you meant it as a note, move the \\ away from the start.\n")
@@ -1825,9 +1868,27 @@ def getLY(score,headers=None,have_final_barline=True):
             elif word==']': # tuplet end
                 out.append("}")
                 notehead_markup.tuplet = (1,1)
-            elif re.match(r"g\[[#b',1-9qsdh]+\]$",word):
-                if midi or western: out.append(r"\grace { " + gracenotes_western(word[2:-1],word,line) + " }")
-                else: out.append(r"\grace { " + graceNotes_markup(word[2:-1],word,line,0,isInHarmonic) + " }")
+            elif re.match(r"g\[[#b',1-9qsdh]+\](?:@[0-9=,;^_a-z]+)?$",word):
+                grace_word, _, spec = word.partition('@')
+                notes = grace_word[2:-1]
+                marks = {}
+                if spec:
+                    for assignment in spec.split(';'):
+                        try:
+                            index_text, values = assignment.split('=', 1)
+                            index = int(index_text)
+                            if index < 0 or index >= sum(c in '123456789' for c in notes):
+                                raise ValueError('invalid grace note index')
+                            for value in values.split(','):
+                                direction = value[0] if value and value[0] in '^_' else ''
+                                name = value[len(direction):]
+                                if name not in _GRACE_MARK_NAMES:
+                                    raise ValueError('unsupported grace mark')
+                                marks.setdefault(index, []).append(direction + '\\' + name)
+                        except (ValueError, IndexError):
+                            scoreError("Invalid grace-note marks",word,line)
+                if midi or western: out.append(r"\grace { " + gracenotes_western(notes,word,line,marks) + " }")
+                else: out.append(r"\grace { " + graceNotes_markup(notes,word,line,0,isInHarmonic,marks) + " }")
             elif re.match(r"\[[#b',1-9,q,s,d,h]+\]g$",word):
                 if midi or western: out[lastPtr] = r" \afterGrace { " + out[lastPtr] + " } { " + gracenotes_western(word[1:-2],word,line) + " }"
                 else: out[lastPtr] = r" \afterGrace { " + out[lastPtr] + " } { " + graceNotes_markup(word[1:-2],word,line,1,isInHarmonic) + " }"

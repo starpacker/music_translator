@@ -711,6 +711,8 @@ def render_score_to_jianpu_pdf(
     else:
         log_message('MIDI 中转后的严格拍号路径也失败，切换到备用简谱排版。', logging.WARNING)
 
+    if any(getattr(event, 'notations', ()) for measure in measures for event in measure):
+        log_message('[jianpu] 备用图形或文字排版不能完整显示音符演奏记号，请校对。', logging.WARNING)
     font_name = register_pdf_font()
     try:
         create_pdf(output_pdf_path, title, measures, header_lines, font_name, lyrics_lines)

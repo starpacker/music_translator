@@ -8,13 +8,24 @@ produce differences that require review.
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import json
 from pathlib import Path
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from music21 import chord, converter, note, spanner
+from music21 import articulations, chord, converter, expressions, note, spanner
 from core.notation.jianpu import _get_score_key_tonic, extract_jianpu_measures
+
+
+_SUPPORTED_MARKS = {
+    articulations.Accent: 'accent', articulations.StrongAccent: 'marcato',
+    articulations.Staccato: 'staccato', articulations.Staccatissimo: 'staccatissimo',
+    articulations.Tenuto: 'tenuto', expressions.Fermata: 'fermata',
+    expressions.Trill: 'trill', expressions.Mordent: 'mordent',
+    expressions.InvertedMordent: 'prall', expressions.Turn: 'turn',
+    expressions.InvertedTurn: 'reverseturn',
+}
 
 
 def audit(path: Path) -> dict:
@@ -33,6 +44,7 @@ def audit(path: Path) -> dict:
                 and not any(getattr(event.duration, 'isGrace', False) for event in (ends[0], ends[-1]))):
             comparable_slurs.append(slur)
     mismatches = []
+    source_mark_counts, jianpu_mark_counts, unsupported_marks = Counter(), Counter(), Counter()
     previous_pitches = None
     reference = tonic
     for index in range(max(len(original), len(extracted))):
@@ -91,6 +103,28 @@ def audit(path: Path) -> dict:
         source_order = ['rest' if isinstance(event, note.Rest) else 'note'
                         for event in canonical_measure.recurse().notesAndRests]
         target_order = ['rest' if event.is_rest else 'note' for event in extracted[index]]
+        source_marks = []
+        for event in canonical_measure.recurse().notesAndRests:
+            marks = []
+            for mark in (*event.articulations, *event.expressions):
+                name = _SUPPORTED_MARKS.get(type(mark))
+                if name is None:
+                    unsupported_marks[type(mark).__name__] += 1
+                else:
+                    marks.append(name)
+                    source_mark_counts[name] += 1
+            source_marks.append(sorted(marks))
+        target_marks = []
+        for event in extracted[index]:
+            marks = sorted(mark.lstrip('^_').removeprefix('\\') for mark in event.notations)
+            target_marks.append(marks)
+            jianpu_mark_counts.update(marks)
+        # Empty per-event mark lists can differ merely because an unmarked
+        # note or rest is missing; the event comparison already reports that.
+        if source_marks != target_marks and (any(source_marks) or any(target_marks)):
+            mismatches.append({'index': index + 1, 'measure_number': str(original[index].number),
+                               'reason': 'note_mark_placement', 'source_marks': source_marks,
+                               'jianpu_marks': target_marks})
         if (source != target or source_rests != target_rests or source_order != target_order
                 or source_rest_tuplets != target_rest_tuplets):
             mismatches.append({'index': index + 1, 'measure_number': str(original[index].number),
@@ -115,6 +149,9 @@ def audit(path: Path) -> dict:
                                             if event.tie and event.tie.type in ('stop', 'continue')),
             'jianpu_tie_continuations': sum(1 for measure in extracted for event in measure
                                             if event.symbol == '-'),
+            'source_supported_note_marks': dict(source_mark_counts),
+            'jianpu_supported_note_marks': dict(jianpu_mark_counts),
+            'source_unsupported_note_marks': dict(unsupported_marks),
             'mismatch_count': len(mismatches), 'mismatches': mismatches}
 
 

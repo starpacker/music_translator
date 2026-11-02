@@ -3,7 +3,7 @@
 import logging as _logging
 from fractions import Fraction
 
-from music21 import chord as m21chord, note as m21note
+from music21 import articulations as m21art, chord as m21chord, expressions as m21expr, note as m21note
 
 from ...config import (
     ALLOWED_JIANPU_DURATIONS,
@@ -298,7 +298,36 @@ def _pitch_to_fields(pitch, key_tonic_semitone: int) -> tuple[str, str, int, int
     return accidental, symbol, upper_dots, lower_dots, note_midi
 
 
+def _source_notations(element) -> tuple[str, ...]:
+    """Convert recognized note-level marks to safe LilyPond post-events."""
+    kinds = {
+        m21art.Accent: 'accent', m21art.StrongAccent: 'marcato',
+        m21art.Staccato: 'staccato', m21art.Staccatissimo: 'staccatissimo',
+        m21art.Tenuto: 'tenuto', m21expr.Fermata: 'fermata',
+        m21expr.Trill: 'trill', m21expr.Mordent: 'mordent',
+        m21expr.InvertedMordent: 'prall', m21expr.Turn: 'turn',
+        m21expr.InvertedTurn: 'reverseturn',
+    }
+    result = []
+    for mark in (*getattr(element, 'articulations', ()), *getattr(element, 'expressions', ())):
+        command = kinds.get(type(mark))
+        if command is None:
+            _log_message(f'[jianpu] 未支持的音符演奏记号 {type(mark).__name__}，请校对。', _logging.WARNING)
+            continue
+        if isinstance(mark, m21expr.Fermata) and getattr(mark, 'shape', 'normal') not in ('normal', None):
+            _log_message('[jianpu] 特殊延长记号形状暂按普通延长记号显示，请校对。', _logging.WARNING)
+        if type(mark) is m21art.StrongAccent and getattr(mark, 'pointDirection', 'up') != 'up':
+            _log_message('[jianpu] 强重音的方向未必能准确还原，请校对。', _logging.WARNING)
+        if any(getattr(mark, attr, None) is not None for attr in ('accidental', 'upperAccidental', 'lowerAccidental')):
+            _log_message('[jianpu] 装饰音附带的升降号未完整表示，请校对。', _logging.WARNING)
+        placement = getattr(mark, 'placement', None)
+        direction = '^' if placement == 'above' else '_' if placement == 'below' else ''
+        result.append(direction + '\\' + command)
+    return tuple(result)
+
+
 def _apply_tuplet_metadata(result: JianpuNote, element) -> JianpuNote:
+    result.notations = _source_notations(element)
     tuplets = element.duration.tuplets
     if len(tuplets) == 1 and not element.duration.isGrace:
         tuplet = tuplets[0]
@@ -511,6 +540,16 @@ def _jianpu_note_token_unmarked(note: JianpuNote) -> str:
 def jianpu_note_token(note: JianpuNote) -> str:
     """Format an event and its explicit slur boundaries for jianpu-ly."""
     token = _jianpu_note_token_unmarked(note)
+    if note.notations:
+        if note.is_grace:
+            # Keep these post-events inside the preceding single-note grace
+            # group rather than accidentally attaching them to the main note.
+            token += ' ' + ' '.join('GraceMark:' + mark for mark in note.notations)
+        else:
+            # A long note expands to "1 - -"; attach to its first event.
+            words = token.split()
+            words[1:1] = list(note.notations)
+            token = ' '.join(words)
     prefix = ''
     if note.tuplet_start:
         power = 1 << (note.tuplet_actual - 1).bit_length()
@@ -605,6 +644,7 @@ def clone_jianpu_note(note: JianpuNote, duration: float, carry_lyrics: bool = Tr
         tuplet_type=note.tuplet_type,
         tuplet_start=note.tuplet_start,
         tuplet_stop=note.tuplet_stop,
+        notations=note.notations if carry_lyrics else (),
     )
 
 

@@ -256,6 +256,10 @@ def clone_monophonic_element(element, duration: float):
     else:
         new_element = m21note.Note(element.pitch)
         new_element.lyrics = list(element.lyrics)
+    # Fresh music21 elements otherwise silently lose note-level performance
+    # marks (including fermatas and ornaments) before Jianpu extraction.
+    new_element.articulations = list(getattr(element, 'articulations', ()))
+    new_element.expressions = list(getattr(element, 'expressions', ()))
     if element.duration.tuplets:
         import copy
         new_element.duration = copy.deepcopy(element.duration)
