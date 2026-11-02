@@ -59,6 +59,7 @@ from core.notation.jianpu import (  # noqa: E402
     _with_time_signatures,
     extract_jianpu_measures,
     _get_score_key_tonic,
+    _get_voice_ids_in_part,
     _extract_part_repeat_barlines,
 )
 from core.render.jianpu_runner import _insert_repeat_bar_commands  # noqa: E402
@@ -484,7 +485,19 @@ def build(pdf_path: Path, mxl_path: Path, out_path: Path,
 
     score = converter.parse(str(mxl_path))
     tonic, key_header = _get_score_key_tonic(score)
-    measures, time_sig = extract_jianpu_measures(score, tonic)
+    part = score.parts[0] if score.parts else None
+    voice_ids = _get_voice_ids_in_part(part) if part is not None else []
+    if len(voice_ids) > 1:
+        tracks = [extract_jianpu_measures(score, tonic, _part=part, _voice_id=vid,
+                                          _multi_voice_mode=True, _is_primary_voice=(index == 0))
+                  for index, vid in enumerate(voice_ids)]
+        print(f'[insitu] 检测到 {len(tracks)} 个声部，逐行分别排版。')
+        if not expand:
+            print('[insitu] 多声部需要更多行间空间；建议使用 spaced 模式并校对。')
+    else:
+        tracks = [extract_jianpu_measures(score, tonic)]
+    if len(score.parts) > 1:
+        print('[insitu] 检测到多个乐器分部；当前原位对齐仅使用第一个分部，请校对。')
     repeat_bars = _extract_part_repeat_barlines(score.parts[0]) if score.parts else {}
     if title is None:
         title = pdf_path.stem
@@ -493,44 +506,51 @@ def build(pdf_path: Path, mxl_path: Path, out_path: Path,
     tmpdir = Path(tempfile.mkdtemp(prefix='insitu_ly_'))
     placed = 0
     fallback_rows = 0
+    incomplete_voice_rows = 0
     tiles = {}
 
     for sl, layout in zip(slices, staves):
         staff = layout.staff
-        line_measures = _line_slur_continuations(measures, sl.omr_start, sl.omr_end)
-        chunk = _with_time_signatures(
-            _measure_texts(line_measures, time_sig), 0,
-            layout_time_tokens(line_measures, 64),
-        )
-        if not chunk:
+        line_tiles = []
+        for voice_index, (measures, time_sig) in enumerate(tracks):
+            line_measures = _line_slur_continuations(measures, sl.omr_start, sl.omr_end)
+            chunk = _with_time_signatures(
+                _measure_texts(line_measures, time_sig), 0,
+                layout_time_tokens(line_measures, 64),
+            )
+            if not chunk:
+                continue
+            line_key = key_header if placed == 0 and voice_index == 0 else ''
+            try:
+                workdir = tmpdir / f'sys_{sl.staff_index}_voice_{voice_index}'
+                workdir.mkdir(parents=True, exist_ok=True)
+                ly_text = _run_jianpu_ly(
+                    _jianpu_ly_source([chunk], line_key, time_sig, title), workdir)
+                local_repeats = {index - sl.omr_start: info for index, info in repeat_bars.items()
+                                 if sl.omr_start <= index < sl.omr_end}
+                ly_text = _insert_repeat_bar_commands(ly_text, local_repeats)
+                tile_pdf, ink = _render_ly_tile(ly_text, workdir)
+                line_tiles.append((tile_pdf, ink, len(chunk)))
+            except Exception as exc:                   # keep the rest of the run
+                print(f'  ! staff {sl.staff_index} voice {voice_index + 1}: {exc}')
+        if not line_tiles:
             continue
-        # `1=C` appears once, on the first rendered line only - exactly as in
-        # 梆笛.jianpu.pdf, instead of above every system.
-        line_key = key_header if placed == 0 else ''
-        try:
-            workdir = tmpdir / f'sys_{sl.staff_index}'
-            workdir.mkdir(parents=True, exist_ok=True)
-            ly_text = _run_jianpu_ly(
-                _jianpu_ly_source([chunk], line_key, time_sig, title), workdir)
-            local_repeats = {index - sl.omr_start: info for index, info in repeat_bars.items()
-                             if sl.omr_start <= index < sl.omr_end}
-            ly_text = _insert_repeat_bar_commands(ly_text, local_repeats)
-            tile_pdf, ink = _render_ly_tile(ly_text, workdir)
-        except Exception as exc:                       # keep the rest of the run
-            print(f'  ! staff {sl.staff_index}: {exc}')
-            continue
+        if len(line_tiles) != len(tracks):
+            incomplete_voice_rows += 1
 
         if expand:
-            tiles[sl.staff_index] = (tile_pdf, ink, len(chunk))
+            tiles[sl.staff_index] = line_tiles
             placed += 1
             continue
 
         page = doc[staff.page - 1]
         top = staff.bottom + Y_OFFSET
-        placement = _place_tile(page, tile_pdf, ink, layout, top, len(chunk))
-        if placement != 'aligned':
-            fallback_rows += 1
-            print(f'  ! 第 {staff.page} 页谱表 {sl.staff_index + 1}: 对齐回退 ({placement})')
+        for tile_pdf, ink, count in line_tiles:
+            placement = _place_tile(page, tile_pdf, ink, layout, top, count)
+            if placement != 'aligned':
+                fallback_rows += 1
+                print(f'  ! 第 {staff.page} 页谱表 {sl.staff_index + 1}: 对齐回退 ({placement})')
+            top += ink.height + 9
         placed += 1
 
     if expand:
@@ -547,19 +567,23 @@ def build(pdf_path: Path, mxl_path: Path, out_path: Path,
                 cut = _blank_cut(page, low, max(low + 1, high))
                 overrides = (_tempo_cut_overrides(page, low, cut, next_top)
                              if row + 1 < len(page_rows) else [])
-                tile, ink, count = tiles[index]
+                line_tiles = tiles[index]
+                total_ink = sum(ink.height for _, ink, _ in line_tiles) + 9 * (len(line_tiles) - 1)
                 spread = max([0.0] + [cut - y for _, _, y in overrides])
-                insertions.append((cut, max(34.0, ink.height + 18.0) + spread,
-                                   index, layout, tile, ink, count, overrides))
+                insertions.append((cut, max(34.0, total_ink + 18.0) + spread,
+                                   index, layout, line_tiles, None, None, overrides))
             added = sum(item[1] for item in insertions)
             target_page = output.new_page(width=page.rect.width, height=page.rect.height + added)
             _copy_with_column_cuts(target_page, doc, page_index, insertions)
             shift = 0.0
-            for cut, height, index, layout, tile, ink, count, _ in insertions:
-                placement = _place_tile(target_page, tile, ink, layout, cut + shift + 9, count)
-                if placement != 'aligned':
-                    fallback_rows += 1
-                    print(f'  ! 第 {page_index + 1} 页谱表 {index + 1}: 对齐回退 ({placement})')
+            for cut, height, index, layout, line_tiles, _, _, _ in insertions:
+                top = cut + shift + 9
+                for tile, ink, count in line_tiles:
+                    placement = _place_tile(target_page, tile, ink, layout, top, count)
+                    if placement != 'aligned':
+                        fallback_rows += 1
+                        print(f'  ! 第 {page_index + 1} 页谱表 {index + 1}: 对齐回退 ({placement})')
+                    top += ink.height + 9
                 shift += height
         output.save(str(out_path), garbage=3, deflate=True)
         output.close()
@@ -570,6 +594,8 @@ def build(pdf_path: Path, mxl_path: Path, out_path: Path,
     print(f'placed {placed}/{len(staves)} lines')
     if fallback_rows:
         print(f'  ! {fallback_rows} 行因分隔线不明确或空间不足，使用整体放置或压缩；请校对。')
+    if incomplete_voice_rows:
+        print(f'  ! {incomplete_voice_rows} 个谱表存在未生成的声部，结果不完整；请校对。')
     return out_path
 
 

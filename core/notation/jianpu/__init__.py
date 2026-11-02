@@ -32,7 +32,6 @@ from .measure import (
 from .extract import (
     _extract_part_repeat_barlines,
     _get_voice_ids_in_part,
-    _secondary_voice_overlaps_primary,
     extract_jianpu_measures,
     extract_strict_jianpu_measures,
     strip_grace_notes,
@@ -108,38 +107,44 @@ def _with_time_signatures(measure_texts: list[str], start: int,
     ]
 
 
-def _measure_tempo_marks(score, part, measure_count: int) -> dict[int, list[tuple[float, str]]]:
-    """Collect representable metronome marks at their original measure offsets."""
-    from music21 import stream, tempo as m21tempo
-
+def _measure_direction_events(score, part, measure_count: int, event_type, description: str):
+    """Find directions in measures, parts or the score without moving them."""
+    from music21 import stream
     if part is None or not measure_count:
-        return {}
+        return []
     source_measures = list(part.getElementsByClass(stream.Measure))[:measure_count]
     has_measures = bool(source_measures)
     if not source_measures:
         source_measures = [part]
-    result: dict[int, list[tuple[float, str]]] = {}
-    units = {'whole': 1, 'half': 2, 'quarter': 4, 'eighth': 8,
-             '16th': 16, '32nd': 32, '64th': 64}
     starts = [float(m.getOffsetInHierarchy(part)) if m is not part else 0.0
               for m in source_measures]
     candidates = [(index, float(mark.getOffsetInHierarchy(measure)), mark)
                   for index, measure in enumerate(source_measures)
-                  for mark in measure.recurse().getElementsByClass(m21tempo.MetronomeMark)]
+                  for mark in measure.recurse().getElementsByClass(event_type)]
     # Marks may also belong directly to a Part or Score instead of a Measure.
     direct_sources = [(part, 0.0)] if has_measures else []
     if score is not part:
         direct_sources.append((score, float(part.getOffsetInHierarchy(score))))
     for container, part_offset in direct_sources:
-        for mark in container.getElementsByClass(m21tempo.MetronomeMark):
+        for mark in container.getElementsByClass(event_type):
             absolute = float(mark.offset) - part_offset
             indices = [i for i, start in enumerate(starts) if start <= absolute + 1e-7]
             if not indices:
-                log_message('[jianpu] 谱表之前的速度记号无法定位，需人工校对。', _logging.WARNING)
+                log_message(f'[jianpu] 谱表之前的{description}无法定位，需人工校对。', _logging.WARNING)
                 continue
             index = indices[-1]
             candidates.append((index, absolute - starts[index], mark))
-    for index, offset, mark in candidates:
+    return candidates
+
+
+def _measure_tempo_marks(score, part, measure_count: int) -> dict[int, list[tuple[float, str]]]:
+    """Collect representable metronome marks at their original measure offsets."""
+    from music21 import tempo as m21tempo
+    result: dict[int, list[tuple[float, str]]] = {}
+    units = {'whole': 1, 'half': 2, 'quarter': 4, 'eighth': 8,
+             '16th': 16, '32nd': 32, '64th': 64}
+    for index, offset, mark in _measure_direction_events(
+            score, part, measure_count, m21tempo.MetronomeMark, '速度记号'):
         referent = mark.referent
         unit = units.get(getattr(referent, 'type', None))
         number = mark.number
@@ -152,21 +157,55 @@ def _measure_tempo_marks(score, part, measure_count: int) -> dict[int, list[tupl
     return result
 
 
+def _measure_dynamic_marks(score, part, measure_count: int) -> dict[int, list[tuple[float, str]]]:
+    """Collect supported dynamic marks without confusing them with text commands."""
+    from music21 import dynamics
+    allowed = {'ppppp', 'pppp', 'ppp', 'pp', 'p', 'mp', 'mf', 'f', 'ff', 'fff',
+               'ffff', 'fffff', 'fp', 'sf', 'sff', 'sfz', 'sfp', 'rfz', 'sp', 'spp', 'fz'}
+    result: dict[int, list[tuple[float, str]]] = {}
+    for index, offset, mark in _measure_direction_events(
+            score, part, measure_count, dynamics.Dynamic, '力度记号'):
+        value = str(mark.value or '').strip().lower()
+        if value not in allowed:
+            log_message(f'[jianpu] 小节 {index + 1} 的力度记号 {value!r} 无法表示，需人工校对。',
+                        _logging.WARNING)
+            continue
+        result.setdefault(index, []).append((offset, '\\' + value))
+    return result
+
+
 def _measure_text_with_tempos(notes: list[JianpuNote], marks: list[tuple[float, str]],
-                              measure_number: int) -> str:
+                              measure_number: int,
+                              dynamics: Optional[list[tuple[float, str]]] = None) -> str:
     """Insert marks only at a rendered event boundary, never move them silently."""
     pending = sorted(marks, key=lambda item: item[0])
+    pending_dynamics = sorted(dynamics or [], key=lambda item: item[0])
     words: list[str] = []
     position = 0.0
     for note in notes:
         matched = [mark for mark in pending if abs(mark[0] - position) < 1e-6]
         words.extend(word for _, word in matched)
         pending = [mark for mark in pending if abs(mark[0] - position) >= 1e-6]
-        words.append(jianpu_note_token(note))
+        token = jianpu_note_token(note)
+        if not note.is_grace:
+            matched_dynamics = [mark for mark in pending_dynamics if abs(mark[0] - position) < 1e-6]
+            pending_dynamics = [mark for mark in pending_dynamics if abs(mark[0] - position) >= 1e-6]
+            if matched_dynamics:
+                # A long Jianpu event may expand to "1 - -".  LilyPond
+                # dynamics attach to the *preceding* event, so insert after
+                # the first note word, not after the last duration dash.
+                parts = token.split()
+                index = 1 if len(parts) > 1 and parts[0].endswith('[') else 0
+                parts[index + 1:index + 1] = [word for _, word in matched_dynamics]
+                token = ' '.join(parts)
+        words.append(token)
         if not note.is_grace:
             position += note.duration
     for offset, _ in pending:
         log_message(f'[jianpu] 小节 {measure_number} 的速度记号位于 {offset:g} 拍，'
+                    '不在可表示的音符边界，需人工校对。', _logging.WARNING)
+    for offset, _ in pending_dynamics:
+        log_message(f'[jianpu] 小节 {measure_number} 的力度记号位于 {offset:g} 拍，'
                     '不在可表示的音符边界，需人工校对。', _logging.WARNING)
     return ' '.join(words)
 
@@ -249,7 +288,7 @@ def build_jianpu_ly_text(score, title: str, use_strict_timing: bool = False,
 
     For single-part scores the output is identical to the previous behaviour,
     except that when the single part contains multiple non-rest voices they are
-    each extracted as a separate ``NextPart`` section (capped at 4 voices).
+    each extracted as a separate ``NextPart`` section.
 
     For multi-part scores each part becomes a separate jianpu section; parts
     that contain multiple non-rest voices are further split so each voice gets
@@ -260,10 +299,9 @@ def build_jianpu_ly_text(score, title: str, use_strict_timing: bool = False,
     _return_groups
         When *True* the function returns ``(text, voice_groups)`` instead of
         just *text*.  ``voice_groups`` is a ``list[list[int]]`` where each
-        inner list contains the 0-based section indices that belong to the same
-        Part and should therefore be rendered on the *same* jianpu staff as
-        simultaneous polyphonic voices.  Sections with a group of length 1 are
-        monophonic and need no merging.
+        inner list contains the 0-based section indices to render on the same
+        jianpu staff. Explicit independent voices are currently kept on separate
+        staves to avoid overlapping numbered notes.
     """
     key_tonic_semitone, key_header_line = _get_score_key_tonic(score)
 
@@ -290,19 +328,11 @@ def build_jianpu_ly_text(score, title: str, use_strict_timing: bool = False,
         else:
             # Multiple voices within a single part — extract each voice separately
             log_message(
-                f'[jianpu] 单声部多声道: {len(_v_ids)} 个声道 ({", ".join(str(v) for v in _v_ids[:4])})',
+                f'[jianpu] 单声部多声道: {len(_v_ids)} 个声道 ({", ".join(str(v) for v in _v_ids)})',
                 _logging.DEBUG,
             )
-            _primary_vid = _v_ids[0]
             _group_idxs: list[int] = []
-            for i, vid in enumerate(_v_ids[:4]):
-                # 跳过伪复声部：次声部音符 onset 严格落在主声部音符时值内 → OMR 误判
-                if i > 0 and part is not None and _secondary_voice_overlaps_primary(part, _primary_vid, vid):
-                    log_message(
-                        f'[jianpu] 跳过伪复声部 voice={vid}（音符与主声部重叠，判定为 OMR 误判）',
-                        _logging.DEBUG,
-                    )
-                    continue
+            for i, vid in enumerate(_v_ids):
                 measures, ts = extract_jianpu_measures(
                     score, key_tonic_semitone, _part=part, _voice_id=vid,
                     _multi_voice_mode=True, _is_primary_voice=(i == 0))
@@ -312,7 +342,9 @@ def build_jianpu_ly_text(score, title: str, use_strict_timing: bool = False,
                     _group_idxs.append(len(_sections))
                     _sections.append(measures)
                     _section_parts.append(part)
-            _voice_groups = [_group_idxs] if _group_idxs else [[0]]
+            # Independent numbered voices can collide if painted on the same
+            # rhythmic staff.  Keep separate, synchronised staves instead.
+            _voice_groups = [[index] for index in _group_idxs] if _group_idxs else [[0]]
     else:
         # Multi-part path: one section per part / voice combination
         for part in _parts:
@@ -337,21 +369,13 @@ def build_jianpu_ly_text(score, title: str, use_strict_timing: bool = False,
                         _sections.append(measures)
                         _section_parts.append(part)
                 else:
-                    # Multiple voices: one section per voice (max 4).
+                    # Multiple voices: one section per voice.
                     # In a multi-part score each Part already maps to a separate staff;
                     # when a Part contains multiple voice IDs (e.g. due to OMR chord
                     # encoding), each voice is an independent melodic line and should
                     # get its own staff row — NOT be merged into a shared polyphonic
                     # staff (that path is reserved for the single-part case above).
-                    _primary_vid_mp = voice_ids[0]
-                    for i, vid in enumerate(voice_ids[:4]):
-                        # 跳过伪复声部：次声部音符 onset 严格落在主声部音符时值内 → OMR 误判
-                        if i > 0 and _secondary_voice_overlaps_primary(part, _primary_vid_mp, vid):
-                            log_message(
-                                f'[jianpu] 跳过伪复声部 voice={vid}（音符与主声部重叠，判定为 OMR 误判）',
-                                _logging.DEBUG,
-                            )
-                            continue
+                    for i, vid in enumerate(voice_ids):
                         measures, ts = extract_jianpu_measures(
                             score, key_tonic_semitone, _part=part, _voice_id=vid,
                             _multi_voice_mode=True, _is_primary_voice=(i == 0))
@@ -393,6 +417,10 @@ def build_jianpu_ly_text(score, title: str, use_strict_timing: bool = False,
         # tokens restart from the header's bar length for every section.
         section_time_sigs = layout_time_tokens(measures, bar_units)
         tempo_marks = _measure_tempo_marks(score, _section_parts[section_idx], len(measures))
+        # If sections are ever grouped on one staff, print its dynamic once.
+        primary_section = next((group[0] for group in _voice_groups if section_idx in group), section_idx)
+        dynamic_marks = (_measure_dynamic_marks(score, _section_parts[section_idx], len(measures))
+                         if section_idx == primary_section else {})
         if tempo > 0 and 0 in tempo_marks:
             # A caller-supplied initial tempo overrides source marks at time zero.
             tempo_marks[0] = [(offset, word) for offset, word in tempo_marks[0]
@@ -402,7 +430,8 @@ def build_jianpu_ly_text(score, title: str, use_strict_timing: bool = False,
             try:
                 # Emitted exactly as extracted: no padding, no trimming.
                 measure_texts = [
-                    _measure_text_with_tempos(m, tempo_marks.get(i + offset, []), i + offset + 1)
+                    _measure_text_with_tempos(m, tempo_marks.get(i + offset, []), i + offset + 1,
+                                              dynamic_marks.get(i + offset, []))
                     for offset, m in enumerate(line_measures)
                 ]
                 header.append(

@@ -108,90 +108,18 @@ def _canonical_offset(seen: dict[int, float], offset: float) -> float:
 
 
 def _get_voice_ids_in_part(part) -> list[str]:
-    """Return sorted voice IDs that contain significant non-rest content.
+    """Return all explicit voices with notes or rests, including short entries.
 
-    A voice is significant — and warrants its own jianpu polyphony track — when:
-      1. it has actual notes in at least 2 distinct measures (the original guard
-         against single-measure harmony chords triggering multi-voice extraction), AND
-      2. it is either the most prolific voice in the part (always kept), OR
-         it meets the secondary-voice significance test (see below).
-
-    Secondary-voice significance test (both of the following must be true):
-      a. note count >= 10 % of the primary voice's note count, AND
-      b. EITHER note count >= 8 (the original guard against 2-measure OMR stray voices)
-         OR the voice spans at least 4 distinct measures.
-
-    Rationale for the OR branch: OMR stray voices typically appear in exactly 2
-    (occasionally 3) consecutive measures with a handful of notes.  A voice spread
-    across 4 or more measures — even with fewer than 8 total notes — is far more
-    likely to be a genuine polyphonic voice (e.g. a later-entering canon voice that
-    is only sparsely tagged with voice numbers in the MusicXML) than an OMR artefact.
-    The 10 % floor prevents near-empty one-off notes from being promoted regardless.
+    Length and rhythmic overlap cannot distinguish an OMR artefact from a real
+    counterpoint voice.  Preserve the source and leave uncertain OMR results for
+    review instead of silently dropping a potentially genuine voice.
     """
-    voice_stats: dict[str, tuple[int, int]] = {}  # vid -> (measure_count, note_count)
+    voice_ids: set[str] = set()
     for measure in part.getElementsByClass(stream.Measure):
         for voice in measure.voices:
-            n_notes = sum(1 for e in voice.flatten().notes if isinstance(e, m21note.Note))
-            if n_notes > 0:
-                vid = str(voice.id)
-                m_count, prev = voice_stats.get(vid, (0, 0))
-                voice_stats[vid] = (m_count + 1, prev + n_notes)
-
-    candidates = [vid for vid, (m_count, _) in voice_stats.items() if m_count >= 2]
-    if len(candidates) <= 1:
-        return sorted(candidates)
-
-    primary_vid = max(candidates, key=lambda v: voice_stats[v][1])
-    primary_notes = voice_stats[primary_vid][1]
-    return sorted(
-        vid for vid in candidates
-        if vid == primary_vid
-        or (
-            voice_stats[vid][1] >= primary_notes * 0.10
-            and (voice_stats[vid][1] >= 8 or voice_stats[vid][0] >= 4)
-        )
-    )
-
-
-def _secondary_voice_overlaps_primary(
-    part, primary_vid: str, secondary_vid: str, overlap_threshold: float = 0.5
-) -> bool:
-    """Return True when the secondary voice is likely OMR false-polyphony.
-
-    For each non-rest note in the secondary voice, checks whether its onset falls
-    *strictly inside* the duration span of any primary-voice note in the same measure
-    (i.e. p_start < onset < p_end).  Notes that start simultaneously with a primary
-    note (chords) or exactly at the primary note's end are intentionally excluded.
-
-    If the fraction of such "inside" notes exceeds *overlap_threshold* the secondary
-    voice is treated as a duplicate detection artifact rather than genuine counterpoint,
-    and the caller should skip it to prevent visual number overlap in the jianpu output.
-    """
-    total = 0
-    inside = 0
-    for measure in part.getElementsByClass(stream.Measure):
-        v_list = list(measure.voices)
-        if not v_list:
-            continue
-        v1 = next((v for v in v_list if str(v.id) == primary_vid), None)
-        v2 = next((v for v in v_list if str(v.id) == secondary_vid), None)
-        if v1 is None or v2 is None:
-            continue
-        # 主声部非休止符元素的时值区间 (onset, onset+dur)
-        p_spans: list[tuple[float, float]] = [
-            (float(el.offset), float(el.offset) + float(el.duration.quarterLength or 0.25))
-            for el in v1.flatten().notesAndRests
-            if isinstance(el, (m21note.Note, m21chord.Chord))
-        ]
-        for el in v2.flatten().notesAndRests:
-            if not isinstance(el, (m21note.Note, m21chord.Chord)):
-                continue
-            total += 1
-            onset = float(el.offset)
-            # 严格落在主声部音符时值内部（不含同时起音和恰好在结束点的情形）
-            if any(p_start < onset < p_end for p_start, p_end in p_spans):
-                inside += 1
-    return total > 0 and (inside / total) >= overlap_threshold
+            if list(voice.flatten().notesAndRests):
+                voice_ids.add(str(voice.id))
+    return sorted(voice_ids)
 
 
 def _extract_part_repeat_barlines(part) -> dict[int, dict[str, bool]]:
@@ -349,21 +277,10 @@ def extract_jianpu_measures(score, key_tonic_semitone: int = 0,
                 _flat_all = list(_best_voice.flatten().notesAndRests)
         else:
             if _multi_voice_mode and not _is_primary_voice:
-                # No voice containers in this measure + secondary voice.
-                # HOMR sometimes encodes 2-voice polyphony with <chord/> tags instead of
-                # separate <voice> containers.  When chord objects exist, the lower pitch
-                # belongs to the secondary voice; recover those notes rather than emitting
-                # a whole-measure rest.  Single notes (no chord sibling) belong solely to
-                # the primary voice and are left alone.
-                _chord_lowers: list[m21note.Note] = []
-                for _el in measure_src.flatten().notesAndRests:
-                    if isinstance(_el, m21chord.Chord) and len(_el.pitches) >= 2:
-                        _lower_p = min(_el.pitches, key=lambda p: p.midi)
-                        _lower_n = m21note.Note(_lower_p)
-                        _lower_n.duration.quarterLength = float(_el.duration.quarterLength or 0.25)
-                        _lower_n.offset = float(_el.offset)
-                        _chord_lowers.append(_lower_n)
-                _flat_all = _chord_lowers  # remains [] when no chords → whole-measure rest
+                # A chord without explicit voices belongs to the primary
+                # track.  Copying its lower pitch into a missing secondary
+                # voice invents notes that were never assigned to that voice.
+                _flat_all = []
             else:
                 _flat_all = list(measure_src.flatten().notesAndRests)
 
