@@ -292,7 +292,13 @@ def _pitch_to_fields(pitch, key_tonic_semitone: int,
     pitch_space = getattr(pitch, 'ps', None)
     if pitch_space is not None and abs(pitch_space - round(pitch_space)) > 1e-7:
         _log_message('[jianpu] 微分音无法用当前简谱符号准确表示，已取整半音，请校对。', _logging.WARNING)
-    note_midi = pitch.midi
+    # music21's MIDI accessor folds out-of-range pitches back by octaves.
+    # Preserve integral pitch-space values for notation even when MIDI cannot
+    # represent them; otherwise an extreme note silently changes register.
+    note_midi = (int(round(pitch_space)) if pitch_space is not None
+                 and abs(pitch_space - round(pitch_space)) < 1e-7 else pitch.midi)
+    if note_midi is not None and not 0 <= note_midi <= 127:
+        _log_message('[jianpu] 音符超出 MIDI 音高范围，请校对排版和试听。', _logging.WARNING)
     if note_midi is None:
         _step_pc = {'C': 0, 'D': 2, 'E': 4, 'F': 5, 'G': 7, 'A': 9, 'B': 11}
         _alter = int(pitch.accidental.alter) if pitch.accidental else 0
@@ -421,7 +427,7 @@ def note_to_jianpu(element, key_tonic_semitone: int = 0, *,
     # carries a <chord/> flag), and it has no .pitch attribute: handling it here
     # renders it as a plain note instead of raising AttributeError (中音笙).
     if isinstance(element, m21chord.Chord) and element.pitches:
-        _sorted_pitches = sorted(element.pitches, key=lambda p: p.midi if p.midi is not None else 0)
+        _sorted_pitches = sorted(element.pitches, key=lambda p: p.ps if p.ps is not None else 0)
         accidental, symbol, upper_dots, lower_dots, note_midi = _pitch_to_fields(
             _sorted_pitches[0], key_tonic_semitone, tonic_step
         )

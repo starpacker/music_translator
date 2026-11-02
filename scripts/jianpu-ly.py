@@ -301,7 +301,7 @@ def all_scores_start(inDat):
     r += "}\n" # end of \paper block
 
     r += r"""
-%% 2-dot and 3-dot articulations
+%% Multi-octave dot articulations
 #(append! default-script-alist
    (list
     `(two-dots
@@ -325,6 +325,25 @@ def all_scores_start(inDat):
 
 "three-dots" =
 #(make-articulation 'three-dots)
+
+#(append! default-script-alist
+   (list
+    `(four-dots
+       . ((stencil . ,ly:text-interface::print)
+          (text . ,#{ \markup \override #'(font-encoding . latin1) \override #'(baseline-skip . 0.6) \center-column { \bold "." \bold "." \bold "." \bold "." } #})
+          (padding . 0.30)
+          (avoid-slur . inside)
+          (direction . ,UP)))
+    `(five-dots
+       . ((stencil . ,ly:text-interface::print)
+          (text . ,#{ \markup \override #'(font-encoding . latin1) \override #'(baseline-skip . 0.6) \center-column { \bold "." \bold "." \bold "." \bold "." \bold "." } #})
+          (padding . 0.30)
+          (avoid-slur . inside)
+          (direction . ,UP)))))
+"four-dots" =
+#(make-articulation 'four-dots)
+"five-dots" =
+#(make-articulation 'five-dots)
 
 \layout {
   \context {
@@ -741,6 +760,12 @@ def addOctaves(octave1,octave2):
         octave1=octave1[1:]
     return octave2
 
+def lily_octave(octave):
+    """Translate Jianpu octave marks to LilyPond's middle-C reference."""
+    level = len(octave) if "'" in octave else -len(octave)
+    level += 1
+    return "'" * level if level >= 0 else "," * -level
+
 class NoteheadMarkup:
   def __init__(self,graceType=None):
       self.initOneScore()
@@ -785,7 +810,7 @@ class NoteheadMarkup:
     # figures is a chord string of '1'-'7', or 'x' or '0' or '-'
     # nBeams is 0, 1, 2 .. etc (number of beams for this note)
     # dots is "" or "." or ".." etc (extra length)
-    # octave is "", "'", "''", "'''", ",", ",," or ",,,"
+    # octave contains up to five apostrophes or commas
     # accidental is "", "#", "b", "##", or "bb"
     # tremolo is "" or ":32"
     # word,line is for error handling
@@ -827,9 +852,10 @@ class NoteheadMarkup:
             accidental = self.last_accidental # ditto
     else: # not invisTieLast
         if not isChord: octave=addOctaves(octave,self.base_octave)
-        if not octave in [",,,",",,",",","","'","''","'''"]: scoreError("Can't handle octave "+octave+" in",word,line)
+        if len(octave) > 5 or ("'" in octave and "," in octave):
+            scoreError("Can't handle octave "+octave+" in",word,line)
         self.last_octave = octave
-        self.octavesSeen.append({",,,":-3,",,":-2,",":-1,"":0,"'":1,"''":2,"'''":3}[octave]) # for figuring out the best clef with WithStaff
+        self.octavesSeen.append(len(octave) if "'" in octave else -len(octave)) # for figuring out the best clef with WithStaff
         self.last_tremolo = tremolo
         if isChord: self.current_chord = word
         else: self.current_chord = None
@@ -920,7 +946,7 @@ class NoteheadMarkup:
         if need_space_for_accidental and not not_angka and not (figures.startswith("-") or midi or western): ret += r"\once \tweak Accidental.extra-offset #'(0 . 0.7)"
         ret += placeholder_chord
         if midi or western or not not_angka: ret += {"":"", "#":"is", "b":"es", "##":"isis", "bb":"eses"}[accidental]
-        if (midi or western) and not placeholder_chord=="r": ret += {"":"'","'":"''","''":"'''","'''":"''''",",":"",",,":",",",,,":",,"}[octave] # so no-mark starts near middle C
+        if (midi or western) and not placeholder_chord=="r": ret += lily_octave(octave)
         if add_cautionary_accidental: ret += "!"
     ret += ("%d" % length) + dots
     if self.rplacNextIfStillInBeam: self.rplacNextIfStillInBeam += ("r%d" % length) + dots + '['
@@ -942,12 +968,16 @@ class NoteheadMarkup:
           oDict = {",":r"-\tweak #'Y-offset #-1.2 ",
                    ",,":r"-\tweak #'Y-offset #-2 ",
                    ",,,":r"-\tweak #'Y-offset #-2.7 ",
+                   ",,,,":r"-\tweak #'Y-offset #-3.4 ",
+                   ",,,,,":r"-\tweak #'Y-offset #-4.1 ",
                 }
           ret += oDict.get(octave,"")
       elif self.graceType:
           oDict = {",":r"-\tweak #'Y-offset #%.1f " % (grace_height-1-nBeams*0.3),
                    ",,":r"-\tweak #'Y-offset #%.1f " % (grace_height-1.6-nBeams*0.3),
                    ",,,":r"-\tweak #'Y-offset #%.1f " % (grace_height-2-nBeams*0.3),
+                   ",,,,":r"-\tweak #'Y-offset #%.1f " % (grace_height-2.7-nBeams*0.3),
+                   ",,,,,":r"-\tweak #'Y-offset #%.1f " % (grace_height-3.4-nBeams*0.3),
                 }
           ret += oDict.get(octave,"")
       # Ugly fix for grace dot positions
@@ -957,13 +987,19 @@ class NoteheadMarkup:
             "'":"^.",
             "''":r"-\tweak #'X-offset #%.1f ^\two-dots " % x_offset,
             "'''":r"-\tweak #'X-offset #%.1f ^\three-dots " % x_offset,
+            "''''":r"-\tweak #'X-offset #%.1f ^\four-dots " % x_offset,
+            "'''''":r"-\tweak #'X-offset #%.1f ^\five-dots " % x_offset,
             ",":r"-\tweak #'X-offset #%.1f _. " % x_offset,
             ",,":r"-\tweak #'X-offset #%.1f _\two-dots " % x_offset,
-            ",,,":r"-\tweak #'X-offset #%.1f _\three-dots " % x_offset}
+            ",,,":r"-\tweak #'X-offset #%.1f _\three-dots " % x_offset,
+            ",,,,":r"-\tweak #'X-offset #%.1f _\four-dots " % x_offset,
+            ",,,,,":r"-\tweak #'X-offset #%.1f _\five-dots " % x_offset}
       if not_angka: oDict.update({
               "'":r"-\tweak #'extra-offset #'(0.4 . 2.7) -\markup{\bold .}",
               "''":r"-\tweak #'extra-offset #'(0.4 . 3.5) -\markup{\bold :}",
               "'''":r"-\tweak #'extra-offset #'(0.4 . 4.3) -\markup{\bold "+three_dots+"}",
+              "''''":r"-\tweak #'extra-offset #'(0.4 . 5.1) ^\four-dots ",
+              "'''''":r"-\tweak #'extra-offset #'(0.4 . 5.9) ^\five-dots ",
               })
       ret += oDict[octave]
     if nBeams and (not self.inBeamGroup or (self.inBeamGroup=="restHack" and not replaceLast) or inRestHack) and not midi and not western:
@@ -1384,14 +1420,12 @@ def graceNotes_markup(notes,word,line,isAfter,harmonic=False,marks_by_index=None
             accidental += "b"
         elif n=="'":
             if i and notes[i-1]==notes[i]: continue
-            if notes[i:i+3]=="'''": octave = "'''"
-            elif notes[i:i+2]=="''": octave = "''"
-            else: octave = "'"
+            octave = "'" * len(re.match(r"'+", notes[i:]).group())
+            if len(octave) > 5: scoreError("Can't handle octave "+octave+" in",word,line)
         elif n==',':
             if i and notes[i-1]==notes[i]: continue
-            if notes[i:i+3]==",,,": octave = ",,,"
-            elif notes[i:i+2]==",,": octave = ",,"
-            else: octave = ","
+            octave = "," * len(re.match(r",+", notes[i:]).group())
+            if len(octave) > 5: scoreError("Can't handle octave "+octave+" in",word,line)
         elif n in 'qsdh': beams = '*qsdh'.index(n)
         else:
             # number should be the last char of a note
@@ -1441,14 +1475,14 @@ def gracenotes_western(notes,word,line,marks_by_index=None):
         elif n=='b': nextAcc += "b"
         elif n=="'":
             if i and notes[i-1]==notes[i]: continue
-            if notes[i:i+3]=="'''": next8ve = "''''"
-            elif notes[i:i+2]=="''": next8ve = "'''"
-            else: next8ve = "''"
+            octave = re.match(r"'+", notes[i:]).group()
+            if len(octave) > 5: scoreError("Can't handle octave "+octave+" in",word,line)
+            next8ve = lily_octave(octave)
         elif n==',':
             if i and notes[i-1]==notes[i]: continue
-            if notes[i:i+3]==",,,": next8ve = ",,"
-            elif notes[i:i+2]==",,": next8ve = ","
-            else: next8ve = ""
+            octave = re.match(r",+", notes[i:]).group()
+            if len(octave) > 5: scoreError("Can't handle octave "+octave+" in",word,line)
+            next8ve = lily_octave(octave)
         elif n in 'qsdh': duration = {'q':8, 's':16, 'd':32, 'h':64}[n]
         else:
             if not n in placeholders: continue # TODO: errExit ?
@@ -1507,26 +1541,14 @@ def chordNotes_markup(notes,word,line):
             sortKey -= 0.5
         elif n=="'":
             if i and notes[i-1]==notes[i]: continue
-            if notes[i:i+3]=="'''":
-                octave = "'''"
-                sortKey += 22
-            elif notes[i:i+2]=="''":
-                octave = "''"
-                sortKey += 15
-            else:
-                octave = "'"
-                sortKey += 8
+            octave = re.match(r"'+", notes[i:]).group()
+            if len(octave) > 5: scoreError("Can't handle octave "+octave+" in",word,line)
+            sortKey += 7 * len(octave) + 1
         elif n==',':
             if i and notes[i-1]==notes[i]: continue
-            if notes[i:i+3]==",,,":
-                octave = ",,,"
-                sortKey -= 22
-            elif notes[i:i+2]==",,":
-                octave = ",,"
-                sortKey -= 15
-            else:
-                octave = ","
-                sortKey -= 8
+            octave = re.match(r",+", notes[i:]).group()
+            if len(octave) > 5: scoreError("Can't handle octave "+octave+" in",word,line)
+            sortKey -= 7 * len(octave) + 1
         else:
             # number should be the last char of a note
             if n not in '01234567' : continue
@@ -1563,16 +1585,24 @@ def chordNotes_markup(notes,word,line):
     offsets = {"'":1,
         "''":1.6,
         "'''":2.2,
+        "''''":2.8,
+        "'''''":3.4,
         ",":1,
         ",,":1.6,
-        ",,,":2.2}
+        ",,,":2.2,
+        ",,,,":2.8,
+        ",,,,,":3.4}
     oDict = {"":"",
         "'":"^.",
         "''":r"-\tweak #'X-offset #0.6 ^\two-dots ",
         "'''":r"-\tweak #'X-offset #0.6 ^\three-dots ",
+        "''''":r"-\tweak #'X-offset #0.6 ^\four-dots ",
+        "'''''":r"-\tweak #'X-offset #0.6 ^\five-dots ",
         ",":r"-\tweak #'X-offset #0.6 _. ",
         ",,":r"-\tweak #'X-offset #0.6 _\two-dots ",
-        ",,,":r"-\tweak #'X-offset #0.6 _\three-dots "}
+        ",,,":r"-\tweak #'X-offset #0.6 _\three-dots ",
+        ",,,,":r"-\tweak #'X-offset #0.6 _\four-dots ",
+        ",,,,,":r"-\tweak #'X-offset #0.6 _\five-dots "}
     ret = "< "
     baseline = 0
     for f in dNotes:

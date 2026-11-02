@@ -277,8 +277,8 @@ def extract_jianpu_measures(score, key_tonic_semitone: int = 0,
         for source_note in measure.recurse().notes:
             if getattr(source_note.duration, 'isGrace', False):
                 continue
-            pitches = (tuple(sorted(p.midi for p in source_note.pitches))
-                       if isinstance(source_note, m21chord.Chord) else (source_note.pitch.midi,))
+            pitches = (tuple(sorted(p.ps for p in source_note.pitches))
+                       if isinstance(source_note, m21chord.Chord) else (source_note.pitch.ps,))
             key = (round(float(source_note.getOffsetInHierarchy(measure)), 7), pitches)
             for slur in source_note.getSpannerSites(spanner.Slur):
                 ends = slur.getSpannedElements()
@@ -504,7 +504,7 @@ def extract_strict_jianpu_measures(score, key_tonic_semitone: int = 0,
             by_offset[offset] = candidate
         elif isinstance(existing, m21note.Rest) and not isinstance(candidate, m21note.Rest):
             by_offset[offset] = candidate
-        elif isinstance(existing, m21note.Note) and isinstance(candidate, m21note.Note) and candidate.pitch.midi > existing.pitch.midi:
+        elif isinstance(existing, m21note.Note) and isinstance(candidate, m21note.Note) and candidate.pitch.ps > existing.pitch.ps:
             by_offset[offset] = candidate
 
     # For trailing-rest pickups: rebuild by_offset so that the layout matches
