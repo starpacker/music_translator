@@ -70,3 +70,19 @@ class EventAuditTest(unittest.TestCase):
                 report = audit(path)
             self.assertEqual(report['mismatch_count'], 1)
             self.assertEqual(report['mismatches'][0]['measure_number'], '1')
+
+    def test_reports_wrong_written_degree_even_when_stored_midi_is_unchanged(self):
+        score, part, measure = stream.Score(), stream.Part(), stream.Measure(number=1)
+        measure.insert(0, note.Note('C4', quarterLength=4))
+        part.append(measure)
+        score.insert(0, part)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'score.musicxml'
+            score.write('musicxml', fp=path)
+            def corrupt_symbol(*args, **kwargs):
+                measures, ts = extract_jianpu_measures(*args, **kwargs)
+                measures[0][0].symbol = '7' if measures[0][0].symbol != '7' else '1'
+                return measures, ts
+            with patch('scripts.audit_jianpu_events.extract_jianpu_measures', side_effect=corrupt_symbol):
+                report = audit(path)
+            self.assertTrue(any(m.get('reason') == 'jianpu_symbol_pitch' for m in report['mismatches']))

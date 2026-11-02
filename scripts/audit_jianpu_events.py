@@ -24,7 +24,7 @@ def audit(path: Path) -> dict:
     part = score.parts[0]
     original = list(part.getElementsByClass('Measure'))
     tonic, _ = _get_score_key_tonic(score)
-    extracted, _ = extract_jianpu_measures(score, tonic, _part=part)
+    extracted, _ = extract_jianpu_measures(score, tonic, _part=part, follow_key_changes=True)
     part_note_ids = {id(event) for event in part.recurse().notes}
     comparable_slurs = []
     for slur in score.recurse().getElementsByClass(spanner.Slur):
@@ -34,11 +34,14 @@ def audit(path: Path) -> dict:
             comparable_slurs.append(slur)
     mismatches = []
     previous_pitches = None
+    reference = tonic
     for index in range(max(len(original), len(extracted))):
         if index >= len(original) or index >= len(extracted):
             mismatches.append({'index': index + 1, 'reason': 'measure_count'})
             continue
         source = []
+        if index in getattr(extracted, 'key_changes', {}):
+            reference = extracted.key_changes[index][0]
         canonical_measure = original[index]
         for event in canonical_measure.recurse().notes:
             pitches = (sorted(p.midi for p in event.pitches)
@@ -49,11 +52,25 @@ def audit(path: Path) -> dict:
                            'tuplets': [[t.numberNotesActual, t.numberNotesNormal]
                                        for t in event.duration.tuplets]})
         target = []
+        symbol_mismatches = []
         for event in extracted[index]:
             if event.is_rest:
                 previous_pitches = None
                 continue
             continuation = event.symbol == '-'
+            if not continuation:
+                fields = [(event.accidental, event.symbol, event.upper_dots, event.lower_dots, event.midi),
+                          *event.chord_notes]
+                for accidental, symbol, upper, lower, expected in fields:
+                    degrees = {'1': 0, '2': 2, '3': 4, '4': 5, '5': 7, '6': 9, '7': 11}
+                    alters = {'': 0, '#': 1, 'b': -1}
+                    rendered = (60 + reference + degrees[symbol] + alters[accidental] + 12 * (upper - lower)
+                                if symbol in degrees and accidental in alters else None)
+                    if rendered != expected:
+                        symbol_mismatches.append({'symbol': symbol, 'accidental': accidental,
+                                                  'upper_dots': upper, 'lower_dots': lower,
+                                                  'reference': reference, 'rendered_midi': rendered,
+                                                  'source_midi': expected})
             pitches = previous_pitches if continuation else [event.midi, *[p[4] for p in event.chord_notes]]
             target.append({'pitches': pitches,
                            'duration': round(float(event.duration), 6), 'grace': event.is_grace,
@@ -82,6 +99,9 @@ def audit(path: Path) -> dict:
                                'source_rest_tuplets': source_rest_tuplets,
                                'jianpu_rest_tuplets': target_rest_tuplets,
                                'source_order': source_order, 'jianpu_order': target_order})
+        if symbol_mismatches:
+            mismatches.append({'index': index + 1, 'measure_number': str(original[index].number),
+                               'reason': 'jianpu_symbol_pitch', 'events': symbol_mismatches})
     starts = sum(event.slur_starts for measure in extracted for event in measure)
     stops = sum(event.slur_stops for measure in extracted for event in measure)
     if starts != len(comparable_slurs) or stops != len(comparable_slurs):

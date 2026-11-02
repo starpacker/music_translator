@@ -147,6 +147,8 @@ class MeasureBarUnits(list):
         # only — it is never used to lay the measure out.
         self.bar_units: list[int] = []
         self.time_signatures: list[Optional[str]] = []
+        # Zero-based measure index -> (reference pitch class, displayed key).
+        self.key_changes: dict[int, tuple[int, str]] = {}
 
 
 def measure_units(notes: list[JianpuNote]) -> int:

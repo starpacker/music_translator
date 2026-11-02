@@ -81,49 +81,33 @@ def _get_score_key_tonic(score) -> tuple[int, str]:
     the piece's *actual* tonic (see ``_format_key_header``).
 
     Detection priority:
-    1. ``Key`` element — explicit tonic + mode (most authoritative).
-    2. ``KeySignature`` element (fifths only, no mode) + ``score.analyze('key')``
-       to disambiguate major/minor — mirrors the transposer's
-       ``_parse_musicxml_key_signature`` + ``detect_key_from_musicxml`` logic
-       but adds mode resolution.  Handles OMR engines (e.g. Homr) that write
-       ``<fifths>`` without ``<mode>``.
-    3. ``score.analyze('key')`` tonic alone — for scores with no key-signature
+    1. Earliest key signature.  An explicit ``Key`` supplies its mode; for a
+       fifths-only ``KeySignature``, analysis chooses major/minor.
+    2. ``score.analyze('key')`` tonic alone — for scores with no key-signature
        element at all.
-    4. First actual note — last resort (no mode info; treated as major).
+    3. First actual note — last resort (no mode info; treated as major).
     """
     from music21 import key as m21key  # local import to avoid circular at module level
     try:
-        # Priority 1: explicit Key element (has both fifths and mode)
-        key_sigs = _first_part(score).flatten().getElementsByClass(m21key.Key)
-        if key_sigs:
-            key = key_sigs[0]
-            return _tonic_result(key.tonic, key.mode)
-    except Exception:
-        pass
-
-    try:
-        # Priority 2: KeySignature (fifths only) + statistical mode detection
-        # music21 parses MusicXML <key><fifths>N</fifths></key> (no <mode>) as
-        # KeySignature, not Key.  We combine the explicit accidental count with
-        # Krumhansl-Schmuckler analysis to determine major vs minor, then call
-        # asKey(mode) to obtain the correct tonic.
         ksigs = _first_part(score).flatten().getElementsByClass(m21key.KeySignature)
         if ksigs:
             ks = ksigs[0]
+            if isinstance(ks, m21key.Key):
+                return _tonic_result(ks.tonic, ks.mode)
             analyzed = score.analyze('key')
             mode = analyzed.mode if analyzed else 'major'
             return _tonic_result(ks.asKey(mode).tonic, mode)
     except Exception:
         pass
 
-    # Priority 3: pure statistical analysis (no key-signature element at all)
+    # Priority 2: pure statistical analysis (no key-signature element at all)
     try:
         analyzed = score.analyze('key')
         return _tonic_result(analyzed.tonic, analyzed.mode)
     except Exception:
         pass
 
-    # Priority 4: first actual note — last resort (no mode info; treated as major)
+    # Priority 3: first actual note — last resort (no mode info; treated as major)
     try:
         for element in _first_part(score).flatten().notesAndRests:
             if isinstance(element, m21note.Note) and element.pitch is not None:

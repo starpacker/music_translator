@@ -321,7 +321,10 @@ def build_jianpu_ly_text(score, title: str, use_strict_timing: bool = False,
         if len(_v_ids) <= 1:
             # Single voice (or strict mode) — existing behaviour
             fn = extract_strict_jianpu_measures if use_strict_timing else extract_jianpu_measures
-            measures, _time_sig = fn(score, key_tonic_semitone)
+            if use_strict_timing:
+                measures, _time_sig = fn(score, key_tonic_semitone)
+            else:
+                measures, _time_sig = fn(score, key_tonic_semitone, follow_key_changes=True)
             _sections = [measures]
             _section_parts = [part if part is not None else score]
             _voice_groups = [[0]]
@@ -335,7 +338,7 @@ def build_jianpu_ly_text(score, title: str, use_strict_timing: bool = False,
             for i, vid in enumerate(_v_ids):
                 measures, ts = extract_jianpu_measures(
                     score, key_tonic_semitone, _part=part, _voice_id=vid,
-                    _multi_voice_mode=True, _is_primary_voice=(i == 0))
+                    _multi_voice_mode=True, _is_primary_voice=(i == 0), follow_key_changes=True)
                 if not _ts_set:
                     _time_sig, _ts_set = ts, True
                 if measures:
@@ -361,7 +364,8 @@ def build_jianpu_ly_text(score, title: str, use_strict_timing: bool = False,
                 voice_ids = _get_voice_ids_in_part(part)
                 if len(voice_ids) <= 1:
                     # No multi-voice structure — one section for the whole part
-                    measures, ts = extract_jianpu_measures(score, key_tonic_semitone, _part=part)
+                    measures, ts = extract_jianpu_measures(score, key_tonic_semitone, _part=part,
+                                                           follow_key_changes=True)
                     if not _ts_set:
                         _time_sig, _ts_set = ts, True
                     if measures:
@@ -378,7 +382,7 @@ def build_jianpu_ly_text(score, title: str, use_strict_timing: bool = False,
                     for i, vid in enumerate(voice_ids):
                         measures, ts = extract_jianpu_measures(
                             score, key_tonic_semitone, _part=part, _voice_id=vid,
-                            _multi_voice_mode=True, _is_primary_voice=(i == 0))
+                            _multi_voice_mode=True, _is_primary_voice=(i == 0), follow_key_changes=True)
                         if not _ts_set:
                             _time_sig, _ts_set = ts, True
                         if measures:
@@ -434,6 +438,10 @@ def build_jianpu_ly_text(score, title: str, use_strict_timing: bool = False,
                                               dynamic_marks.get(i + offset, []))
                     for offset, m in enumerate(line_measures)
                 ]
+                changes = getattr(measures, 'key_changes', {})
+                measure_texts = [f'{changes[i + offset][1]} {text}'
+                                 if i + offset in changes else text
+                                 for offset, text in enumerate(measure_texts)]
                 header.append(
                     ' | '.join(_with_time_signatures(measure_texts, i, section_time_sigs)) + ' |')
             except Exception as exc:

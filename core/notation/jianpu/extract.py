@@ -2,7 +2,7 @@
 import logging as _logging
 from typing import Optional
 
-from music21 import chord as m21chord, note as m21note, spanner, stream
+from music21 import chord as m21chord, key as m21key, note as m21note, spanner, stream
 
 from ...config import JianpuNote
 from ...utils import log_message
@@ -13,6 +13,8 @@ from .primitives import (
     normalize_jianpu_duration,
     note_to_jianpu,
     split_duration_chunks,
+    _get_score_key_tonic,
+    _tonic_result,
 )
 from .measure import (
     MeasureBarUnits,
@@ -152,7 +154,8 @@ def _extract_part_repeat_barlines(part) -> dict[int, dict[str, bool]]:
 def extract_jianpu_measures(score, key_tonic_semitone: int = 0,
                              _part=None, _voice_id: str = '1',
                              _multi_voice_mode: bool = False,
-                             _is_primary_voice: bool = True) -> tuple[list[list[JianpuNote]], str]:
+                             _is_primary_voice: bool = True,
+                             *, follow_key_changes: bool = False) -> tuple[list[list[JianpuNote]], str]:
     """
     Extract jianpu measure list and time signature from a music21 score.
     Merges polyphony by offset; fills gaps and overflows with rests at bar boundaries.
@@ -170,6 +173,8 @@ def extract_jianpu_measures(score, key_tonic_semitone: int = 0,
                          flat measure content when the measure has no explicit voice
                          containers.  Secondary voices (``_is_primary_voice=False``) emit
                          rests in such measures.
+    follow_key_changes : Apply source key changes at measure boundaries and
+                         expose their headers through ``measures.key_changes``.
     """
     part = _part if _part is not None else (score.parts[0] if score.parts else score.flatten())
     time_signature = '4/4'
@@ -221,7 +226,39 @@ def extract_jianpu_measures(score, key_tonic_semitone: int = 0,
     # a measure the OMR left completely empty a sane width — see the ``not
     # by_offset`` branch below.
     _previous_content = nominal_measure_length or 4.0
+    initial_tonic, initial_header = _get_score_key_tonic(score) if follow_key_changes else (None, None)
+    active_header = initial_header if initial_tonic == key_tonic_semitone else None
+    deferred_key = None
     for _m_idx, measure in enumerate(measure_streams):
+        if follow_key_changes:
+            boundary_key = deferred_key
+            deferred_key = None
+            for signature in measure.recurse().getElementsByClass(m21key.KeySignature):
+                signature_offset = float(signature.getOffsetInHierarchy(measure))
+                try:
+                    if isinstance(signature, m21key.Key):
+                        ref, header = _tonic_result(signature.tonic, signature.mode)
+                        explicit_mode = True
+                    else:
+                        major = signature.asKey('major')
+                        ref, header = _tonic_result(major.tonic, 'major')
+                        explicit_mode = False
+                except Exception:
+                    log_message(f'[jianpu] 小节 {_m_idx + 1} 的调号无法转换，保持之前的唱名；'
+                                '请核对。', _logging.WARNING)
+                    continue
+                candidate = (ref, header, explicit_mode)
+                if abs(signature_offset) < 1e-7:
+                    boundary_key = candidate
+                else:
+                    deferred_key = candidate
+                    log_message(f'[jianpu] 小节 {_m_idx + 1} 中途变调，保持当前唱名并在下一小节切换；'
+                                '请核对调号位置。', _logging.WARNING)
+            if boundary_key is not None:
+                ref, header, explicit_mode = boundary_key
+                if ref != key_tonic_semitone or (explicit_mode and active_header != header):
+                    measures.key_changes[_m_idx] = (ref, header)
+                    key_tonic_semitone, active_header = ref, header
         # The measure's length is decided *after* its notes are collected: it is
         # wherever the model's last note ends (see ``measure_length`` below).
         # No time signature is consulted — a bar the OMR under-filled keeps its
