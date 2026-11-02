@@ -14,6 +14,7 @@ from .primitives import (
     note_to_jianpu,
     split_duration_chunks,
     _get_score_key_tonic,
+    _reference_step_from_header,
     _tonic_result,
 )
 from .measure import (
@@ -185,9 +186,13 @@ def extract_jianpu_measures(score, key_tonic_semitone: int = 0,
         nominal_measure_length = float(getattr(time_sig[0].barDuration, 'quarterLength', 4.0) or 4.0)
 
     measures: MeasureBarUnits = MeasureBarUnits()
+    initial_tonic, initial_header = _get_score_key_tonic(score)
+    active_header = initial_header if initial_tonic == key_tonic_semitone else None
+    tonic_step = _reference_step_from_header(active_header, key_tonic_semitone)
     measure_streams = list(part.getElementsByClass(stream.Measure))
     if not measure_streams:
-        fallback_notes = [note_to_jianpu(element, key_tonic_semitone) for element in part.flatten().notesAndRests]
+        fallback_notes = [note_to_jianpu(element, key_tonic_semitone, tonic_step=tonic_step)
+                          for element in part.flatten().notesAndRests]
         fallback = MeasureBarUnits([fallback_notes] if fallback_notes else [])
         if fallback:
             fallback.bar_units.append(_parse_bar_units(time_signature))
@@ -226,8 +231,6 @@ def extract_jianpu_measures(score, key_tonic_semitone: int = 0,
     # a measure the OMR left completely empty a sane width — see the ``not
     # by_offset`` branch below.
     _previous_content = nominal_measure_length or 4.0
-    initial_tonic, initial_header = _get_score_key_tonic(score) if follow_key_changes else (None, None)
-    active_header = initial_header if initial_tonic == key_tonic_semitone else None
     deferred_key = None
     for _m_idx, measure in enumerate(measure_streams):
         if follow_key_changes:
@@ -256,9 +259,12 @@ def extract_jianpu_measures(score, key_tonic_semitone: int = 0,
                                 '请核对调号位置。', _logging.WARNING)
             if boundary_key is not None:
                 ref, header, explicit_mode = boundary_key
-                if ref != key_tonic_semitone or (explicit_mode and active_header != header):
+                changed_spelling = (active_header and active_header.startswith('1=')
+                                    and header.startswith('1=') and active_header != header)
+                if ref != key_tonic_semitone or (explicit_mode and active_header != header) or changed_spelling:
                     measures.key_changes[_m_idx] = (ref, header)
                     key_tonic_semitone, active_header = ref, header
+                    tonic_step = _reference_step_from_header(active_header, key_tonic_semitone)
         # The measure's length is decided *after* its notes are collected: it is
         # wherever the model's last note ends (see ``measure_length`` below).
         # No time signature is consulted — a bar the OMR under-filled keeps its
@@ -324,7 +330,7 @@ def extract_jianpu_measures(score, key_tonic_semitone: int = 0,
         for element in _flat_all:
             offset = _canonical_offset(_offset_seen, float(element.offset))
             if getattr(element.duration, 'isGrace', False):
-                grace = note_to_jianpu(element, key_tonic_semitone)
+                grace = note_to_jianpu(element, key_tonic_semitone, tonic_step=tonic_step)
                 grace.is_grace = True
                 grace.duration = 0.0
                 by_offset.setdefault(offset, []).append(grace)
@@ -333,7 +339,7 @@ def extract_jianpu_measures(score, key_tonic_semitone: int = 0,
             # 渲染为延音 dash（'-'），而非独立音符或休止符。
             _tie = getattr(element, 'tie', None)
             if _tie is not None and _tie.type in ('stop', 'continue'):
-                cont = note_to_jianpu(element, key_tonic_semitone)
+                cont = note_to_jianpu(element, key_tonic_semitone, tonic_step=tonic_step)
                 pitches = (cont.midi, *[p[4] for p in cont.chord_notes])
                 starts, stops = slur_boundaries.pop((round(offset, 7), pitches), (0, 0))
                 cont.slur_starts, cont.slur_stops = starts, stops
@@ -364,7 +370,7 @@ def extract_jianpu_measures(score, key_tonic_semitone: int = 0,
             # is not padding to fit a signature.
             measure_length = _previous_content
             measures.append([
-                note_to_jianpu(_rest_of(piece), key_tonic_semitone)
+                note_to_jianpu(_rest_of(piece), key_tonic_semitone, tonic_step=tonic_step)
                 for piece in (split_duration_chunks(measure_length) or [measure_length])
             ])
             measures.bar_units.append(int(round(measure_length * 16)))
@@ -394,7 +400,7 @@ def extract_jianpu_measures(score, key_tonic_semitone: int = 0,
                 for piece in split_duration_chunks(gap):
                     rest_piece = m21note.Rest()
                     rest_piece.duration.quarterLength = piece
-                    measure_notes.append(note_to_jianpu(rest_piece, key_tonic_semitone))
+                    measure_notes.append(note_to_jianpu(rest_piece, key_tonic_semitone, tonic_step=tonic_step))
                     current_offset += piece
 
             next_offset = offsets[idx + 1] if idx + 1 < len(offsets) else measure_length
@@ -405,7 +411,7 @@ def extract_jianpu_measures(score, key_tonic_semitone: int = 0,
                     measure_notes.append(element)
                     element_end = max(element_end, offset + element.duration)
                 else:
-                    jn = note_to_jianpu(element, key_tonic_semitone)
+                    jn = note_to_jianpu(element, key_tonic_semitone, tonic_step=tonic_step)
                     if not jn.is_rest:
                         pitches = (jn.midi, *[p[4] for p in jn.chord_notes])
                         starts, stops = slur_boundaries.pop((round(offset, 7), pitches), (0, 0))
@@ -418,7 +424,7 @@ def extract_jianpu_measures(score, key_tonic_semitone: int = 0,
                 for piece in split_duration_chunks(gap):
                     rest_piece = m21note.Rest()
                     rest_piece.duration.quarterLength = piece
-                    measure_notes.append(note_to_jianpu(rest_piece, key_tonic_semitone))
+                    measure_notes.append(note_to_jianpu(rest_piece, key_tonic_semitone, tonic_step=tonic_step))
             current_offset = next_offset
 
         # No trailing rest: the measure already ends with the model's last note,
@@ -449,6 +455,8 @@ def extract_strict_jianpu_measures(score, key_tonic_semitone: int = 0,
             _voice_id for per-voice extraction.
     """
     part = _part if _part is not None else (score.parts[0] if score.parts else score.flatten())
+    initial_tonic, header = _get_score_key_tonic(score)
+    tonic_step = _reference_step_from_header(header, key_tonic_semitone) if initial_tonic == key_tonic_semitone else None
     # 合并延音线：同小节 start→stop 对合并为单音符；跨小节 tie 的合并音符由
     # append_element_chunks 正确跨 bar 拆分。
     try:
@@ -565,7 +573,7 @@ def extract_strict_jianpu_measures(score, key_tonic_semitone: int = 0,
                 return
             for piece in split_duration_chunks(piece_total):
                 element_piece = clone_monophonic_element(element_template, piece)
-                current_measure.append(note_to_jianpu(element_piece, key_tonic_semitone))
+                current_measure.append(note_to_jianpu(element_piece, key_tonic_semitone, tonic_step=tonic_step))
                 current_pos += piece
             remaining -= piece_total
             # 判断当前位置是否恰好是小节边界

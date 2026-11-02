@@ -57,8 +57,10 @@ def audit(path: Path) -> dict:
             reference = extracted.key_changes[index][0]
         canonical_measure = original[index]
         for event in canonical_measure.recurse().notes:
-            pitches = (sorted(p.midi for p in event.pitches)
-                       if isinstance(event, chord.Chord) else [event.pitch.midi])
+            # Pitch-space values retain fractional semitones, unlike MIDI
+            # integers, so an unsupported microtone cannot audit as exact.
+            pitches = (sorted(p.ps for p in event.pitches)
+                       if isinstance(event, chord.Chord) else [event.pitch.ps])
             source.append({'pitches': pitches, 'duration': round(float(event.duration.quarterLength), 6),
                            'grace': bool(event.duration.isGrace),
                            'continuation': bool(event.tie and event.tie.type in ('stop', 'continue')),

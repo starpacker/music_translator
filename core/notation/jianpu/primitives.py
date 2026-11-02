@@ -266,11 +266,32 @@ def _extract_lyrics(element) -> dict[int, tuple[str, bool]]:
     return result
 
 
-def _pitch_to_fields(pitch, key_tonic_semitone: int) -> tuple[str, str, int, int, int]:
+def _reference_step_from_header(header: str | None, tonic_semitone: int) -> str | None:
+    """Return the relative-major tonic letter if the header matches the reference."""
+    if not header or '=' not in header:
+        return None
+    try:
+        from music21.pitch import Pitch
+        degree, name = header.split('=', 1)
+        tonic = Pitch(name.replace('b', '-'))
+        if degree == '6':
+            tonic = _relative_major_tonic(tonic)
+        elif degree != '1':
+            return None
+        return tonic.step if tonic.pitchClass == tonic_semitone % 12 else None
+    except (ValueError, TypeError):
+        return None
+
+
+def _pitch_to_fields(pitch, key_tonic_semitone: int,
+                     tonic_step: str | None = None) -> tuple[str, str, int, int, int]:
     """Map a music21 Pitch to (accidental, symbol, upper_dots, lower_dots, midi).
 
     Movable-Do: the pitch-class of *key_tonic_semitone* becomes '1'.
     """
+    pitch_space = getattr(pitch, 'ps', None)
+    if pitch_space is not None and abs(pitch_space - round(pitch_space)) > 1e-7:
+        _log_message('[jianpu] 微分音无法用当前简谱符号准确表示，已取整半音，请校对。', _logging.WARNING)
     note_midi = pitch.midi
     if note_midi is None:
         _step_pc = {'C': 0, 'D': 2, 'E': 4, 'F': 5, 'G': 7, 'A': 9, 'B': 11}
@@ -283,6 +304,22 @@ def _pitch_to_fields(pitch, key_tonic_semitone: int) -> tuple[str, str, int, int
     diff = note_midi - key_midi_ref
     relative_semitone = diff % 12
     octave_offset = diff // 12
+
+    # Preserve the diatonic spelling when it fits Jianpu's supported single
+    # accidentals. Pitch-class-only conversion changes, for example, C-major
+    # B-flat into #6 instead of b7 even though both sound the same.
+    steps = 'CDEFGAB'
+    if tonic_step and tonic_step in steps and getattr(pitch, 'step', None) in steps:
+        degree = (steps.index(pitch.step) - steps.index(tonic_step)) % 7
+        natural_semitone = (0, 2, 4, 5, 7, 9, 11)[degree]
+        alter = (diff - natural_semitone) % 12
+        if alter > 6:
+            alter -= 12
+        if alter in (-1, 0, 1):
+            accidental = {-1: 'b', 0: '', 1: '#'}[alter]
+            octave_offset = (diff - natural_semitone - alter) // 12
+            return accidental, str(degree + 1), max(octave_offset, 0), max(-octave_offset, 0), note_midi
+        _log_message('[jianpu] 原音名需要重升或重降唱名，暂用等音代替，请校对。', _logging.WARNING)
 
     if relative_semitone in _DIATONIC_SEMITONES:
         symbol = _DIATONIC_SEMITONES[relative_semitone]
@@ -354,7 +391,8 @@ def _apply_tuplet_metadata(result: JianpuNote, element) -> JianpuNote:
     return result
 
 
-def note_to_jianpu(element, key_tonic_semitone: int = 0) -> JianpuNote:
+def note_to_jianpu(element, key_tonic_semitone: int = 0, *,
+                   tonic_step: str | None = None) -> JianpuNote:
     """Convert a music21 note, rest or chord to a JianpuNote dataclass (Movable-Do / 首调唱名法).
 
     *key_tonic_semitone* is the pitch-class (0–11) of the reference tonic
@@ -385,10 +423,10 @@ def note_to_jianpu(element, key_tonic_semitone: int = 0) -> JianpuNote:
     if isinstance(element, m21chord.Chord) and element.pitches:
         _sorted_pitches = sorted(element.pitches, key=lambda p: p.midi if p.midi is not None else 0)
         accidental, symbol, upper_dots, lower_dots, note_midi = _pitch_to_fields(
-            _sorted_pitches[0], key_tonic_semitone
+            _sorted_pitches[0], key_tonic_semitone, tonic_step
         )
         chord_notes = tuple(
-            _pitch_to_fields(p, key_tonic_semitone)[:5] for p in _sorted_pitches[1:]
+            _pitch_to_fields(p, key_tonic_semitone, tonic_step)[:5] for p in _sorted_pitches[1:]
         )
         # 规范化：_pitch_to_fields 返回 (acc, sym, up, low, midi)，即 chord_notes 的元素顺序
         return _apply_tuplet_metadata(JianpuNote(
@@ -415,7 +453,7 @@ def note_to_jianpu(element, key_tonic_semitone: int = 0) -> JianpuNote:
         ), element)
 
     accidental, symbol, upper_dots, lower_dots, note_midi = _pitch_to_fields(
-        pitch, key_tonic_semitone
+        pitch, key_tonic_semitone, tonic_step
     )
 
     return _apply_tuplet_metadata(JianpuNote(
