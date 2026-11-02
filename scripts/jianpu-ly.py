@@ -1459,7 +1459,8 @@ def gracenotes_western(notes,word,line,marks_by_index=None):
 
 
 _GRACE_MARK_NAMES = ('accent', 'marcato', 'staccato', 'staccatissimo', 'tenuto',
-                     'fermata', 'trill', 'mordent', 'prall', 'turn', 'reverseturn')
+                     'fermata', 'shortfermata', 'longfermata', 'trill', 'mordent',
+                     'prall', 'turn', 'reverseturn')
 
 
 def merge_marked_grace_groups(line):
@@ -1836,7 +1837,7 @@ def getLY(score,headers=None,have_final_barline=True):
                 out[rStartP] = out[rStartP].replace(('volta %d ' % (extraRepeats+1)),('volta %d ' % (extraRepeats+2))) # ensure there's enough repeats for the alternatives
             elif word.startswith('GraceMark:'):
                 mark = word[len('GraceMark:'):]
-                if not re.match(r"^[\^_]?\\(?:accent|marcato|staccato|staccatissimo|tenuto|fermata|trill|mordent|prall|turn|reverseturn)$", mark):
+                if not re.match(r"^[\^_]?\\(?:accent|marcato|staccato|staccatissimo|tenuto|fermata|shortfermata|longfermata|trill|mordent|prall|turn|reverseturn)$", mark):
                     scoreError("Unsupported grace-note mark",word,line)
                 if not out or not out[-1].startswith(r'\grace { ') or not out[-1].endswith(' }'):
                     scoreError("Grace-note mark has no preceding grace note",word,line)

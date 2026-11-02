@@ -314,8 +314,14 @@ def _source_notations(element) -> tuple[str, ...]:
         if command is None:
             _log_message(f'[jianpu] 未支持的音符演奏记号 {type(mark).__name__}，请校对。', _logging.WARNING)
             continue
-        if isinstance(mark, m21expr.Fermata) and getattr(mark, 'shape', 'normal') not in ('normal', None):
-            _log_message('[jianpu] 特殊延长记号形状暂按普通延长记号显示，请校对。', _logging.WARNING)
+        if isinstance(mark, m21expr.Fermata):
+            shape = getattr(mark, 'shape', 'normal')
+            shapes = {'normal': 'fermata', None: 'fermata', '': 'fermata',
+                      'angled': 'shortfermata', 'square': 'longfermata'}
+            if shape in shapes:
+                command = shapes[shape]
+            else:
+                _log_message('[jianpu] 未支持的延长记号形状暂按普通延长记号显示，请校对。', _logging.WARNING)
         if type(mark) is m21art.StrongAccent and getattr(mark, 'pointDirection', 'up') != 'up':
             _log_message('[jianpu] 强重音的方向未必能准确还原，请校对。', _logging.WARNING)
         if any(getattr(mark, attr, None) is not None for attr in ('accidental', 'upperAccidental', 'lowerAccidental')):

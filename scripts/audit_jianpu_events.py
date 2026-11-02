@@ -106,9 +106,11 @@ def audit(path: Path) -> dict:
         target_order = ['rest' if event.is_rest else 'note' for event in extracted[index]]
         source_marks = []
         source_fermatas = []
+        source_fermata_shapes = []
         for event in canonical_measure.recurse().notesAndRests:
             marks = []
             fermatas = []
+            fermata_shapes = []
             for mark in (*event.articulations, *event.expressions):
                 name = _SUPPORTED_MARKS.get(type(mark))
                 if name is None:
@@ -118,18 +120,25 @@ def audit(path: Path) -> dict:
                     source_mark_counts[name] += 1
                     if type(mark) is expressions.Fermata:
                         fermatas.append(mark.type)
+                        fermata_shapes.append(mark.shape or 'normal')
             source_marks.append(sorted(marks))
             source_fermatas.append(sorted(fermatas))
+            source_fermata_shapes.append(sorted(fermata_shapes))
         target_marks = []
         target_fermatas = []
+        target_fermata_shapes = []
+        shapes_by_command = {'fermata': 'normal', 'shortfermata': 'angled', 'longfermata': 'square'}
         for event in extracted[index]:
-            marks = sorted(mark.lstrip('^_').removeprefix('\\') for mark in event.notations)
+            commands = [mark.lstrip('^_').removeprefix('\\') for mark in event.notations]
+            marks = sorted('fermata' if command in shapes_by_command else command for command in commands)
             target_marks.append(marks)
             jianpu_mark_counts.update(marks)
             target_fermatas.append(sorted('inverted' if mark.startswith('_') else
                                            'upright' if mark.startswith('^') else 'unspecified'
                                            for mark in event.notations
-                                           if mark.lstrip('^_') == r'\fermata'))
+                                           if mark.lstrip('^_').removeprefix('\\') in shapes_by_command))
+            target_fermata_shapes.append(sorted(shapes_by_command[command]
+                                                for command in commands if command in shapes_by_command))
         # Empty per-event mark lists can differ merely because an unmarked
         # note or rest is missing; the event comparison already reports that.
         if source_marks != target_marks and (any(source_marks) or any(target_marks)):
@@ -140,6 +149,11 @@ def audit(path: Path) -> dict:
             mismatches.append({'index': index + 1, 'measure_number': str(original[index].number),
                                'reason': 'fermata_direction', 'source': source_fermatas,
                                'jianpu': target_fermatas})
+        if (source_fermata_shapes != target_fermata_shapes
+                and (any(source_fermata_shapes) or any(target_fermata_shapes))):
+            mismatches.append({'index': index + 1, 'measure_number': str(original[index].number),
+                               'reason': 'fermata_shape', 'source': source_fermata_shapes,
+                               'jianpu': target_fermata_shapes})
         if (source != target or source_rests != target_rests or source_order != target_order
                 or source_rest_tuplets != target_rest_tuplets):
             mismatches.append({'index': index + 1, 'measure_number': str(original[index].number),

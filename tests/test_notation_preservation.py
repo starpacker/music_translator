@@ -130,7 +130,9 @@ class NotationPreservationTest(unittest.TestCase):
             fermatas = tree.findall('.//fermata')
             fermatas[0].attrib.pop('type', None)
             fermatas[1].set('type', 'upright')
+            fermatas[1].text = 'angled'
             fermatas[2].set('type', 'inverted')
+            fermatas[2].text = 'square'
             tree.write(xml, encoding='utf-8', xml_declaration=True)
             original = xml.read_bytes()
             score = parse_musicxml_compatible(xml)
@@ -140,17 +142,23 @@ class NotationPreservationTest(unittest.TestCase):
             tonic, _ = _get_score_key_tonic(score)
             measures, _ = extract_jianpu_measures(score, tonic, follow_key_changes=True)
             extracted = [mark for bar in measures for event in bar
-                         for mark in event.notations if mark.endswith(r'\fermata')]
-            self.assertEqual(extracted, [r'^\fermata', r'^\fermata', r'_\fermata'])
+                         for mark in event.notations if mark.endswith('fermata')]
+            self.assertEqual(extracted, [r'^\fermata', r'^\shortfermata', r'_\longfermata'])
             self.assertEqual(audit(xml)['mismatch_count'], 0)
             from core.notation.jianpu import primitives
             original_notations = primitives._source_notations
             def wrong_direction(event):
-                return tuple(mark.replace(r'_\fermata', r'^\fermata')
+                return tuple(mark.replace(r'_\longfermata', r'^\longfermata')
                              for mark in original_notations(event))
             with mock.patch.object(primitives, '_source_notations', side_effect=wrong_direction):
                 result = audit(xml)
             self.assertTrue(any(m.get('reason') == 'fermata_direction' for m in result['mismatches']))
+            def wrong_shape(event):
+                return tuple(mark.replace(r'\shortfermata', r'\fermata')
+                             for mark in original_notations(event))
+            with mock.patch.object(primitives, '_source_notations', side_effect=wrong_shape):
+                result = audit(xml)
+            self.assertTrue(any(m.get('reason') == 'fermata_shape' for m in result['mismatches']))
             self.assertEqual(xml.read_bytes(), original)
 
     def test_graphical_fallback_warns_that_marks_may_be_lost(self):
@@ -186,6 +194,11 @@ class NotationPreservationTest(unittest.TestCase):
                                                     '1=C', '4/4', 'test'), root)
             self.assertIn(r'^\fermata', ly)
             self.assertIn(r'_\fermata', ly)
+            self.assertTrue(_render_ly_tile(ly, root)[0].is_file())
+            ly = _run_jianpu_ly(_jianpu_ly_source(
+                [[r'g[2] GraceMark:^\shortfermata g[3] GraceMark:_\longfermata 1 - - -']],
+                '1=C', '4/4', 'test'), root)
+            self.assertIn(r"d'16 ^\shortfermata e'16 _\longfermata", ly)
             self.assertTrue(_render_ly_tile(ly, root)[0].is_file())
 
     @unittest.skipUnless(shutil.which('lilypond'), 'LilyPond is required')
