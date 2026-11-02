@@ -17,6 +17,44 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class PiecewiseCutTest(unittest.TestCase):
+    def test_empty_pixel_row_inside_one_object_is_not_a_safe_cut(self):
+        from insitu.render_insitu import _blank_cut, _cut_has_ink
+        source = pymupdf.open()
+        page = source.new_page(width=200, height=160)
+        # One vector symbol with disconnected upper and lower strokes.
+        shape = page.new_shape()
+        shape.draw_rect(pymupdf.Rect(80, 50, 90, 60))
+        shape.draw_rect(pymupdf.Rect(80, 85, 90, 95))
+        shape.finish(color=None, fill=(0, 0, 0))
+        shape.commit()
+        pix = page.get_pixmap(matrix=pymupdf.Matrix(2, 2), colorspace=pymupdf.csGRAY, alpha=False)
+        pixels = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.stride)
+        self.assertTrue(np.all(pixels[2 * 72, :pix.width] >= 245))
+        self.assertTrue(_cut_has_ink(page, 72))
+        cut = _blank_cut(page, 40, 110)
+        self.assertTrue(_cut_has_ink(page, cut))
+        from insitu.render_insitu import _piecewise_blank_cut
+        safe, overrides = _piecewise_blank_cut(page, 40, 110)
+        self.assertFalse(_cut_has_ink(page, safe, overrides))
+        self.assertTrue(safe <= 50 or safe >= 95)
+        page = source.new_page(width=200, height=160)
+        shape = page.new_shape()
+        shape.draw_line((80, 50), (80, 60))
+        shape.draw_line((80, 85), (80, 95))
+        shape.finish(color=(0, 0, 0), width=.5)
+        shape.commit()
+        self.assertTrue(_cut_has_ink(page, 72), 'zero-width path bounds must also be protected')
+        page = source.new_page(width=200, height=160)
+        page.insert_text((80, 105), 'i', fontsize=60)
+        pix = page.get_pixmap(matrix=pymupdf.Matrix(2, 2), colorspace=pymupdf.csGRAY, alpha=False)
+        pixels = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.stride)
+        ys = np.flatnonzero(np.any(pixels[:, :pix.width] < 245, axis=1))
+        parts = np.split(ys, np.where(np.diff(ys) > 1)[0] + 1)
+        self.assertEqual(len(parts), 2)
+        between = (parts[0][-1] + parts[1][0]) / 4
+        self.assertTrue(_cut_has_ink(page, between), 'the dot and stem belong to the same glyph')
+        source.close()
+
     def test_piecewise_cut_preserves_disjoint_interleaved_source_ink(self):
         from insitu.render_insitu import (_blank_cut, _copy_with_column_cuts,
                                           _cut_has_ink, _piecewise_blank_cut)
@@ -52,7 +90,7 @@ class PiecewiseCutTest(unittest.TestCase):
         source.close()
 
     def test_tempo_moves_with_next_staff_while_previous_dynamic_stays(self):
-        from insitu.render_insitu import _copy_with_column_cuts, _tempo_cut_overrides
+        from insitu.render_insitu import _copy_with_column_cuts, _cut_has_ink, _tempo_cut_overrides
         with tempfile.TemporaryDirectory() as tmp:
             src_path = Path(tmp) / 'source.pdf'
             source = pymupdf.open()
@@ -70,6 +108,7 @@ class PiecewiseCutTest(unittest.TestCase):
             self.assertLess(cut, 165)
             self.assertLess(left, 300)
             self.assertGreater(right, 330)
+            self.assertFalse(_cut_has_ink(source[0], 168, overrides))
             output = pymupdf.open()
             target = output.new_page(width=600, height=450)
             _copy_with_column_cuts(target, source, 0,

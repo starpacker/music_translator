@@ -245,6 +245,47 @@ def _render_ly_tile(ly_text: str, workdir: Path) -> tuple[Path, fitz.Rect]:
 
 # ── main ─────────────────────────────────────────────────────────────────────
 
+def _source_ink_boxes(page, low: float, high: float, raster=None):
+    """Bounding boxes of indivisible visible glyphs and vector paths in a band."""
+    import numpy as np
+    if raster is None:
+        raster = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False, colorspace=fitz.csGRAY)
+    pixels = np.frombuffer(raster.samples, dtype=np.uint8).reshape(raster.height, raster.stride)
+    boxes = []
+    # Trace boxes follow the glyph's actual font size. The raw text extractor
+    # can return a much taller line box for music fonts, falsely covering
+    # entire gaps and preventing otherwise safe placement.
+    for span in page.get_texttrace():
+        for codepoint, _, _, bounds in span['chars']:
+            if codepoint not in (9, 10, 13, 32):
+                box = fitz.Rect(bounds)
+                if box.y1 <= low or box.y0 >= high:
+                    continue
+                x0 = max(0, int(np.floor(box.x0 * 2)) - raster.x)
+                x1 = min(raster.width, int(np.ceil(box.x1 * 2)) - raster.x)
+                y0 = max(0, int(np.floor(box.y0 * 2)) - raster.y)
+                y1 = min(raster.height, int(np.ceil(box.y1 * 2)) - raster.y)
+                if x1 <= x0 or y1 <= y0:
+                    continue
+                ink_rows = np.flatnonzero(np.any(pixels[y0:y1, x0:x1] < 245, axis=1))
+                if len(ink_rows):
+                    # Font boxes frequently have large unused ascenders or
+                    # descenders. Keep both disconnected parts of a glyph,
+                    # but do not classify those blank margins as ink.
+                    box.y0 = (raster.y + y0 + int(ink_rows[0])) / 2
+                    box.y1 = (raster.y + y0 + int(ink_rows[-1]) + 1) / 2
+                    boxes.append(box)
+    for drawing in page.get_drawings():
+        box = fitz.Rect(drawing['rect'])
+        if box.x0 == box.x1 and box.y1 > box.y0:
+            # Vertical paths can have zero-width bounding boxes even when
+            # drawn with a visible stroke or a dashed pattern.
+            box.x0 -= .25
+            box.x1 += .25
+        boxes.append(box)
+    return [box for box in boxes if box.y1 > low and box.y0 < high and box.x1 > box.x0]
+
+
 def _blank_cut(page, low: float, high: float) -> float:
     """Choose a low-ink horizontal cut in the gap between adjacent systems."""
     low = max(0.0, min(low, page.rect.height - 1))
@@ -256,6 +297,34 @@ def _blank_cut(page, low: float, high: float) -> float:
     counts = np.count_nonzero(pixels[start:end, :pix.width] < 245, axis=1)
     if not len(counts):
         return low
+    # An empty pixel row may still pass between disconnected parts of one
+    # glyph or path (for example the dot and stem of a letter). Prefer an
+    # empty row that is also outside every source object's bounding box.
+    rows = (start + np.arange(len(counts))) / 2
+    clear_objects = np.ones(len(counts), dtype=bool)
+    for box in _source_ink_boxes(page, low, high, pix):
+        clear_objects &= ~((rows > box.y0 + .05) & (rows < box.y1 - .05))
+    safe_mask = (counts == 0) & clear_objects
+    # Clip-edge rasterization can differ slightly from the full-page raster.
+    # Prefer a blank half-point on both sides of the boundary when available.
+    padded = safe_mask.copy()
+    if len(padded) > 2:
+        padded[1:] &= counts[:-1] == 0
+        padded[:-1] &= counts[1:] == 0
+        padded[0] = padded[-1] = False
+    safe = np.flatnonzero(padded)
+    if not len(safe):
+        safe = np.flatnonzero(safe_mask)
+    if len(safe):
+        middle = (len(counts) - 1) / 2
+        row = min(safe, key=lambda i: abs(i - middle))
+        blank = np.flatnonzero(counts == 0)
+        nearest = min(blank, key=lambda i: abs(i - middle))
+        # A distant straight cut may move an annotation to the wrong staff.
+        # Let the tempo-aware / piecewise validation handle a much closer
+        # candidate before selecting such a distant cut.
+        if abs(row - middle) <= abs(nearest - middle) + 4:
+            return (start + int(row)) / 2
     best = int(counts.min())
     choices = np.flatnonzero(counts == best)
     middle = (len(counts) - 1) / 2
@@ -265,14 +334,36 @@ def _blank_cut(page, low: float, high: float) -> float:
     return (start + int(row)) / 2
 
 
-def _cut_has_ink(page, cut: float) -> bool:
-    """Check the exact half-point raster row selected by _blank_cut."""
+def _cut_has_ink(page, cut: float, overrides=()) -> bool:
+    """Reject ink or split objects along the whole possibly piecewise cut."""
     import numpy as np
-    clip = fitz.Rect(0, cut, page.rect.width, min(page.rect.height, cut + .5))
-    pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), clip=clip,
-                          alpha=False, colorspace=fitz.csGRAY)
+    boundaries = sorted({0.0, page.rect.width,
+                         *(max(0.0, min(page.rect.width, x))
+                           for left, right, _ in overrides for x in (left, right))})
+    segments = []
+    for left, right in zip(boundaries, boundaries[1:]):
+        middle = (left + right) / 2
+        level = min([cut] + [y for x0, x1, y in overrides if x0 <= middle <= x1])
+        segments.append((left, right, level))
+    lowest = min([cut] + [y for _, _, y in overrides])
+    pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False, colorspace=fitz.csGRAY)
     pixels = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.stride)
-    return not pix.height or bool(np.any(pixels[:, :pix.width] < 245))
+    boxes = _source_ink_boxes(page, lowest - .1, cut + .1, pix)
+    for left, right, level in segments:
+        row = int(np.floor(level * 2)) - pix.y
+        x0 = max(0, int(np.floor(left * 2)) - pix.x)
+        x1 = min(pix.width, int(np.ceil(right * 2)) - pix.x)
+        if not 0 <= row < pix.height or np.any(pixels[row, x0:x1] < 245):
+            return True
+        if any(box.x0 < right and box.x1 > left and box.y0 + .05 < level < box.y1 - .05
+               for box in boxes):
+            return True
+    for first, second in zip(segments, segments[1:]):
+        seam, lower, upper = first[1], min(first[2], second[2]), max(first[2], second[2])
+        if lower < upper and any(box.x0 < seam < box.x1 and box.y0 < upper and box.y1 > lower
+                                 for box in boxes):
+            return True
+    return False
 
 
 def _piecewise_blank_cut(page, low: float, high: float):
@@ -295,14 +386,7 @@ def _piecewise_blank_cut(page, low: float, high: float):
     # Treat each source glyph and vector drawing as indivisible even if its
     # ink contains empty columns or rows. Otherwise separate components of a
     # single symbol could be translated to opposite sides of the new gap.
-    boxes = []
-    for block in page.get_text('rawdict')['blocks']:
-        for line in block.get('lines', []):
-            for span in line.get('spans', []):
-                boxes.extend(fitz.Rect(char['bbox']) for char in span['chars']
-                             if char.get('c', '').strip())
-    boxes.extend(fitz.Rect(drawing['rect']) for drawing in page.get_drawings())
-    boxes = [box for box in boxes if box.y1 > low and box.y0 < high and box.x1 > box.x0]
+    boxes = _source_ink_boxes(page, low, high)
     for box in boxes:
         left = max(0, int(box.x0 * scale) - pix.x)
         right = min(pix.width, int(np.ceil(box.x1 * scale)) - pix.x)
@@ -823,7 +907,9 @@ def build(pdf_path: Path, mxl_path: Path, out_path: Path,
                 high = min(next_top - 5, staff.bottom + 55)
                 high = max(low + 1, high)
                 cut = _blank_cut(page, low, high)
-                if _cut_has_ink(page, cut):
+                overrides = (_tempo_cut_overrides(page, low, cut, next_top)
+                             if next_top < page.rect.height else [])
+                if _cut_has_ink(page, cut, overrides):
                     safe_cut = _piecewise_blank_cut(page, low, high)
                     if safe_cut is None:
                         # Preserve the uncut source and continue with the
@@ -843,8 +929,6 @@ def build(pdf_path: Path, mxl_path: Path, out_path: Path,
                     piecewise_rows += 1
                     row_reports[index]['source_cut'] = 'piecewise'
                 else:
-                    overrides = (_tempo_cut_overrides(page, low, cut, next_top)
-                                 if next_top < page.rect.height else [])
                     row_reports[index]['source_cut'] = 'tempo_piecewise' if overrides else 'blank'
                 line_tiles = tiles[index]
                 total_ink = sum(ink.height for _, ink, _, _ in line_tiles) + 9 * (len(line_tiles) - 1)
