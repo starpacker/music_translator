@@ -9,6 +9,28 @@ from core.notation.jianpu import extract_jianpu_measures
 
 
 class EventAuditTest(unittest.TestCase):
+    def test_reports_missing_rest(self):
+        score = stream.Score()
+        part = stream.Part()
+        measure = stream.Measure(number=1)
+        measure.insert(0, meter.TimeSignature('4/4'))
+        measure.insert(0, note.Note('C4', quarterLength=2))
+        measure.insert(2, note.Rest(quarterLength=2))
+        part.append(measure)
+        score.insert(0, part)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'score.musicxml'
+            score.write('musicxml', fp=path)
+            self.assertEqual(audit(path)['mismatch_count'], 0)
+            def omit_rest(*args, **kwargs):
+                measures, ts = extract_jianpu_measures(*args, **kwargs)
+                measures[0] = [event for event in measures[0] if not event.is_rest]
+                return measures, ts
+            with patch('scripts.audit_jianpu_events.extract_jianpu_measures', side_effect=omit_rest):
+                report = audit(path)
+            self.assertEqual(report['mismatches'][0]['source_rests'], [2.0])
+            self.assertEqual(report['mismatches'][0]['jianpu_rests'], [])
+
     def test_reports_missing_extracted_pitch(self):
         score = stream.Score()
         part = stream.Part()
