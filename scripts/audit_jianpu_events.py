@@ -29,6 +29,11 @@ _SUPPORTED_MARKS = {
 }
 
 
+def _tie_types(event):
+    members = event.notes if isinstance(event, chord.Chord) else (event,)
+    return [member.tie.type if member.tie else None for member in members]
+
+
 def audit(path: Path) -> dict:
     score = parse_musicxml_compatible(path)
     if not score.parts:
@@ -61,9 +66,14 @@ def audit(path: Path) -> dict:
             # integers, so an unsupported microtone cannot audit as exact.
             pitches = (sorted(p.ps for p in event.pitches)
                        if isinstance(event, chord.Chord) else [event.pitch.ps])
+            ties = _tie_types(event)
+            if isinstance(event, chord.Chord) and len(set(ties)) > 1:
+                mismatches.append({'index': index + 1, 'measure_number': str(original[index].number),
+                                   'reason': 'partial_chord_tie_unrepresented',
+                                   'pitches': [n.pitch.ps for n in event.notes], 'tie_types': ties})
             source.append({'pitches': pitches, 'duration': round(float(event.duration.quarterLength), 6),
                            'grace': bool(event.duration.isGrace),
-                           'continuation': bool(event.tie and event.tie.type in ('stop', 'continue')),
+                           'continuation': bool(ties and all(t in ('stop', 'continue') for t in ties)),
                            'tuplets': [[t.numberNotesActual, t.numberNotesNormal]
                                        for t in event.duration.tuplets]})
         target = []
@@ -177,7 +187,8 @@ def audit(path: Path) -> dict:
             'comparable_melodic_slurs': len(comparable_slurs),
             'jianpu_slur_starts': starts, 'jianpu_slur_stops': stops,
             'source_tie_continuations': sum(1 for event in part.recurse().notes
-                                            if event.tie and event.tie.type in ('stop', 'continue')),
+                                            if _tie_types(event) and all(t in ('stop', 'continue')
+                                                                         for t in _tie_types(event))),
             'jianpu_tie_continuations': sum(1 for measure in extracted for event in measure
                                             if event.symbol == '-'),
             'source_supported_note_marks': dict(source_mark_counts),

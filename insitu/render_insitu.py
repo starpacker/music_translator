@@ -836,6 +836,12 @@ def build(pdf_path: Path, mxl_path: Path, out_path: Path,
             voice_report = {'voice_index': voice_index + 1, 'rendered': False,
                             'placement': None, 'error': None, 'measures': []}
             row_report['voices'].append(voice_report)
+            voice_report['tie_review_measures'] = [
+                {'musicxml_index': sl.omr_start + offset + 1,
+                 'reasons': sorted({event.tie_review for event in measure if event.tie_review})}
+                for offset, measure in enumerate(measures[sl.omr_start:sl.omr_end])
+                if any(event.tie_review for event in measure)
+            ]
             line_measures = _line_slur_continuations(measures, sl.omr_start, sl.omr_end)
             chunk = _with_time_signatures(
                 _measure_texts(line_measures, time_sig), 0,
@@ -976,8 +982,11 @@ def build(pdf_path: Path, mxl_path: Path, out_path: Path,
     missing = sum(not row['rendered'] or len(row['voices']) != len(tracks)
                   or any(not voice['rendered'] for voice in row['voices']) for row in row_reports)
     mismatches = sum(row['pdf_measures'] != row['musicxml_measures'] for row in row_reports)
+    tie_review_count = sum(len(voice.get('tie_review_measures', []))
+                           for row in row_reports for voice in row['voices'])
     status = ('incomplete' if not staves or missing else
-              'needs_review' if fallback_rows or mismatches or piecewise_rows or len(score.parts) > 1 else 'rendered')
+              'needs_review' if fallback_rows or mismatches or piecewise_rows or tie_review_count
+              or len(score.parts) > 1 else 'rendered')
     try:
         def digest(path):
             hasher = hashlib.sha256()
@@ -993,6 +1002,7 @@ def build(pdf_path: Path, mxl_path: Path, out_path: Path,
                   'incomplete_staff_count': missing, 'alignment_mismatch_count': mismatches,
                   'placement_fallback_count': fallback_rows,
                   'piecewise_source_cut_count': piecewise_rows,
+                  'tie_review_measure_count': tie_review_count,
                   'musicxml_part_count': len(score.parts), 'rows': row_reports}
         _write_json_report(report_path, report)
         print(f'[insitu] 逐行报告: {report_path}（{status}）')

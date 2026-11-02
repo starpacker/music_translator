@@ -699,6 +699,7 @@ def clone_jianpu_note(note: JianpuNote, duration: float, carry_lyrics: bool = Tr
         tuplet_start=note.tuplet_start,
         tuplet_stop=note.tuplet_stop,
         notations=note.notations if carry_lyrics else (),
+        tie_review=note.tie_review if carry_lyrics else '',
     )
 
 

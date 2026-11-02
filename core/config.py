@@ -157,3 +157,5 @@ class JianpuNote:
     tuplet_stop: bool = False
     # Safe, whitelisted LilyPond post-events attached to this exact event.
     notations: tuple[str, ...] = ()
+    # Exact note-level tie information could not be represented safely.
+    tie_review: str = ''

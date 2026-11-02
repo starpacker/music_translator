@@ -227,6 +227,9 @@ def extract_jianpu_measures(score, key_tonic_semitone: int = 0,
             _first_measure_length_override = _fallback_ql
 
     tol = 0.01
+    # A dash repeats the preceding event's *entire* pitch set. Only use it
+    # when the previous adjacent source event ties every one of those pitches.
+    previous_source = None
     # How long the previous measure's *content* actually was.  Only used to give
     # a measure the OMR left completely empty a sane width — see the ``not
     # by_offset`` branch below.
@@ -272,6 +275,7 @@ def extract_jianpu_measures(score, key_tonic_semitone: int = 0,
         # keeps every note (nothing is dropped or clamped).  The pickup
         # detection above stays only for the signature word shown in the UI.
         by_offset: dict[float, list[object]] = {}
+        tie_review_candidates: dict[int, str] = {}
         _offset_seen: dict[int, float] = {}  # Preserve first offset for epsilon-only deduplication.
         slur_boundaries: dict[tuple[float, tuple[int, ...]], list[int]] = {}
         for source_note in measure.recurse().notes:
@@ -335,11 +339,34 @@ def extract_jianpu_measures(score, key_tonic_semitone: int = 0,
                 grace.duration = 0.0
                 by_offset.setdefault(offset, []).append(grace)
                 continue
+            full_continuation = False
+            tie_review = ''
+            if isinstance(element, m21note.Rest):
+                previous_source = None
+            else:
+                component_notes = list(element.notes) if isinstance(element, m21chord.Chord) else [element]
+                source_pitches = tuple(sorted(n.pitch.ps for n in component_notes))
+                tie_types = [n.tie.type if n.tie else None for n in component_notes]
+                incoming = [kind in ('stop', 'continue') for kind in tie_types]
+                outgoing = [kind in ('start', 'continue') for kind in tie_types]
+                absolute_offset = float(measure.getOffsetInHierarchy(part)) + offset
+                full_continuation = bool(
+                    incoming and all(incoming) and previous_source is not None
+                    and previous_source[0] == source_pitches and previous_source[1]
+                    and abs(previous_source[2] - absolute_offset) <= 1e-6)
+                if (any(incoming) and not full_continuation) or (any(outgoing) and not all(outgoing)):
+                    tie_review = ('partial_chord_tie' if isinstance(element, m21chord.Chord)
+                                  and len(set(tie_types)) > 1 else 'unmatched_tie')
+                    log_message(
+                        f'[jianpu] 小节 {_m_idx + 1}、位置 {offset:g} 的部分延音或不匹配延音'
+                        '无法完整表示；保留所有音符，请校对。', _logging.WARNING)
+                previous_source = (source_pitches, bool(outgoing and all(outgoing)),
+                                   absolute_offset + float(element.duration.quarterLength))
             # 跨小节 tie-stop/continue：上一小节 tie-start 音符在本小节内的延续。
             # 渲染为延音 dash（'-'），而非独立音符或休止符。
-            _tie = getattr(element, 'tie', None)
-            if _tie is not None and _tie.type in ('stop', 'continue'):
+            if full_continuation:
                 cont = note_to_jianpu(element, key_tonic_semitone, tonic_step=tonic_step)
+                cont.tie_review = tie_review
                 pitches = (cont.midi, *[p[4] for p in cont.chord_notes])
                 starts, stops = slur_boundaries.pop((round(offset, 7), pitches), (0, 0))
                 cont.slur_starts, cont.slur_stops = starts, stops
@@ -357,6 +384,8 @@ def extract_jianpu_measures(score, key_tonic_semitone: int = 0,
             # the OMR had over-filled, and stopped earlier bars from being "too
             # long" at all.)
             candidate = clone_monophonic_element(element, float(element.duration.quarterLength or 0.25))
+            if tie_review:
+                tie_review_candidates[id(candidate)] = tie_review
             existing = by_offset.get(offset)
             if existing is None:
                 by_offset[offset] = [candidate]
@@ -412,6 +441,7 @@ def extract_jianpu_measures(score, key_tonic_semitone: int = 0,
                     element_end = max(element_end, offset + element.duration)
                 else:
                     jn = note_to_jianpu(element, key_tonic_semitone, tonic_step=tonic_step)
+                    jn.tie_review = tie_review_candidates.get(id(element), '')
                     if not jn.is_rest:
                         pitches = (jn.midi, *[p[4] for p in jn.chord_notes])
                         starts, stops = slur_boundaries.pop((round(offset, 7), pitches), (0, 0))
