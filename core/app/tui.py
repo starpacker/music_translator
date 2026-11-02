@@ -519,14 +519,9 @@ class TUI:
     def _do_regenerate(self, txt_path: Path, title: str, output_dir: Path) -> None:
         """Regenerate jianpu PDF from an edited .jianpu.txt via jianpu-ly → LilyPond.
 
-        The editor workspace file has a human-readable ``#``-prefixed comment
-        header prepended by ``_build_editor_header()``.  jianpu-ly.py does NOT
-        treat ``#`` as a line comment inside score content — it only skips them
-        inside its own documentation output routine.  We therefore write a
-        temporary copy of the file with all ``#`` comment lines stripped before
-        passing it to ``render_jianpu_ly``.
+        The shared jianpu runner filters the editor's comment header while
+        preserving music lines beginning with sharp accidentals.
         """
-        import tempfile
         from ..render.renderer import sanitize_generated_lilypond_file
         from ..render.lilypond_runner import render_jianpu_ly, render_lilypond_pdf
         from ..utils import safe_remove_file
@@ -540,35 +535,19 @@ class TUI:
         output_dir.mkdir(parents=True, exist_ok=True)
         success = False
         out_pdf: Optional[Path] = None
-        clean_txt_path: Optional[Path] = None
-
         try:
-            # Strip "# comment" header lines — jianpu-ly parses # as a sharp
-            # accidental token, causing "Unrecognised command # in score" errors.
-            raw = txt_path.read_text(encoding='utf-8', errors='ignore')
-            clean = '\n'.join(
-                line for line in raw.splitlines() if not line.startswith('#')
-            )
-            with tempfile.NamedTemporaryFile(
-                mode='w', encoding='utf-8', suffix='.jianpu.txt',
-                dir=txt_path.parent, delete=False,
-            ) as tmp:
-                tmp.write(clean)
-                clean_txt_path = Path(tmp.name)
-
-            if render_jianpu_ly(clean_txt_path, ly_path):
+            if render_jianpu_ly(txt_path, ly_path):
                 sanitize_generated_lilypond_file(ly_path, title)
                 pdf_result = render_lilypond_pdf(ly_path)
                 if pdf_result is not None and pdf_result.exists():
                     # Output filename mirrors the main pipeline convention
                     out_pdf = output_dir / f'{txt_path.stem}.pdf'
-                    shutil.copy(str(pdf_result), str(out_pdf))
+                    if pdf_result.resolve() != out_pdf.resolve():
+                        shutil.copy(str(pdf_result), str(out_pdf))
                     success = True
         except Exception as exc:
             log_message(f'重新生成 PDF 时发生错误: {exc}', logging.WARNING)
         finally:
-            if clean_txt_path is not None:
-                safe_remove_file(clean_txt_path)
             safe_remove_file(ly_path)
 
         self._header('简谱编辑器 — 生成结果')

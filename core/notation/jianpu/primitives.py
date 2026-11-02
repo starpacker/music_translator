@@ -305,7 +305,7 @@ def _pitch_to_fields(pitch, key_tonic_semitone: int,
     relative_semitone = diff % 12
     octave_offset = diff // 12
 
-    # Preserve the diatonic spelling when it fits Jianpu's supported single
+    # Preserve the diatonic spelling when it fits Jianpu's supported
     # accidentals. Pitch-class-only conversion changes, for example, C-major
     # B-flat into #6 instead of b7 even though both sound the same.
     steps = 'CDEFGAB'
@@ -315,11 +315,11 @@ def _pitch_to_fields(pitch, key_tonic_semitone: int,
         alter = (diff - natural_semitone) % 12
         if alter > 6:
             alter -= 12
-        if alter in (-1, 0, 1):
-            accidental = {-1: 'b', 0: '', 1: '#'}[alter]
+        if alter in (-2, -1, 0, 1, 2):
+            accidental = {-2: 'bb', -1: 'b', 0: '', 1: '#', 2: '##'}[alter]
             octave_offset = (diff - natural_semitone - alter) // 12
             return accidental, str(degree + 1), max(octave_offset, 0), max(-octave_offset, 0), note_midi
-        _log_message('[jianpu] 原音名需要重升或重降唱名，暂用等音代替，请校对。', _logging.WARNING)
+        _log_message('[jianpu] 原音名需要三重或更多升降唱名，暂用等音代替，请校对。', _logging.WARNING)
 
     if relative_semitone in _DIATONIC_SEMITONES:
         symbol = _DIATONIC_SEMITONES[relative_semitone]

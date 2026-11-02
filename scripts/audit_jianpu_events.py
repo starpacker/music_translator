@@ -78,7 +78,7 @@ def audit(path: Path) -> dict:
                           *event.chord_notes]
                 for accidental, symbol, upper, lower, expected in fields:
                     degrees = {'1': 0, '2': 2, '3': 4, '4': 5, '5': 7, '6': 9, '7': 11}
-                    alters = {'': 0, '#': 1, 'b': -1}
+                    alters = {'': 0, '#': 1, 'b': -1, '##': 2, 'bb': -2}
                     rendered = (60 + reference + degrees[symbol] + alters[accidental] + 12 * (upper - lower)
                                 if symbol in degrees and accidental in alters else None)
                     if rendered != expected:

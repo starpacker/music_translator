@@ -786,7 +786,7 @@ class NoteheadMarkup:
     # nBeams is 0, 1, 2 .. etc (number of beams for this note)
     # dots is "" or "." or ".." etc (extra length)
     # octave is "", "'", "''", "'''", ",", ",," or ",,,"
-    # accidental is "", "#", "b"
+    # accidental is "", "#", "b", "##", or "bb"
     # tremolo is "" or ":32"
     # word,line is for error handling
     if len(figures)>1:
@@ -834,7 +834,9 @@ class NoteheadMarkup:
         if isChord: self.current_chord = word
         else: self.current_chord = None
     if not figures=="-": self.last_figures = figures
-    if not isChord and not accidental in ["","#","b"]: scoreError("Can't handle accidental "+accidental+" in",word,line)
+    if not isChord and not accidental in ["","#","b","##","bb"]: scoreError("Can't handle accidental "+accidental+" in",word,line)
+    if not_angka and accidental in ("##", "bb"):
+        scoreError("Double accidentals are not supported in not-angka mode:",word,line)
     self.last_accidental = accidental
 
     ret = ""
@@ -917,7 +919,7 @@ class NoteheadMarkup:
     elif not isChord or figures.startswith("-"): # single note or rest
         if need_space_for_accidental and not not_angka and not (figures.startswith("-") or midi or western): ret += r"\once \tweak Accidental.extra-offset #'(0 . 0.7)"
         ret += placeholder_chord
-        if midi or western or not not_angka: ret += {"":"", "#":"is", "b":"es"}[accidental]
+        if midi or western or not not_angka: ret += {"":"", "#":"is", "b":"es", "##":"isis", "bb":"eses"}[accidental]
         if (midi or western) and not placeholder_chord=="r": ret += {"":"'","'":"''","''":"'''","'''":"''''",",":"",",,":",",",,,":",,"}[octave] # so no-mark starts near middle C
         if add_cautionary_accidental: ret += "!"
     ret += ("%d" % length) + dots
@@ -994,7 +996,7 @@ class NoteheadMarkup:
         self.inBeamGroup = "restHack"
     self.lastNBeams = nBeams
     beamC = u'\u0333' if nBeams>=2 else u'\u0332' if nBeams==1 else u""
-    self.unicode_approx.append({'#':u"\u266f",'b':u"\u266d"}.get(0 if invisTieLast else accidental,u"")+(u"-" if invisTieLast else figures[-1:])+beamC+(u"" if invisTieLast else (u'\u0323' if "," in octave else u'\u0307' if "'" in octave else u""))+u''.join(c+beamC for c in dots)+(u"" if self.inBeamGroup else u" ")) # (NB inBeamGroup is correct only if not midi and not western)
+    self.unicode_approx.append({'#':u"\u266f",'b':u"\u266d",'##':u"\U0001d12a",'bb':u"\U0001d12b"}.get(0 if invisTieLast else accidental,u"")+(u"-" if invisTieLast else figures[-1:])+beamC+(u"" if invisTieLast else (u'\u0323' if "," in octave else u'\u0307' if "'" in octave else u""))+u''.join(c+beamC for c in dots)+(u"" if self.inBeamGroup else u" ")) # (NB inBeamGroup is correct only if not midi and not western)
     if self.barPos == self.barLength:
         self.unicode_approx[-1]=self.unicode_approx[-1].rstrip()+u'\u2502'
         self.barPos = 0 ; self.barNo += 1
@@ -1377,9 +1379,9 @@ def graceNotes_markup(notes,word,line,isAfter,harmonic=False,marks_by_index=None
     for i in xrange(len(notes)):
         n = notes[i]
         if n=='#':
-            accidental = "#"
+            accidental += "#"
         elif n=='b':
-            accidental = "b"
+            accidental += "b"
         elif n=="'":
             if i and notes[i-1]==notes[i]: continue
             if notes[i:i+3]=="'''": octave = "'''"
@@ -1435,8 +1437,8 @@ def gracenotes_western(notes,word,line,marks_by_index=None):
     note_index = 0
     for i in xrange(len(notes)):
         n = notes[i]
-        if n=='#': nextAcc = "is"
-        elif n=='b': nextAcc = "es"
+        if n=='#': nextAcc += "#"
+        elif n=='b': nextAcc += "b"
         elif n=="'":
             if i and notes[i-1]==notes[i]: continue
             if notes[i:i+3]=="'''": next8ve = "''''"
@@ -1450,7 +1452,9 @@ def gracenotes_western(notes,word,line,marks_by_index=None):
         elif n in 'qsdh': duration = {'q':8, 's':16, 'd':32, 'h':64}[n]
         else:
             if not n in placeholders: continue # TODO: errExit ?
-            r.append(placeholders[n]+nextAcc+next8ve+str(duration))
+            if nextAcc not in ("", "#", "b", "##", "bb"):
+                scoreError("Can't handle accidental "+nextAcc+" in",word,line)
+            r.append(placeholders[n]+{"":"", "#":"is", "b":"es", "##":"isis", "bb":"eses"}[nextAcc]+next8ve+str(duration))
             if marks_by_index and note_index in marks_by_index:
                 r[-1] += ' ' + ' '.join(marks_by_index[note_index])
             note_index += 1
@@ -1496,10 +1500,10 @@ def chordNotes_markup(notes,word,line):
     for i in xrange(len(notes)):
         n = notes[i]
         if n=='#':
-            accidental = "#"
+            accidental += "#"
             sortKey += 0.5
         elif n=='b':
-            accidental = "b"
+            accidental += "b"
             sortKey -= 0.5
         elif n=="'":
             if i and notes[i-1]==notes[i]: continue
@@ -1527,6 +1531,8 @@ def chordNotes_markup(notes,word,line):
             # number should be the last char of a note
             if n not in '01234567' : continue
             figure = n
+            if accidental not in ("", "#", "b", "##", "bb"):
+                scoreError("Can't handle accidental "+accidental+" in",word,line)
             if int(n) == 0: sortKey = 0
             else: sortKey += int(n)
             dNotes.append({
@@ -1541,7 +1547,7 @@ def chordNotes_markup(notes,word,line):
     if sort_chords: dNotes.sort(key=lambda element:element['sortKey'])
     placeholder_chord= "< "
     for f in dNotes:
-        placeholder_chord += placeholders[f['figure']]+{"":"", "#":"is", "b":"es"}[f['accidental']]
+        placeholder_chord += placeholders[f['figure']]+{"":"", "#":"is", "b":"es", "##":"isis", "bb":"eses"}[f['accidental']]
         if "," in f['octave']: placeholder_chord += f['octave'][:-1]+" "
         else: placeholder_chord += f['octave']+"' "
     placeholder_chord += ">"
@@ -1574,7 +1580,7 @@ def chordNotes_markup(notes,word,line):
         if ',' in f['octave']: baseline += offsets[f['octave']]
         if baseline > 0:
             ret += r"\tweak #'Y-offset #%.1f " % baseline
-        ret += (r'\note-mod-angka "' if not_angka else r'\note-mod "')+f['figure']+'" '+placeholders[f['figure']]+{"":"", "#":"is", "b":"es"}[f['accidental']]
+        ret += (r'\note-mod-angka "' if not_angka else r'\note-mod "')+f['figure']+'" '+placeholders[f['figure']]+{"":"", "#":"is", "b":"es", "##":"isis", "bb":"eses"}[f['accidental']]
         if "," in f['octave']: ret += f['octave'][:-1]+" "
         else: ret += f['octave']+"' "
         if "," in f['octave']: ret += r"\tweak #'Y-offset #%.1f " % (baseline -0.1 - 1.2 * offsets[f['octave']])

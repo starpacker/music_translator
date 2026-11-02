@@ -4,6 +4,7 @@ music21>=10.5.0
 Pillow>=12.3.0
 numpy>=1.24
 reportlab>=5.0
+rich>=13
 
 # 仅 tools/make_assets.py（重新生成 logo / 社交预览图）需要
 fonttools>=4.50

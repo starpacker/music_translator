@@ -124,9 +124,9 @@ def render_jianpu_ly(txt_path: Path, ly_path: Path) -> bool:
 
     # jianpu-ly 不支持 # 开头的注释行（会报 "Unrecognised command #"），
     # 预处理：将原文件的 # 注释行过滤掉，传一个临时干净版本给 jianpu-ly。
-    # 注意：简谱中 `#` 紧跟数字（例如 `#6`、`#1'`）表示升号音符，必须保留；
+    # 注意：简谱中 `#` 或 `##` 紧跟数字表示升号音符，必须保留；
     # 仅当 `#` 后是空白/字母（真正的注释行）时才剥离。
-    _comment_line_re = re.compile(r'^\s*#(?!\d)')
+    _comment_line_re = re.compile(r"^\s*#(?!#?[,'cqsdh]*\d)")
     _clean_path = txt_path
     _tmp_to_delete: Optional[Path] = None
     try:
