@@ -113,6 +113,79 @@ class VectorDynamicRecoveryTest(unittest.TestCase):
                      for d in measure.recurse().getElementsByClass(dynamics.Dynamic)]
             self.assertEqual(marks, [('p', 0.0), ('f', 2.0)])
 
+    def test_existing_mark_does_not_hide_a_different_onset(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _, mxl = make_sources(root)
+            tree = ET.parse(mxl)
+            measure = tree.find('./part/measure')
+            direction = ET.Element('direction')
+            ET.SubElement(ET.SubElement(direction, 'direction-type'), 'dynamics').append(ET.Element('p'))
+            measure.insert(1, direction)
+            tree.write(mxl)
+            original = mxl.read_bytes()
+            candidates = [{'measure_index': 1, 'offset_quarters': '0', 'value': 'mf'},
+                          {'measure_index': 1, 'offset_quarters': '2', 'value': 'f'},
+                          {'measure_index': 1, 'offset_quarters': '2', 'value': 'p'}]
+            out = root / 'derived.musicxml'
+            inserted, skipped = recovery.write_enriched_dynamics(mxl, out, candidates)
+            self.assertEqual([item['value'] for item in inserted], ['f'])
+            self.assertEqual([item['reason'] for item in skipped],
+                             ['existing_musicxml_dynamics', 'existing_musicxml_dynamics'])
+            self.assertEqual(mxl.read_bytes(), original)
+            parsed = converter.parse(str(out)).parts[0].measure(1)
+            marks = [(d.value, float(d.getOffsetInHierarchy(parsed)))
+                     for d in parsed.recurse().getElementsByClass(dynamics.Dynamic)]
+            self.assertEqual(marks, [('p', 0.0), ('f', 2.0)])
+
+    def test_existing_mark_offset_accounts_for_backups_chords_and_grace_notes(self):
+        measure = ET.fromstring('''<measure><note><duration>4</duration></note>
+            <note><chord/><duration>4</duration></note><backup><duration>4</duration></backup>
+            <note><grace/></note><note><duration>2</duration></note>
+            <direction><direction-type><dynamics><p/></dynamics></direction-type>
+              <offset>1</offset></direction></measure>''')
+        self.assertEqual(recovery._existing_dynamic_offsets(measure, '', 2), {Fraction(3, 2)})
+        measure.find('./backup/duration').text = '9'
+        self.assertIsNone(recovery._existing_dynamic_offsets(measure, '', 2))
+
+    def test_existing_direction_after_note_uses_relative_offset(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _, mxl = make_sources(root)
+            tree = ET.parse(mxl)
+            measure = tree.find('./part/measure')
+            div = int(measure.find('./attributes/divisions').text)
+            direction = ET.Element('direction')
+            ET.SubElement(ET.SubElement(direction, 'direction-type'), 'dynamics').append(ET.Element('p'))
+            ET.SubElement(direction, 'offset').text = str(-div)
+            first = measure.find('note')
+            measure.insert(list(measure).index(first) + 1, direction)
+            tree.write(mxl)
+            candidates = [{'measure_index': 1, 'offset_quarters': '1', 'value': 'mf'},
+                          {'measure_index': 1, 'offset_quarters': '2', 'value': 'f'}]
+            out = root / 'out.musicxml'
+            inserted, skipped = recovery.write_enriched_dynamics(mxl, out, candidates)
+            self.assertEqual([item['value'] for item in inserted], ['f'])
+            self.assertEqual(skipped[0]['reason'], 'existing_musicxml_dynamics')
+            parsed = converter.parse(str(out)).parts[0].measure(1)
+            marks = sorted((float(d.getOffsetInHierarchy(parsed)), d.value)
+                           for d in parsed.recurse().getElementsByClass(dynamics.Dynamic))
+            self.assertEqual(marks, [(1.0, 'p'), (2.0, 'f')])
+
+    def test_existing_unlocatable_mark_protects_whole_measure(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _, mxl = make_sources(root)
+            tree = ET.parse(mxl)
+            first = tree.find('./part/measure/note')
+            notations = ET.SubElement(first, 'notations')
+            ET.SubElement(ET.SubElement(notations, 'dynamics'), 'p')
+            tree.write(mxl)
+            inserted, skipped = recovery.write_enriched_dynamics(
+                mxl, root / 'out.musicxml', [{'measure_index': 1, 'offset_quarters': '2', 'value': 'f'}])
+            self.assertEqual(inserted, [])
+            self.assertEqual(skipped[0]['reason'], 'existing_musicxml_dynamics')
+
     def test_midmeasure_divisions_change_is_not_guessed(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

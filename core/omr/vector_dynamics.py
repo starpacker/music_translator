@@ -165,6 +165,42 @@ def discover_pdf_dynamics(pdf_path: Path, mxl_path: Path):
     return [item for item in candidates if counts[(item['measure_index'], item['offset_quarters'])] == 1], report
 
 
+def _existing_dynamic_offsets(measure, ns, divisions):
+    """Locate existing directions in a measure, or return None if ambiguous."""
+    if not any(el.tag == f'{ns}dynamics' for el in measure.iter()):
+        return set()
+    if divisions is None or divisions <= 0:
+        return None
+    cursor = 0
+    offsets = set()
+    seen = 0
+    try:
+        for child in measure:
+            if child.tag == f'{ns}direction':
+                marks = list(child.iter(f'{ns}dynamics'))
+                if marks:
+                    delta = int(child.findtext(f'{ns}offset', '0'))
+                    offsets.add(Fraction(cursor + delta, divisions))
+                    seen += len(marks)
+            elif child.tag in (f'{ns}note', f'{ns}forward', f'{ns}backup'):
+                # Chord members share the preceding onset; grace notes do not
+                # advance the MusicXML cursor.
+                if child.tag == f'{ns}note' and (child.find(f'{ns}chord') is not None
+                                                  or child.find(f'{ns}grace') is not None):
+                    continue
+                value = int(child.findtext(f'{ns}duration', ''))
+                if value < 0:
+                    return None
+                cursor += -value if child.tag == f'{ns}backup' else value
+                if cursor < 0:
+                    return None
+    except (TypeError, ValueError, ZeroDivisionError):
+        return None
+    if seen != sum(1 for el in measure.iter() if el.tag == f'{ns}dynamics'):
+        return None
+    return offsets
+
+
 def write_enriched_dynamics(mxl_path: Path, output: Path, candidates):
     """Add directions to a derived XML at exact, representable offsets."""
     root = _read_root(mxl_path)
@@ -173,8 +209,6 @@ def write_enriched_dynamics(mxl_path: Path, output: Path, candidates):
     if len(parts) != 1:
         return [], [{'reason': 'multiple_parts'}]
     measures = parts[0].findall(f'{ns}measure')
-    existing_measures = {index for index, measure in enumerate(measures)
-                         if any(el.tag == f'{ns}dynamics' for el in measure.iter())}
     divisions_by_measure = []
     divisions = None
     for measure in measures:
@@ -197,6 +231,8 @@ def write_enriched_dynamics(mxl_path: Path, output: Path, candidates):
                 if not timed:
                     initial = divisions
         divisions_by_measure.append(None if changed else initial)
+    existing_offsets = [_existing_dynamic_offsets(measure, ns, div)
+                        for measure, div in zip(measures, divisions_by_measure)]
     inserted, skipped = [], []
     for item in candidates:
         index = item['measure_index'] - 1
@@ -204,9 +240,6 @@ def write_enriched_dynamics(mxl_path: Path, output: Path, candidates):
             skipped.append({**item, 'reason': 'missing_measure'})
             continue
         measure, div = measures[index], divisions_by_measure[index]
-        if index in existing_measures:
-            skipped.append({**item, 'reason': 'existing_musicxml_dynamics'})
-            continue
         if item.get('value') not in _DYNAMICS.values():
             skipped.append({**item, 'reason': 'unsupported_dynamic'})
             continue
@@ -214,6 +247,9 @@ def write_enriched_dynamics(mxl_path: Path, output: Path, candidates):
             offset = Fraction(item['offset_quarters'])
         except (KeyError, TypeError, ValueError, ZeroDivisionError):
             skipped.append({**item, 'reason': 'unrepresentable_offset'})
+            continue
+        if existing_offsets[index] is None or offset in existing_offsets[index]:
+            skipped.append({**item, 'reason': 'existing_musicxml_dynamics'})
             continue
         ticks = offset * div if div is not None and div > 0 else None
         if ticks is None or ticks.denominator != 1 or ticks < 0:
@@ -230,6 +266,7 @@ def write_enriched_dynamics(mxl_path: Path, output: Path, candidates):
                    if child.tag in {f'{ns}note', f'{ns}forward', f'{ns}backup'}), len(children))
         measure.insert(at, direction)
         inserted.append(item)
+        existing_offsets[index].add(offset)
     if inserted:
         if output.resolve() == mxl_path.resolve():
             raise ValueError('不能覆盖原始 MusicXML')
