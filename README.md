@@ -238,6 +238,15 @@ OMR 结果默认缓存在 `<输出目录>/work/<曲名>.musicxml`，输入内容
 [omr] 复用已有结果 .../work/曲笛.musicxml
 ```
 
+可用以下命令逐小节比较 MusicXML 第一声部和简谱提取出的音高、时值、装饰音：
+
+```bash
+python scripts/audit_jianpu_events.py output/work/曲笛.musicxml
+```
+
+该检查输出 JSON，发现差异时退出码为 1。它不比较原五线谱，连音、多声部和
+三连音等情况可能需要人工解释，不能作为 OMR 准确率的证明。
+
 ### 指定输出与前缀
 
 `-o` 在 `mode=both` 时是**前缀**，在单模式下是目标文件名。
