@@ -142,3 +142,8 @@ class JianpuNote:
     chord_notes: tuple[tuple[str, str, int, int, int], ...] = ()
     # Grace notes are printed but consume no time in the measure.
     is_grace: bool = False
+    slur_starts: int = 0
+    slur_stops: int = 0
+    # Only used when one in-situ line continues a slur from/to another line.
+    slur_carry_in: int = 0
+    slur_carry_out: int = 0

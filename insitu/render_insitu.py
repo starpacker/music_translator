@@ -41,6 +41,7 @@ import subprocess
 import sys
 import tempfile
 import shutil
+import copy
 from pathlib import Path
 from typing import Optional
 
@@ -89,6 +90,27 @@ def _measure_texts(measures, time_sig: str) -> list[str]:
     for m in measures:
         out.append(' '.join(jianpu_note_token(n) for n in m))
     return out
+
+
+def _line_slur_continuations(measures, start: int, end: int):
+    """Close/reopen a cross-system slur at the edges of independently rendered lines."""
+    active = 0
+    for measure in measures[:start]:
+        for event in measure:
+            active = max(0, active - event.slur_stops) + event.slur_starts
+    entering = active
+    line = [[copy.copy(event) for event in measure] for measure in measures[start:end]]
+    for measure in line:
+        for event in measure:
+            active = max(0, active - event.slur_stops) + event.slur_starts
+    audible = [event for measure in line for event in measure
+               if not event.is_rest and not event.is_grace and event.symbol != '-']
+    if audible:
+        audible[0].slur_carry_in += entering
+        audible[-1].slur_carry_out += active
+    elif entering or active:
+        print('  ! 跨行连音线没有可连接的音符，请校对')
+    return line
 
 
 def _jianpu_ly_source(lines: list[str], key_header: str, time_sig: str, title: str) -> str:
@@ -255,7 +277,7 @@ def build(pdf_path: Path, mxl_path: Path, out_path: Path,
 
     for sl, layout in zip(slices, staves):
         staff = layout.staff
-        line_measures = measures[sl.omr_start:sl.omr_end]
+        line_measures = _line_slur_continuations(measures, sl.omr_start, sl.omr_end)
         chunk = _with_time_signatures(
             _measure_texts(line_measures, time_sig), 0,
             layout_time_tokens(line_measures, 64),

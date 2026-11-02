@@ -419,7 +419,7 @@ def jianpu_octave_symbol(upper_dots: int, lower_dots: int) -> str:
     return ''
 
 
-def jianpu_note_token(note: JianpuNote) -> str:
+def _jianpu_note_token_unmarked(note: JianpuNote) -> str:
     """Produce the jianpu-ly token string for a single note (pitch, octave marker, duration).
 
     A note carrying ``chord_notes`` (合音) is emitted in jianpu-ly's simple-chord
@@ -494,6 +494,13 @@ def jianpu_note_token(note: JianpuNote) -> str:
     return f'q{base_note}'
 
 
+def jianpu_note_token(note: JianpuNote) -> str:
+    """Format an event and its explicit slur boundaries for jianpu-ly."""
+    token = _jianpu_note_token_unmarked(note)
+    return (token + ' (' * note.slur_carry_in + ' )' * note.slur_stops
+            + ' (' * note.slur_starts + ' )' * note.slur_carry_out)
+
+
 def normalize_jianpu_duration(duration: float) -> float:
     """Round a duration down to the nearest allowed jianpu duration value."""
     tol = 0.01
@@ -562,6 +569,8 @@ def clone_jianpu_note(note: JianpuNote, duration: float, carry_lyrics: bool = Tr
         lyrics=note.lyrics if carry_lyrics else {},
         chord_notes=getattr(note, 'chord_notes', ()),
         is_grace=getattr(note, 'is_grace', False),
+        slur_starts=getattr(note, 'slur_starts', 0),
+        slur_stops=getattr(note, 'slur_stops', 0),
     )
 
 

@@ -238,7 +238,7 @@ OMR 结果默认缓存在 `<输出目录>/work/<曲名>.musicxml`，输入内容
 [omr] 复用已有结果 .../work/曲笛.musicxml
 ```
 
-可用以下命令逐小节比较 MusicXML 第一声部和简谱提取出的音高、时值、装饰音及休止符时值：
+可用以下命令逐小节比较 MusicXML 第一声部和简谱提取出的音高、时值、装饰音及休止符时值，并检查普通旋律连音线的端点数量：
 
 ```bash
 python scripts/audit_jianpu_events.py output/work/曲笛.musicxml

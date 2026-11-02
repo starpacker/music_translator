@@ -2,7 +2,7 @@
 import logging as _logging
 from typing import Optional
 
-from music21 import chord as m21chord, note as m21note, stream
+from music21 import chord as m21chord, note as m21note, spanner, stream
 
 from ...config import JianpuNote
 from ...utils import log_message
@@ -55,15 +55,16 @@ def strip_grace_notes(score) -> int:
 
 
 def _canonical_offset(seen: dict[int, float], offset: float) -> float:
-    """Collapse float-epsilon variants of one musical onset onto a single dict key.
+    """Merge numerical noise only, keeping genuinely distinct onsets apart.
 
-    by_offset 用 float 直接做字典键时，三连音类 offset（1/3 等无限小数）经不同
-    计算路径产生的浮点误差变体会把"同一位置"分裂成两个键，绕过所有 tol 容差。
-    这里按 1/64 音符网格（QL×16 取整）判定身份，返回该网格首次出现的**原始**
-    offset——量化只用于去重，不用于时值运算：三连音 1/3 若被吸附到 5/16，
-    下游 `next_offset - offset` 会把时值改写成附点十六分，musically 错误。
+    A fixed 1/64-note grid conflates distinct notes in shorter tuplets.  The
+    small tolerance handles floating point noise without snapping to a rhythm.
     """
-    return seen.setdefault(round(offset * 16), offset)
+    for previous in seen.values():
+        if abs(previous - offset) <= 1e-7:
+            return previous
+    seen[len(seen)] = offset
+    return offset
 
 
 def _get_voice_ids_in_part(part) -> list[str]:
@@ -260,12 +261,28 @@ def extract_jianpu_measures(score, key_tonic_semitone: int = 0,
         # keeps every note (nothing is dropped or clamped).  The pickup
         # detection above stays only for the signature word shown in the UI.
         by_offset: dict[float, list[object]] = {}
-        _offset_seen: dict[int, float] = {}  # 1/64 网格 → 首见原始 offset（P1-4 去重）
+        _offset_seen: dict[int, float] = {}  # Preserve first offset for epsilon-only deduplication.
+        slur_boundaries: dict[tuple[float, tuple[int, ...]], list[int]] = {}
+        for source_note in measure.recurse().notes:
+            if getattr(source_note.duration, 'isGrace', False):
+                continue
+            pitches = (tuple(sorted(p.midi for p in source_note.pitches))
+                       if isinstance(source_note, m21chord.Chord) else (source_note.pitch.midi,))
+            key = (round(float(source_note.getOffsetInHierarchy(measure)), 7), pitches)
+            for slur in source_note.getSpannerSites(spanner.Slur):
+                ends = slur.getSpannedElements()
+                # Grace-note curves are already rendered by the grace syntax.
+                if len(ends) < 2 or any(getattr(e.duration, 'isGrace', False)
+                                        for e in (ends[0], ends[-1])):
+                    continue
+                flags = slur_boundaries.setdefault(key, [0, 0])
+                flags[0] += int(slur.isFirst(source_note))
+                flags[1] += int(slur.isLast(source_note))
 
         # 合并同小节延音线（cross-measure tie-stop 音符在本小节内无对应 start，
         # stripTies 会保留其时值不变；仅合并同小节内的 start→stop 对）
         try:
-            measure_src = measure.stripTies(retainContainers=True)
+            measure_src = measure.stripTies()
         except Exception:
             measure_src = measure
 
@@ -402,6 +419,10 @@ def extract_jianpu_measures(score, key_tonic_semitone: int = 0,
                     element_end = max(element_end, offset + element.duration)
                 else:
                     jn = note_to_jianpu(element, key_tonic_semitone)
+                    if not jn.is_rest:
+                        pitches = (jn.midi, *[p[4] for p in jn.chord_notes])
+                        starts, stops = slur_boundaries.pop((round(offset, 7), pitches), (0, 0))
+                        jn.slur_starts, jn.slur_stops = starts, stops
                     measure_notes.append(jn)
                     element_end = max(element_end, offset + jn.duration)
             # 填充音符实际结束位置到下一个音符开始位置之间的空白（OMR 漏标休止符的常见情形）
@@ -441,9 +462,9 @@ def extract_strict_jianpu_measures(score, key_tonic_semitone: int = 0,
     """
     part = _part if _part is not None else (score.parts[0] if score.parts else score.flatten())
     # 合并延音线：同小节 start→stop 对合并为单音符；跨小节 tie 的合并音符由
-    # append_element_chunks 正确跨 bar 拆分，因此用 retainContainers=True 即可。
+    # append_element_chunks 正确跨 bar 拆分。
     try:
-        part = part.stripTies(retainContainers=True)
+        part = part.stripTies()
     except Exception:
         pass
     time_signature = '4/4'
@@ -476,7 +497,7 @@ def extract_strict_jianpu_measures(score, key_tonic_semitone: int = 0,
             _trailing_rest_pickup = True
 
     by_offset: dict[float, object] = {}
-    _offset_seen: dict[int, float] = {}  # 1/64 网格 → 首见原始 offset（P1-4 去重）
+    _offset_seen: dict[int, float] = {}  # Preserve first offset for epsilon-only deduplication.
     for element in part.flatten().notesAndRests:
         offset = _canonical_offset(_offset_seen, float(element.offset))
         if offset < 0 or offset >= max_score_offset:
