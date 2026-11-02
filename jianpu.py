@@ -103,6 +103,48 @@ def omr_to_musicxml(score_pdf: Path, work: Path, use_gpu: Optional[bool] = None)
 
 # ── 步骤 2：整页简谱 ────────────────────────────────────────────────────────
 
+def recover_pdf_tempos(score_pdf: Path, mxl: Path, work: Path, stem: str) -> Path:
+    """Use verifiable PDF tempo marks in a derived XML, leaving the input intact."""
+    from core.omr.vector_tempos import discover_pdf_tempos, write_enriched_tempos
+
+    report_path = work / f'{stem}.pdf-tempos.json'
+    enriched = work / f'{stem}.pdf-tempos.musicxml'
+    protected_paths = {mxl.resolve(), score_pdf.resolve()}
+    while report_path.resolve() in protected_paths:
+        report_path = report_path.with_name(report_path.stem + '.report.json')
+    while enriched.resolve() in protected_paths:
+        enriched = enriched.with_name(enriched.stem + '.derived.musicxml')
+    try:
+        candidates, decisions = discover_pdf_tempos(score_pdf, mxl)
+        inserted, skipped = (write_enriched_tempos(mxl, enriched, candidates)
+                             if candidates else ([], []))
+        def digest(path):
+            h = hashlib.sha256()
+            with path.open('rb') as source:
+                for chunk in iter(lambda: source.read(1024 * 1024), b''):
+                    h.update(chunk)
+            return h.hexdigest()
+        report_path.write_text(json.dumps({'source_pdf': str(score_pdf),
+                                          'source_pdf_sha256': digest(score_pdf),
+                                          'source_musicxml': str(mxl),
+                                          'source_musicxml_sha256': digest(mxl),
+                                          'inserted': inserted, 'skipped': skipped,
+                                          'decisions': decisions}, ensure_ascii=False, indent=2),
+                               encoding='utf-8')
+        if inserted:
+            print(f'[jianpu] 从 PDF 矢量标记恢复 {len(inserted)} 个速度记号（推断结果，请核对；'
+                  f'原始 MusicXML 未修改，详情：{report_path}）')
+        unresolved = sum(1 for item in decisions if item.get('reason') != 'verified_candidate')
+        if unresolved:
+            print(f'[jianpu] {unresolved} 个 PDF 速度标记无法可靠定位，请参阅 {report_path} 校对。')
+        if skipped:
+            print(f'[jianpu] {len(skipped)} 个候选未写入（例如该小节已有速度），请参阅 {report_path}。')
+        return enriched if inserted else mxl
+    except Exception as exc:
+        print(f'[jianpu] PDF 速度标记恢复失败，保留原始识谱结果继续：{exc}')
+        return mxl
+
+
 def musicxml_to_jianpu(mxl: Path, out_pdf: Path, title: Optional[str] = None) -> Path:
     """MusicXML → 整页简谱 PDF（music21 → jianpu-ly → LilyPond）。"""
     ensure_sumisora()
@@ -167,6 +209,8 @@ def main(argv: list[str]) -> int:
                     help='原位简谱：spaced=矢量插入空白（默认）；stamp=矢量贴字；'
                          'strip=插条并加长页面')
     ap.add_argument('--mxl', type=Path, default=None, help='已有的 MusicXML（跳过 OMR）')
+    ap.add_argument('--no-vector-tempos', action='store_true',
+                    help='不从 PDF 矢量文字推断速度记号')
     ap.add_argument('--work', type=Path, default=None,
                     help='OMR 中间结果目录（默认 <输出目录>/work）')
     ap.add_argument('--title', default=None, help='标题（默认取输入文件名）')
@@ -190,16 +234,19 @@ def main(argv: list[str]) -> int:
     use_gpu = {'auto': None, 'on': True, 'off': False}[args.gpu]
     mxl = args.mxl or omr_to_musicxml(score, work, use_gpu=use_gpu)
     title = args.title or score.stem
+    jianpu_mxl = mxl
+    if not args.no_vector_tempos and (args.mode in ('jianpu', 'both') or args.engine == 'strip'):
+        jianpu_mxl = recover_pdf_tempos(score, mxl, work, base.name)
 
     if args.mode in ('jianpu', 'both'):
-        musicxml_to_jianpu(mxl, base.parent / f'{base.name}.jianpu.pdf', title)
+        musicxml_to_jianpu(jianpu_mxl, base.parent / f'{base.name}.jianpu.pdf', title)
 
     if args.mode in ('insitu', 'both'):
         out = base.parent / f'{base.name}.insitu.pdf'
         if args.engine == 'strip':
             ref = base.parent / f'{base.name}.jianpu.pdf'
             if not ref.is_file():
-                musicxml_to_jianpu(mxl, ref, title)
+                musicxml_to_jianpu(jianpu_mxl, ref, title)
             insitu_strip(score, ref, out)
         else:
             insitu_stamp(score, mxl, out, title, expand=args.engine == 'spaced')
