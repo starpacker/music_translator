@@ -5,6 +5,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 import pymupdf
 
@@ -53,3 +54,15 @@ class SpacedInsituTest(unittest.TestCase):
                 self.assertTrue(dark_near(50, 100))
                 self.assertFalse(dark_near(50, 260))
                 self.assertTrue(any(dark_near(50, y) for y in range(294, 361)))
+            mxl = root / 'compressed.mxl'
+            with zipfile.ZipFile(mxl, 'w') as archive:
+                archive.writestr('META-INF/container.xml', '''<?xml version="1.0"?>
+<container xmlns="urn:oasis:names:tc:opendocument:xmlns:container"><rootfiles>
+<rootfile full-path="score.musicxml" media-type="application/vnd.recordare.musicxml+xml"/>
+</rootfiles></container>''')
+                archive.writestr('score.musicxml', xml.read_bytes())
+            result = subprocess.run([sys.executable, str(ROOT / 'jianpu.py'), str(pdf), '--mxl', str(mxl),
+                                     '--mode', 'insitu', '-o', str(root / 'compressed')], cwd=ROOT,
+                                    capture_output=True, text=True, env={**os.environ, 'TMPDIR': tmp}, timeout=90)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn('placed 2/2 lines', result.stdout)

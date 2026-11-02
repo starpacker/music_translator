@@ -27,6 +27,8 @@ belong under that staff, ready to be typeset as one jianpu line.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import Path
+import zipfile
 
 # Cost model for the alignment.  A missing OMR system break ("we should have
 # started a new staff here but the OMR merged two staves into one") is the most
@@ -220,12 +222,30 @@ def align_from_files(pdf_path, mxl_path) -> tuple[list, list[SystemSlice]]:
     import xml.etree.ElementTree as ET
 
     staves = layout_for_document(pdf_path)
-    root = ET.parse(str(mxl_path)).getroot()
-    measures = root.find('part').findall('measure')
+    mxl_path = Path(mxl_path)
+    if zipfile.is_zipfile(mxl_path):
+        with zipfile.ZipFile(mxl_path) as archive:
+            container = ET.fromstring(archive.read('META-INF/container.xml'))
+            rootfile = next((entry.get('full-path') for entry in container.iter()
+                             if entry.tag.rsplit('}', 1)[-1] == 'rootfile'
+                             and entry.get('full-path')), None)
+            if rootfile is None:
+                raise ValueError(f'MXL 缺少 MusicXML 根文件: {mxl_path}')
+            root = ET.fromstring(archive.read(rootfile))
+    else:
+        root = ET.parse(str(mxl_path)).getroot()
+    def child(element, name):
+        return next((item for item in element if item.tag.rsplit('}', 1)[-1] == name), None)
+
+    part = child(root, 'part')
+    if part is None:
+        raise ValueError(f'MusicXML 没有可对齐的声部: {mxl_path}')
+    measures = [item for item in part if item.tag.rsplit('}', 1)[-1] == 'measure']
     breaks = [
         idx for idx, el in enumerate(measures)
-        if (el.find('print') is not None
-            and 'yes' in (el.find('print').get('new-system') or ''))
+        if (child(el, 'print') is not None
+            and (child(el, 'print').get('new-system') == 'yes'
+                 or child(el, 'print').get('new-page') == 'yes'))
     ]
     omr_counts = _omr_segments(len(measures), breaks)
     returns = (staves, align(_pdf_counts(staves), omr_counts))
