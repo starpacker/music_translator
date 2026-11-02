@@ -94,12 +94,161 @@ def _strip_repeats_for_midi(score) -> int:
     return dropped
 
 
+def _split_tied_chords_for_midi(score) -> int:
+    """Make chord-member ties visible to music21's MIDI translator.
+
+    music21 writes a partly tied Chord as two separately attacked chords.
+    Independent notes at the same offset retain the individual tie states, so
+    a held pitch can continue while other pitches stop or begin. This is only
+    applied to the private MIDI copy, never the source or printed score.
+    """
+    import copy
+    from music21 import chord as m21chord
+
+    count = 0
+    for container in list(score.recurse(streamsOnly=True, includeSelf=True)):
+        for event in list(container.getElementsByClass(m21chord.Chord)):
+            if event.duration.isGrace or not any(member.tie for member in event.notes):
+                continue
+            if len({member.pitch.ps for member in event.notes}) != len(event.notes):
+                log_message('[MIDI] 延音和弦含重复音高，无法可靠拆分，请校对试听。', logging.WARNING)
+                continue
+            offset = event.offset
+            members = []
+            for original in event.notes:
+                member = copy.deepcopy(original)
+                member.duration = copy.deepcopy(event.duration)
+                if member.volume.velocity is None and event.volume.velocity is not None:
+                    member.volume.velocity = event.volume.velocity
+                member.articulations = copy.deepcopy(event.articulations) + member.articulations
+                member.expressions = copy.deepcopy(event.expressions) + member.expressions
+                members.append(member)
+            container.remove(event)
+            for member in members:
+                container.insert(offset, member)
+            count += 1
+    return count
+
+
+def _merge_note_ties_for_midi(score) -> tuple[int, int]:
+    """Join adjacent same-voice, same-pitch ties before music21's MIDI export.
+
+    music21's own tie stripping can merge the wrong note when several separate
+    pitches are tied simultaneously. Work on a private copy and clear the tie
+    markers once exact adjacent pairs have been joined.
+    """
+    from collections import Counter
+    from music21 import note as m21note, stream as m21stream
+
+    merged = issues = 0
+    for part in (list(score.parts) or [score]):
+        events = []
+        for event in part.recurse().getElementsByClass(m21note.Note):
+            parent = event.activeSite
+            current, voice_id = parent, None
+            while current is not None and current is not part:
+                if isinstance(current, m21stream.Voice):
+                    voice_id = str(current.id)
+                    break
+                current = getattr(current, 'activeSite', None)
+            onset = float(event.getOffsetInHierarchy(part))
+            duration = float(event.duration.quarterLength)
+            events.append((onset, voice_id, event.pitch.ps, duration, parent, event))
+        events.sort(key=lambda row: row[0])
+        simultaneous = Counter((onset, voice, pitch) for onset, voice, pitch, _, _, _ in events)
+        ambiguous = {(voice, pitch) for (onset, voice, pitch), count in simultaneous.items() if count > 1}
+        active = {}
+        for onset, voice, pitch, duration, parent, event in events:
+            key = (voice, pitch)
+            kind = event.tie.type if event.tie else None
+            if kind is None:
+                if key in active and onset < active[key][1] + 1e-6:
+                    del active[key]
+                    issues += 1
+                continue
+            event.tie = None
+            if key in ambiguous or kind not in ('start', 'continue', 'stop'):
+                active.pop(key, None)
+                issues += 1
+                continue
+            if kind == 'start':
+                if key in active:
+                    issues += 1
+                active[key] = (event, onset + duration)
+                continue
+            previous = active.get(key)
+            if previous is None or abs(previous[1] - onset) > 1e-6:
+                issues += 1
+                active.pop(key, None)
+                if kind == 'continue':
+                    active[key] = (event, onset + duration)
+                continue
+            first, _ = previous
+            first.duration.quarterLength += event.duration.quarterLength
+            parent.remove(event)
+            merged += 1
+            if kind == 'continue':
+                active[key] = (first, onset + duration)
+            else:
+                del active[key]
+        issues += len(active)
+    return merged, issues
+
+
+def _flatten_parts_for_midi(score):
+    """Keep expanded absolute offsets when a held note crosses a barline."""
+    from music21 import spanner as m21spanner, stream as m21stream
+
+    if not score.parts:
+        return score.flatten()
+    result = m21stream.Score()
+    for element in list(score):
+        offset = score.elementOffset(element)
+        if isinstance(element, m21stream.Part):
+            result.insert(offset, element.flatten())
+        elif not isinstance(element, m21spanner.Spanner):
+            # MIDI has no slur/bracket graphic; other score-level objects
+            # such as tempo marks and metadata still need to be retained.
+            result.insert(offset, element)
+    return result
+
+
 def render_midi_from_score(score, midi_path: Path) -> bool:
     """Export a music21 score to a MIDI file; return True on success.
     All parts are forced to Piano (MIDI program 1) before export.
     """
     try:
+        import copy
+        from music21 import chord as m21chord, stream as m21stream
         from music21 import instrument as m21instrument
+        score = copy.deepcopy(score)
+        has_ties = any(
+            any(member.tie for member in event.notes) if isinstance(event, m21chord.Chord)
+            else bool(event.tie)
+            for event in score.recurse().notes
+        )
+        if has_ties:
+            # Expand repeats while bar durations are intact. Joining an
+            # eight-beat tie inside a four-beat measure *before* expansion
+            # otherwise shifts the following measure and repeat boundary.
+            if score[m21stream.Measure]:
+                try:
+                    score = score.expandRepeats()
+                except Exception as exc:
+                    if not _is_repeat_expansion_failure(exc):
+                        raise
+                    dropped = _strip_repeats_for_midi(score)
+                    log_message(f'[MIDI] 反复记号不成对，已忽略 {dropped} 处，请校对试听。', logging.WARNING)
+                    score = score.expandRepeats()
+            split_count = _split_tied_chords_for_midi(score)
+            merged_count, tie_issues = _merge_note_ties_for_midi(score)
+            score = _flatten_parts_for_midi(score)
+            if split_count:
+                log_message(f'[MIDI] 按音符保留 {split_count} 个延音和弦。')
+            elif merged_count:
+                log_message(f'[MIDI] 合并 {merged_count} 个已匹配的延音片段。')
+            if tie_issues:
+                log_message(f'[MIDI] {tie_issues} 处延音不完整或有歧义，请校对试听。', logging.WARNING)
         midi_path.parent.mkdir(parents=True, exist_ok=True)
         # 统一乐器为钢琴，避免 OMR 引擎写入的乐器编号影响回放音色
         for part in score.parts:
@@ -139,7 +288,8 @@ def render_midi_from_musicxml(mxl_path: Path, midi_path: Path) -> bool:
     preview's play button regenerating a missing .mid). Returns True on success.
     """
     try:
-        score = converter.parse(str(mxl_path))
+        from ..notation.musicxml_wedges import parse_musicxml_compatible
+        score = parse_musicxml_compatible(mxl_path)
     except Exception as exc:
         log_message(f'解析乐谱失败: {mxl_path.name}，原因: {exc}', logging.WARNING)
         return False
