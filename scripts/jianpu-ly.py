@@ -1673,6 +1673,11 @@ def getLY(score,headers=None,have_final_barline=True):
                 isInHarmonic = True
             elif word==":Harm":
                 isInHarmonic = False
+            # Zero-duration chords anchor source MusicXML wedge boundaries at
+            # the current musical time, including an ending barline.
+            elif word in ('WedgeCrescendo', 'WedgeDiminuendo', 'WedgeStop'):
+                out.append({'WedgeCrescendo': r'<> \<', 'WedgeDiminuendo': r'<> \>',
+                            'WedgeStop': r'<> \!'}[word])
             elif re.match("[1-468]+[.]*=[1-9][0-9]*$",word): out.append(r'\tempo '+word) # TODO: reduce size a little?
             elif re.match("[16]=[A-Ga-g][#b]?$",word): #key
                 # Must use \transpose because \transposition doesn't always work.

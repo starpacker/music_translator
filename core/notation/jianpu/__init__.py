@@ -194,17 +194,50 @@ def _measure_meter_marks(score, part, measure_count: int) -> dict[int, list[tupl
     return result
 
 
+def _wedge_marks(measures, pairs):
+    """Return paired wedge commands only if both source boundaries fit."""
+    from collections import defaultdict
+    available = []
+    for measure in measures:
+        position = 0.0
+        boundaries = [0.0]
+        for event in measure:
+            if not event.is_grace:
+                position += event.duration
+            boundaries.append(position)
+        available.append(boundaries)
+    marks = defaultdict(list)
+    for start, end, kind in pairs:
+        if any(index < 0 or index >= len(available)
+               or not any(abs(float(offset) - boundary) < 1e-6 for boundary in available[index])
+               for index, offset in (start, end)):
+            log_message(f'[jianpu] 小节 {start[0] + 1} 的渐强渐弱线端点不在简谱事件边界，'
+                        '整条线未添加，请校对。', _logging.WARNING)
+            continue
+        command = 'WedgeCrescendo' if kind == 'crescendo' else 'WedgeDiminuendo'
+        marks[start[0]].append((float(start[1]), command))
+        marks[end[0]].append((float(end[1]), 'WedgeStop'))
+    # A stop at the same time as the next start closes the previous wedge first.
+    return {index: sorted(items, key=lambda item: (item[0], item[1] != 'WedgeStop'))
+            for index, items in marks.items()}
+
+
 def _measure_text_with_tempos(notes: list[JianpuNote], marks: list[tuple[float, str]],
                               measure_number: int,
                               dynamics: Optional[list[tuple[float, str]]] = None,
-                              meters: Optional[list[tuple[float, str]]] = None) -> str:
+                              meters: Optional[list[tuple[float, str]]] = None,
+                              wedges: Optional[list[tuple[float, str]]] = None) -> str:
     """Insert marks only at a rendered event boundary, never move them silently."""
     pending = sorted(marks, key=lambda item: item[0])
     pending_dynamics = sorted(dynamics or [], key=lambda item: item[0])
     pending_meters = sorted(meters or [], key=lambda item: item[0])
+    pending_wedges = list(wedges or [])
     words: list[str] = []
     position = 0.0
     for note in notes:
+        matched_wedges = [mark for mark in pending_wedges if abs(mark[0] - position) < 1e-6]
+        words.extend(word for _, word in matched_wedges)
+        pending_wedges = [mark for mark in pending_wedges if abs(mark[0] - position) >= 1e-6]
         matched = [mark for mark in pending if abs(mark[0] - position) < 1e-6]
         words.extend(word for _, word in matched)
         pending = [mark for mark in pending if abs(mark[0] - position) >= 1e-6]
@@ -225,6 +258,9 @@ def _measure_text_with_tempos(notes: list[JianpuNote], marks: list[tuple[float, 
         words.append(token)
         if not note.is_grace:
             position += note.duration
+    matched_wedges = [mark for mark in pending_wedges if abs(mark[0] - position) < 1e-6]
+    words.extend(word for _, word in matched_wedges)
+    pending_wedges = [mark for mark in pending_wedges if abs(mark[0] - position) >= 1e-6]
     for offset, _ in pending:
         log_message(f'[jianpu] 小节 {measure_number} 的速度记号位于 {offset:g} 拍，'
                     '不在可表示的音符边界，需人工校对。', _logging.WARNING)
@@ -234,6 +270,9 @@ def _measure_text_with_tempos(notes: list[JianpuNote], marks: list[tuple[float, 
     for offset, _ in pending_meters:
         log_message(f'[jianpu] 小节 {measure_number} 的拍号位于 {offset:g} 拍，'
                     '不在可表示的音符边界，需人工校对。', _logging.WARNING)
+    for offset, _ in pending_wedges:
+        log_message(f'[jianpu] 小节 {measure_number} 的渐强渐弱线端点位于 {offset:g} 拍，'
+                    '无法准确排版，请校对。', _logging.WARNING)
     return ' '.join(words)
 
 
@@ -302,15 +341,15 @@ def build_jianpu_ly_text_from_measures(
 @overload
 def build_jianpu_ly_text(score, title: str, use_strict_timing: bool = False,
                           composer: str = '', tempo: int = 0,
-                          _return_groups: Literal[False] = False) -> str: ...
+                          _return_groups: Literal[False] = False, *, _source_wedges=None) -> str: ...
 @overload
 def build_jianpu_ly_text(score, title: str, use_strict_timing: bool = False,
                           composer: str = '', tempo: int = 0,
-                          *, _return_groups: Literal[True],
+                          *, _return_groups: Literal[True], _source_wedges=None,
                           ) -> tuple[str, list[list[int]], dict[int, dict[str, bool]]]: ...
 def build_jianpu_ly_text(score, title: str, use_strict_timing: bool = False,
                           composer: str = '', tempo: int = 0,
-                          _return_groups: bool = False):
+                          _return_groups: bool = False, *, _source_wedges=None):
     """Build jianpu-ly plain-text for all parts in the score.
 
     For single-part scores the output is identical to the previous behaviour,
@@ -331,8 +370,12 @@ def build_jianpu_ly_text(score, title: str, use_strict_timing: bool = False,
         staves to avoid overlapping numbered notes.
     """
     key_tonic_semitone, key_header_line = _get_score_key_tonic(score)
+    if _source_wedges is None:
+        from music21 import dynamics as m21dynamics
+        if list(score.recurse().getElementsByClass(m21dynamics.DynamicWedge)):
+            log_message('[jianpu] 未提供原始 MusicXML，无法可靠确定渐强渐弱线端点；请校对。', _logging.WARNING)
     if use_strict_timing:
-        log_message('[jianpu] 严格模式重分小节，无法可靠对应原始速度、力度和拍号位置；请校对。',
+        log_message('[jianpu] 严格模式重分小节，无法可靠对应原始速度、力度、渐强渐弱线和拍号位置；请校对。',
                     _logging.WARNING)
 
     # ── Collect one measures-list per output section ──────────────────────────
@@ -454,6 +497,10 @@ def build_jianpu_ly_text(score, title: str, use_strict_timing: bool = False,
                        else _measure_tempo_marks(score, _section_parts[section_idx], len(measures)))
         meter_marks = ({} if use_strict_timing
                        else _measure_meter_marks(score, _section_parts[section_idx], len(measures)))
+        part_index = next((index for index, part in enumerate(_parts)
+                           if part is _section_parts[section_idx]), 0)
+        part_wedges = (_source_wedges[part_index] if _source_wedges and part_index < len(_source_wedges) else [])
+        wedge_marks = {} if use_strict_timing else _wedge_marks(measures, part_wedges)
         # If sections are ever grouped on one staff, print its dynamic once.
         primary_section = next((group[0] for group in _voice_groups if section_idx in group), section_idx)
         dynamic_marks = (_measure_dynamic_marks(score, _section_parts[section_idx], len(measures))
@@ -468,7 +515,8 @@ def build_jianpu_ly_text(score, title: str, use_strict_timing: bool = False,
                 # Emitted exactly as extracted: no padding, no trimming.
                 measure_texts = [
                     _measure_text_with_tempos(m, tempo_marks.get(i + offset, []), i + offset + 1,
-                                              dynamic_marks.get(i + offset, []), meter_marks.get(i + offset, []))
+                                              dynamic_marks.get(i + offset, []), meter_marks.get(i + offset, []),
+                                              wedge_marks.get(i + offset, []))
                     for offset, m in enumerate(line_measures)
                 ]
                 changes = getattr(measures, 'key_changes', {})

@@ -195,6 +195,46 @@ def recover_pdf_dynamics(score_pdf: Path, source_mxl: Path, input_mxl: Path, wor
         return input_mxl
 
 
+def recover_pdf_wedges(score_pdf: Path, source_mxl: Path, input_mxl: Path, work: Path, stem: str) -> Path:
+    """Recover isolated vector hairpins only where both musical boundaries are verified."""
+    report_path = work / f'{stem}.pdf-wedges.json'
+    enriched = work / f'{stem}.pdf-wedges.musicxml'
+    protected = {score_pdf.resolve(), source_mxl.resolve(), input_mxl.resolve()}
+    while report_path.resolve() in protected:
+        report_path = report_path.with_name(report_path.stem + '.report.json')
+    while enriched.resolve() in protected:
+        enriched = enriched.with_name(enriched.stem + '.derived.musicxml')
+    try:
+        from core.omr.vector_wedges import discover_pdf_wedges, write_enriched_wedges
+        candidates, decisions = discover_pdf_wedges(score_pdf, source_mxl)
+        inserted, skipped = (write_enriched_wedges(input_mxl, enriched, candidates)
+                             if candidates else ([], []))
+        report_path.write_text(json.dumps({'source_pdf': str(score_pdf),
+                                           'source_pdf_sha256': _sha256_file(score_pdf),
+                                           'source_musicxml': str(source_mxl),
+                                           'source_musicxml_sha256': _sha256_file(source_mxl),
+                                           'input_musicxml': str(input_mxl),
+                                           'input_musicxml_sha256': _sha256_file(input_mxl),
+                                           'inserted': inserted, 'skipped': skipped,
+                                           'decisions': decisions}, ensure_ascii=False, indent=2),
+                               encoding='utf-8')
+        unresolved = sum(item.get('reason') != 'verified_candidate' for item in decisions)
+        if inserted:
+            print(f'[jianpu] 从 PDF 推断恢复 {len(inserted)} 条渐强渐弱线，请对照原谱；详情：{report_path}')
+        if unresolved or skipped:
+            print(f'[jianpu] {unresolved} 处线段待核对，{len(skipped)} 条候选未写入；详情：{report_path}')
+        return enriched if inserted else input_mxl
+    except Exception as exc:
+        try:
+            report_path.write_text(json.dumps({'source_pdf': str(score_pdf), 'source_musicxml': str(source_mxl),
+                                               'input_musicxml': str(input_mxl), 'inserted': [],
+                                               'error': str(exc)}, ensure_ascii=False, indent=2), encoding='utf-8')
+        except Exception:
+            pass
+        print(f'[jianpu] PDF 渐强渐弱线恢复失败，保留已有识谱结果继续：{exc}')
+        return input_mxl
+
+
 def musicxml_to_jianpu(mxl: Path, out_pdf: Path, title: Optional[str] = None) -> Path:
     """MusicXML → 整页简谱 PDF（music21 → jianpu-ly → LilyPond）。"""
     ensure_sumisora()
@@ -263,6 +303,8 @@ def main(argv: list[str]) -> int:
                     help='不从 PDF 矢量文字推断速度记号')
     ap.add_argument('--no-vector-dynamics', action='store_true',
                     help='不从 PDF 字体和音符位置推断力度记号')
+    ap.add_argument('--no-vector-wedges', action='store_true',
+                    help='不从 PDF 矢量线条推断渐强渐弱线')
     ap.add_argument('--work', type=Path, default=None,
                     help='OMR 中间结果目录（默认 <输出目录>/work）')
     ap.add_argument('--title', default=None, help='标题（默认取输入文件名）')
@@ -291,6 +333,8 @@ def main(argv: list[str]) -> int:
         jianpu_mxl = recover_pdf_tempos(score, mxl, work, base.name)
     if not args.no_vector_dynamics and (args.mode in ('jianpu', 'both') or args.engine == 'strip'):
         jianpu_mxl = recover_pdf_dynamics(score, mxl, jianpu_mxl, work, base.name)
+    if not args.no_vector_wedges and (args.mode in ('jianpu', 'both') or args.engine == 'strip'):
+        jianpu_mxl = recover_pdf_wedges(score, mxl, jianpu_mxl, work, base.name)
 
     if args.mode in ('jianpu', 'both'):
         musicxml_to_jianpu(jianpu_mxl, base.parent / f'{base.name}.jianpu.pdf', title)

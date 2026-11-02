@@ -638,6 +638,7 @@ def render_score_to_jianpu_pdf(
     lyrics_lines: Optional[list[str]] = None,
     composer: str = '',
     tempo: int = 0,
+    source_wedges=None,
 ) -> tuple[bool, list[list[int]], dict[int, dict[str, bool]]]:
     """
     Render a music21 score to jianpu PDF.
@@ -652,7 +653,8 @@ def render_score_to_jianpu_pdf(
     """
     _repeat_barlines: dict = {}
     try:
-        _jly_result = build_jianpu_ly_text(score, title, composer=composer, tempo=tempo, _return_groups=True)
+        _jly_result = build_jianpu_ly_text(score, title, composer=composer, tempo=tempo,
+                                          _return_groups=True, _source_wedges=source_wedges)
         txt_content, _voice_groups, _repeat_barlines = cast(
             tuple[str, list[list[int]], dict], _jly_result
         )
@@ -931,10 +933,23 @@ def generate_jianpu_pdf_from_mxl(
         # flow and the staff-PDF flow see correct start/end repeat structure.
         # Pass temp_dir so each concurrent worker writes its own isolated copy.
         _mxl_for_parse = _fix_adjacent_backward_repeats_in_mxl(mxl_path, temp_dir)
+        from ..notation.musicxml_wedges import remove_continuation_markers_for_parser
+        _mxl_for_parse = remove_continuation_markers_for_parser(_mxl_for_parse, temp_dir)
         # Keep the source voice structure intact.  Rhythmically identical
         # voices or voices containing only rests are not sufficient evidence
         # that MusicXML content is an OMR artefact or an unvoiced chord.
         source_score = converter.parse(str(_mxl_for_parse))
+        try:
+            from ..notation.musicxml_wedges import read_wedges
+            source_wedges, wedge_issues = read_wedges(mxl_path)
+            for part_index, measure_index, issue in wedge_issues:
+                location = f'分部 {part_index + 1}'
+                if measure_index is not None:
+                    location += f' 小节 {measure_index + 1}'
+                log_message(f'[jianpu] {location}：{issue}，请校对。', logging.WARNING)
+        except Exception as exc:
+            source_wedges = None
+            log_message(f'[jianpu] 无法读取 MusicXML 渐强渐弱线，请校对：{exc}', logging.WARNING)
 
         # Source file stem (preferred_title) is always authoritative — OMR engines write
         # internal filenames like "homr_input" that must not leak into the PDF title.
@@ -972,7 +987,7 @@ def generate_jianpu_pdf_from_mxl(
         log_message('当前转换链路: 乐谱文件(PDF/JPG/PNG) -> MXL/MusicXML -> 简谱 PDF')
         result, _voice_groups_out, _repeat_barlines_out = render_score_to_jianpu_pdf(
             source_score, title, output_pdf_path, temp_dir, txt_path, ly_path,
-            composer=composer, tempo=tempo_bpm,
+            composer=composer, tempo=tempo_bpm, source_wedges=source_wedges,
         )
 
         # Preserve editor workspace files when the conversion succeeded
