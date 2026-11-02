@@ -69,7 +69,7 @@ def audit(path: Path) -> dict:
             ties = _tie_types(event)
             if isinstance(event, chord.Chord) and len(set(ties)) > 1:
                 mismatches.append({'index': index + 1, 'measure_number': str(original[index].number),
-                                   'reason': 'partial_chord_tie_unrepresented',
+                                   'reason': 'partial_chord_tie_needs_review',
                                    'pitches': [n.pitch.ps for n in event.notes], 'tie_types': ties})
             source.append({'pitches': pitches, 'duration': round(float(event.duration.quarterLength), 6),
                            'grace': bool(event.duration.isGrace),

@@ -766,6 +766,22 @@ def lily_octave(octave):
     level += 1
     return "'" * level if level >= 0 else "," * -level
 
+def pitch_tie_marks(ties, index):
+    """LilyPond named slurs attached to an individual displayed pitch."""
+    if not ties or index not in ties:
+        return ""
+    starts, stops, carry_in, carry_out = ties[index]
+    def name(number):
+        letters = ""
+        while number:
+            number, digit = divmod(number - 1, 26)
+            letters = chr(ord('A') + digit) + letters
+        return 'PT' + letters
+    return (r"\repeatTie" * len(carry_in)
+            + "".join(r"\=%s)" % name(n) for n in stops)
+            + "".join(r"\=%s(" % name(n) for n in starts)
+            + r"\laissezVibrer" * len(carry_out))
+
 class NoteheadMarkup:
   def __init__(self,graceType=None):
       self.initOneScore()
@@ -806,7 +822,7 @@ class NoteheadMarkup:
   def wholeBarRestLen(self): return {96:"1.",48:"2.",32:"2",24:"4.",16:"4",12:"8.",8:"8"}.get(self.barLength,"1") # TODO: what if irregular?
   def baseOctaveChange(self,change):
       self.base_octave = addOctaves(change,self.base_octave)
-  def __call__(self,figures,nBeams,dots,octave,accidental,tremolo,word,line):
+  def __call__(self,figures,nBeams,dots,octave,accidental,tremolo,word,line,pitch_ties=None):
     # figures is a chord string of '1'-'7', or 'x' or '0' or '-'
     # nBeams is 0, 1, 2 .. etc (number of beams for this note)
     # dots is "" or "." or ".." etc (extra length)
@@ -822,7 +838,9 @@ class NoteheadMarkup:
 
     isChord = len(figures)>1
     if isChord:
-        chord_ret,octave,placeholder_chord = chordNotes_markup(re.sub(r'[\\qsdh.]','',word),word,line) # word w/out durations
+        chord_ret,octave,placeholder_chord = chordNotes_markup(
+            re.sub(r'[\\qsdh.]','',word),word,line,
+            pitch_ties if not midi and not western else None) # word w/out durations
         if not midi and not western: placeholder_chord = "c"
     else: # not isChord
         placeholder_chord = placeholders[figures]
@@ -949,6 +967,8 @@ class NoteheadMarkup:
         if (midi or western) and not placeholder_chord=="r": ret += lily_octave(octave)
         if add_cautionary_accidental: ret += "!"
     ret += ("%d" % length) + dots
+    if not isChord and not midi and not western and figures not in ('-', '0'):
+        ret += pitch_tie_marks(pitch_ties, 0)
     if self.rplacNextIfStillInBeam: self.rplacNextIfStillInBeam += ("r%d" % length) + dots + '['
     if tremolo:
         if midi or western:
@@ -1522,7 +1542,7 @@ def merge_marked_grace_groups(line):
         spec = ';'.join(str(i) + '=' + ','.join(values) for i, values in sorted(marks.items()))
         return 'g[' + ''.join(notes) + ']@' + spec
     return re.sub(pattern, merge, line)
-def chordNotes_markup(notes,word,line):
+def chordNotes_markup(notes,word,line,pitch_ties=None):
     notes = grace_octave_fix(notes,word,line) # ensures octaves and accidentals come before notes
     accidental = ""
     figure = ""
@@ -1561,7 +1581,8 @@ def chordNotes_markup(notes,word,line):
                 'sortKey':sortKey,
                 'figure':figure,
                 'octave':octave,
-                'accidental':accidental})
+                'accidental':accidental,
+                'input_index':len(dNotes)})
             accidental = ""
             figure = ""
             octave = ""
@@ -1611,8 +1632,9 @@ def chordNotes_markup(notes,word,line):
         if baseline > 0:
             ret += r"\tweak #'Y-offset #%.1f " % baseline
         ret += (r'\note-mod-angka "' if not_angka else r'\note-mod "')+f['figure']+'" '+placeholders[f['figure']]+{"":"", "#":"is", "b":"es", "##":"isis", "bb":"eses"}[f['accidental']]
-        if "," in f['octave']: ret += f['octave'][:-1]+" "
-        else: ret += f['octave']+"' "
+        if "," in f['octave']: ret += f['octave'][:-1]
+        else: ret += f['octave']+"'"
+        ret += pitch_tie_marks(pitch_ties, f['input_index']) + " "
         if "," in f['octave']: ret += r"\tweak #'Y-offset #%.1f " % (baseline -0.1 - 1.2 * offsets[f['octave']])
         elif "'" in f['octave']: ret += r"\tweak #'Y-offset #%.1f " % (baseline + 1.6 + 0.02 * offsets[f['octave']])
         ret += oDict[f['octave']]+" "
@@ -1949,14 +1971,26 @@ def getLY(score,headers=None,have_final_barline=True):
                 DS=r'''} } \volta 2 \volta #'() { \section \sectionLabel "Coda" } }'''
             else: # note (or unrecognised)
                 word0 = word
+                pitch_ties = {}
+                if '@PT' in word:
+                    word, spec = word.split('@PT', 1)
+                    if not re.match(r'^\d+[seio][1-9]\d*(?:,\d+[seio][1-9]\d*)*$', spec):
+                        scoreError("Invalid individual pitch ties",word0,line)
+                    for item in spec.split(','):
+                        match = re.match(r'^(\d+)([seio])([1-9]\d*)$', item)
+                        index, kind, tie_id = int(match.group(1)), match.group(2), int(match.group(3))
+                        buckets = pitch_ties.setdefault(index, ([], [], [], []))
+                        buckets['seio'.index(kind)].append(tie_id)
                 baseOctaveChange = "".join(c for c in word if c in "<>")
                 if baseOctaveChange:
                     notehead_markup.baseOctaveChange(baseOctaveChange)
                     word = "".join(c for c in word if not c in "<>")
                     if not word: continue # allow just < and > by itself in a word
                 figures,nBeams,dots,octave,accidental,tremolo = parseNote(word,word0,line)
+                if pitch_ties and (figures in ('-', '0', 'x') or max(pitch_ties) >= len(figures)):
+                    scoreError("Individual pitch tie has no matching note",word0,line)
                 need_final_barline = True
-                aftrLastNonDash,isDash,b4last,replaceLast,aftrlast,this,need_space_for_accidental,nBeams,octave = notehead_markup(figures,nBeams,dots,octave,accidental,tremolo,word0,line)
+                aftrLastNonDash,isDash,b4last,replaceLast,aftrlast,this,need_space_for_accidental,nBeams,octave = notehead_markup(figures,nBeams,dots,octave,accidental,tremolo,word,line,pitch_ties)
                 if replaceLast: out[lastPtr]=replaceLast
                 if b4last: out[lastPtr]=b4last+out[lastPtr]
                 if aftrlast: out.insert(lastPtr+1,aftrlast)

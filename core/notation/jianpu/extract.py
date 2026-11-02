@@ -230,6 +230,7 @@ def extract_jianpu_measures(score, key_tonic_semitone: int = 0,
     # A dash repeats the preceding event's *entire* pitch set. Only use it
     # when the previous adjacent source event ties every one of those pitches.
     previous_source = None
+    next_pitch_tie_id = 1
     # How long the previous measure's *content* actually was.  Only used to give
     # a measure the OMR left completely empty a sane width — see the ``not
     # by_offset`` branch below.
@@ -276,6 +277,7 @@ def extract_jianpu_measures(score, key_tonic_semitone: int = 0,
         # detection above stays only for the signature word shown in the UI.
         by_offset: dict[float, list[object]] = {}
         tie_review_candidates: dict[int, str] = {}
+        pitch_tie_records: dict[int, tuple[list, list]] = {}
         _offset_seen: dict[int, float] = {}  # Preserve first offset for epsilon-only deduplication.
         slur_boundaries: dict[tuple[float, tuple[int, ...]], list[int]] = {}
         for source_note in measure.recurse().notes:
@@ -341,27 +343,59 @@ def extract_jianpu_measures(score, key_tonic_semitone: int = 0,
                 continue
             full_continuation = False
             tie_review = ''
+            tie_record = None
             if isinstance(element, m21note.Rest):
                 previous_source = None
             else:
-                component_notes = list(element.notes) if isinstance(element, m21chord.Chord) else [element]
-                source_pitches = tuple(sorted(n.pitch.ps for n in component_notes))
+                component_notes = sorted(list(element.notes) if isinstance(element, m21chord.Chord)
+                                         else [element], key=lambda n: n.pitch.ps)
+                source_pitches = tuple(n.pitch.ps for n in component_notes)
                 tie_types = [n.tie.type if n.tie else None for n in component_notes]
                 incoming = [kind in ('stop', 'continue') for kind in tie_types]
                 outgoing = [kind in ('start', 'continue') for kind in tie_types]
                 absolute_offset = float(measure.getOffsetInHierarchy(part)) + offset
-                full_continuation = bool(
+                adjacent = bool(previous_source is not None
+                                and abs(previous_source[2] - absolute_offset) <= 1e-6)
+                matched_full = bool(
                     incoming and all(incoming) and previous_source is not None
                     and previous_source[0] == source_pitches and previous_source[1]
-                    and abs(previous_source[2] - absolute_offset) <= 1e-6)
+                    and adjacent)
+                # A chord that continues as a whole but then releases only
+                # some pitches needs visible noteheads for the outgoing ties.
+                partial_outgoing = any(outgoing) and not all(outgoing)
+                full_continuation = matched_full and not partial_outgoing
+                tie_record = ([], [])
+                if not full_continuation and adjacent and previous_source is not None:
+                    if len(set(source_pitches)) == len(source_pitches):
+                        for index, (pitch, is_incoming) in enumerate(zip(source_pitches, incoming)):
+                            if not is_incoming or pitch not in previous_source[3]:
+                                continue
+                            anchor = previous_source[4].get(pitch)
+                            if anchor is None:
+                                continue
+                            anchor_record, anchor_index = anchor
+                            tie_id = next_pitch_tie_id
+                            next_pitch_tie_id += 1
+                            anchor_record[0].append((anchor_index, tie_id))
+                            tie_record[1].append((index, tie_id))
                 if (any(incoming) and not full_continuation) or (any(outgoing) and not all(outgoing)):
                     tie_review = ('partial_chord_tie' if isinstance(element, m21chord.Chord)
                                   and len(set(tie_types)) > 1 else 'unmatched_tie')
                     log_message(
                         f'[jianpu] 小节 {_m_idx + 1}、位置 {offset:g} 的部分延音或不匹配延音'
-                        '无法完整表示；保留所有音符，请校对。', _logging.WARNING)
+                        '需要校对（跨行时可能无法完整显示）；已保留所有音符。', _logging.WARNING)
+                outgoing_pitches = {pitch for pitch, flag in zip(source_pitches, outgoing) if flag}
+                if full_continuation and previous_source is not None:
+                    anchors = {pitch: previous_source[4][pitch] for pitch in outgoing_pitches
+                               if pitch in previous_source[4]}
+                elif len(set(source_pitches)) == len(source_pitches):
+                    anchors = {pitch: (tie_record, index) for index, pitch in enumerate(source_pitches)
+                               if pitch in outgoing_pitches}
+                else:
+                    anchors = {}
                 previous_source = (source_pitches, bool(outgoing and all(outgoing)),
-                                   absolute_offset + float(element.duration.quarterLength))
+                                   absolute_offset + float(element.duration.quarterLength),
+                                   outgoing_pitches, anchors)
             # 跨小节 tie-stop/continue：上一小节 tie-start 音符在本小节内的延续。
             # 渲染为延音 dash（'-'），而非独立音符或休止符。
             if full_continuation:
@@ -384,6 +418,8 @@ def extract_jianpu_measures(score, key_tonic_semitone: int = 0,
             # the OMR had over-filled, and stopped earlier bars from being "too
             # long" at all.)
             candidate = clone_monophonic_element(element, float(element.duration.quarterLength or 0.25))
+            if tie_record is not None:
+                pitch_tie_records[id(candidate)] = tie_record
             if tie_review:
                 tie_review_candidates[id(candidate)] = tie_review
             existing = by_offset.get(offset)
@@ -442,6 +478,8 @@ def extract_jianpu_measures(score, key_tonic_semitone: int = 0,
                 else:
                     jn = note_to_jianpu(element, key_tonic_semitone, tonic_step=tonic_step)
                     jn.tie_review = tie_review_candidates.get(id(element), '')
+                    if id(element) in pitch_tie_records:
+                        jn.pitch_tie_starts, jn.pitch_tie_stops = pitch_tie_records[id(element)]
                     if not jn.is_rest:
                         pitches = (jn.midi, *[p[4] for p in jn.chord_notes])
                         starts, stops = slur_boundaries.pop((round(offset, 7), pitches), (0, 0))

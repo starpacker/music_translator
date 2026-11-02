@@ -527,6 +527,16 @@ def _jianpu_note_token_unmarked(note: JianpuNote) -> str:
     else:
         base_note = note.accidental + note.symbol + jianpu_octave_symbol(note.upper_dots, note.lower_dots)
 
+    if (note.pitch_tie_starts or note.pitch_tie_stops
+            or note.pitch_tie_carry_in or note.pitch_tie_carry_out):
+        # Keep annotations in the note word so tempo, dynamics, tuplets, and
+        # duration dashes still attach to the right musical event.
+        markers = ([f'{index}e{tie_id}' for index, tie_id in note.pitch_tie_stops]
+                   + [f'{index}s{tie_id}' for index, tie_id in note.pitch_tie_starts]
+                   + [f'{index}i{tie_id}' for index, tie_id in note.pitch_tie_carry_in]
+                   + [f'{index}o{tie_id}' for index, tie_id in note.pitch_tie_carry_out])
+        base_note += '@PT' + ','.join(markers)
+
     if getattr(note, 'is_grace', False):
         return f'g[{base_note}]'
 
@@ -700,6 +710,10 @@ def clone_jianpu_note(note: JianpuNote, duration: float, carry_lyrics: bool = Tr
         tuplet_stop=note.tuplet_stop,
         notations=note.notations if carry_lyrics else (),
         tie_review=note.tie_review if carry_lyrics else '',
+        pitch_tie_starts=list(note.pitch_tie_starts) if carry_lyrics else [],
+        pitch_tie_stops=list(note.pitch_tie_stops) if carry_lyrics else [],
+        pitch_tie_carry_in=list(note.pitch_tie_carry_in) if carry_lyrics else [],
+        pitch_tie_carry_out=list(note.pitch_tie_carry_out) if carry_lyrics else [],
     )
 
 

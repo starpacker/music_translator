@@ -159,3 +159,8 @@ class JianpuNote:
     notations: tuple[str, ...] = ()
     # Exact note-level tie information could not be represented safely.
     tie_review: str = ''
+    # Matched individual-pitch ties: (index within low-to-high chord, ID).
+    pitch_tie_starts: list[tuple[int, int]] = field(default_factory=list)
+    pitch_tie_stops: list[tuple[int, int]] = field(default_factory=list)
+    pitch_tie_carry_in: list[tuple[int, int]] = field(default_factory=list)
+    pitch_tie_carry_out: list[tuple[int, int]] = field(default_factory=list)

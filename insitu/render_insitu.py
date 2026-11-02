@@ -103,6 +103,24 @@ def _line_slur_continuations(measures, start: int, end: int):
             active = max(0, active - event.slur_stops) + event.slur_starts
     entering = active
     line = [[copy.copy(event) for event in measure] for measure in measures[start:end]]
+    # A tile is a separate LilyPond score. Keep only individual-pitch ties
+    # whose endpoints both occur within this tile. Draw separate short
+    # continuation arcs for endpoints on different rows and retain review.
+    starts = {tie_id for measure in line for event in measure
+              for _, tie_id in event.pitch_tie_starts}
+    stops = {tie_id for measure in line for event in measure
+             for _, tie_id in event.pitch_tie_stops}
+    local_ties = starts & stops
+    for measure in line:
+        for event in measure:
+            event.pitch_tie_carry_out = [(index, tie_id) for index, tie_id in event.pitch_tie_starts
+                                         if tie_id not in local_ties]
+            event.pitch_tie_carry_in = [(index, tie_id) for index, tie_id in event.pitch_tie_stops
+                                        if tie_id not in local_ties]
+            event.pitch_tie_starts = [(index, tie_id) for index, tie_id in event.pitch_tie_starts
+                                      if tie_id in local_ties]
+            event.pitch_tie_stops = [(index, tie_id) for index, tie_id in event.pitch_tie_stops
+                                     if tie_id in local_ties]
     for measure in line:
         for event in measure:
             active = max(0, active - event.slur_stops) + event.slur_starts
