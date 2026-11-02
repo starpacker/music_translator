@@ -15,7 +15,8 @@ import xml.etree.ElementTree as ET
 import zipfile
 
 import pymupdf
-from music21 import clef, converter, note
+from music21 import clef, note
+from core.notation.musicxml_wedges import parse_musicxml_compatible
 
 from insitu.align import align_from_files
 from .multirest_collapse import page_system_slot_kinds
@@ -129,7 +130,7 @@ def discover_pdf_tempos(pdf_path: Path, mxl_path: Path):
         page_marks = [_page_marks(page) for page in doc]
     if not any(tempos for tempos, _, _ in page_marks):
         return [], []
-    score = converter.parse(str(mxl_path))
+    score = parse_musicxml_compatible(mxl_path)
     if len(score.parts) != 1:
         return [], [{'page': page_index, 'x': round(x, 2), 'y': round(y, 2),
                      'bpm': bpm, 'reason': 'multiple_parts'}

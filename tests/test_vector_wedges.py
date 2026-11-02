@@ -75,6 +75,26 @@ class VectorWedgeTest(unittest.TestCase):
             self.assertFalse(candidates)
             self.assertIn('split_strokes_or_possible_continuation', [item['reason'] for item in report])
 
+    def test_legal_continuation_does_not_break_pdf_analysis(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            pdf, mxl = make_sources(root)
+            tree = ET.parse(mxl)
+            measure = tree.find('./part/measure')
+            notes = measure.findall('note')
+            for position, kind in ((list(measure).index(notes[0]), 'crescendo'),
+                                   (list(measure).index(notes[1]) + 1, 'continue'),
+                                   (len(measure) + 2, 'stop')):
+                direction = ET.Element('direction')
+                dtype = ET.SubElement(direction, 'direction-type')
+                ET.SubElement(dtype, 'wedge', {'type': kind})
+                measure.insert(position, direction)
+            tree.write(mxl)
+            original = mxl.read_bytes()
+            candidates, report = self.discover(add_lines(pdf), mxl)
+            self.assertEqual(len(candidates), 1, report)
+            self.assertEqual(mxl.read_bytes(), original)
+
     def test_existing_wedges_and_invalid_boundary_are_not_overwritten(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

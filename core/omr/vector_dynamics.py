@@ -13,7 +13,7 @@ import tempfile
 import xml.etree.ElementTree as ET
 
 import pymupdf
-from music21 import converter
+from core.notation.musicxml_wedges import parse_musicxml_compatible
 
 from insitu.align import align_from_files
 from .vector_tempos import _matched_note_events, _page_marks, _read_root
@@ -90,7 +90,7 @@ def discover_pdf_dynamics(pdf_path: Path, mxl_path: Path):
         marks_by_page = [_dynamic_glyphs(doc, page) for page in doc]
     if not any(marks_by_page):
         return [], []
-    score = converter.parse(str(mxl_path))
+    score = parse_musicxml_compatible(mxl_path)
     if len(score.parts) != 1:
         return [], [{'page': page, 'x': round(x, 2), 'y': round(y, 2), 'value': value,
                      'reason': 'multiple_parts'}

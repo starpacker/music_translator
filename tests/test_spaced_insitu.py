@@ -76,11 +76,25 @@ class SpacedInsituTest(unittest.TestCase):
 <note><pitch><step>C</step><octave>4</octave></pitch><duration>4</duration><type>whole</type></note></measure>
 <measure number="2"><print new-system="yes"/><note><pitch><step>D</step><octave>4</octave></pitch>
 <duration>4</duration><type>whole</type></note></measure></part></score-partwise>''', encoding='utf-8')
+            # A legal cross-system wedge continuation previously made the
+            # music21 parser reject the entire in-situ conversion.
+            content = xml.read_text()
+            content = content.replace('<note><pitch><step>C</step>',
+                '<direction><direction-type><wedge type="crescendo"/></direction-type></direction>'
+                '<note><pitch><step>C</step>', 1)
+            content = content.replace('<print new-system="yes"/>',
+                '<print new-system="yes"/><direction><direction-type>'
+                '<wedge type="continue"/></direction-type></direction>', 1)
+            content = content.replace('</note></measure></part></score-partwise>',
+                '</note><direction><direction-type><wedge type="stop"/></direction-type></direction>'
+                '</measure></part></score-partwise>', 1)
+            xml.write_text(content)
             result = subprocess.run([sys.executable, str(ROOT / 'jianpu.py'), str(pdf), '--mxl', str(xml),
                                      '--mode', 'insitu', '-o', str(root / 'out')], cwd=ROOT,
                                     capture_output=True, text=True, env={**os.environ, 'TMPDIR': tmp}, timeout=90)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertIn('placed 2/2 lines', result.stdout)
+            self.assertEqual(xml.read_text(), content)
             with pymupdf.open(root / 'out.insitu.pdf') as output:
                 self.assertEqual(len(output), 1)
                 self.assertGreaterEqual(output[0].rect.height, 568)

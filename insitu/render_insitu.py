@@ -63,7 +63,7 @@ from core.notation.jianpu import (  # noqa: E402
     _extract_part_repeat_barlines,
 )
 from core.render.jianpu_runner import _insert_repeat_bar_commands  # noqa: E402
-from music21 import converter  # noqa: E402
+from core.notation.musicxml_wedges import parse_musicxml_compatible  # noqa: E402
 
 from align import align_from_files  # noqa: E402
 
@@ -483,7 +483,7 @@ def build(pdf_path: Path, mxl_path: Path, out_path: Path,
           title: Optional[str] = None, expand: bool = False) -> Path:
     staves, slices = align_from_files(pdf_path, mxl_path)
 
-    score = converter.parse(str(mxl_path))
+    score = parse_musicxml_compatible(mxl_path)
     tonic, key_header = _get_score_key_tonic(score)
     part = score.parts[0] if score.parts else None
     voice_ids = _get_voice_ids_in_part(part) if part is not None else []

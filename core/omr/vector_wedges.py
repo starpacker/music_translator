@@ -7,7 +7,7 @@ import tempfile
 import xml.etree.ElementTree as ET
 
 import pymupdf
-from music21 import converter
+from core.notation.musicxml_wedges import parse_musicxml_compatible
 
 from insitu.align import align_from_files
 from .multirest_collapse import page_system_slot_kinds
@@ -74,7 +74,7 @@ def _nearest_boundary(x, positions, spacing):
 
 
 def discover_pdf_wedges(pdf_path: Path, mxl_path: Path):
-    score = converter.parse(str(mxl_path))
+    score = parse_musicxml_compatible(mxl_path)
     if len(score.parts) != 1:
         return [], [{'reason': 'multiple_parts'}]
     measures = list(score.parts[0].getElementsByClass('Measure'))

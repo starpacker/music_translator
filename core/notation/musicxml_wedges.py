@@ -5,6 +5,7 @@ from fractions import Fraction
 from pathlib import Path
 import xml.etree.ElementTree as ET
 import zipfile
+import tempfile
 
 
 def _root(path: Path):
@@ -38,6 +39,14 @@ def remove_continuation_markers_for_parser(path: Path, temporary_dir: Path) -> P
     out = temporary_dir / '__wedge_continuations_for_parser.musicxml'
     ET.ElementTree(root).write(out, encoding='utf-8', xml_declaration=True)
     return out
+
+
+def parse_musicxml_compatible(path: Path):
+    """Parse valid continuation markers without modifying their source file."""
+    from music21 import converter
+    with tempfile.TemporaryDirectory(prefix='musicxml_parse_') as tmp:
+        compatible = remove_continuation_markers_for_parser(path, Path(tmp))
+        return converter.parse(str(compatible))
 
 
 def read_wedges(path: Path):

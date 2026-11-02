@@ -322,6 +322,19 @@ def main(argv: list[str]) -> int:
     else:
         base = args.output.with_suffix('') if args.output.suffix else args.output
 
+    # Generated files must never replace either of the user's inputs, even
+    # when an output prefix happens to end in .jianpu or .insitu.
+    generated = []
+    if args.mode in ('jianpu', 'both') or (args.mode == 'insitu' and args.engine == 'strip'):
+        generated.append(base.parent / f'{base.name}.jianpu.pdf')
+    if args.mode in ('insitu', 'both'):
+        generated.append(base.parent / f'{base.name}.insitu.pdf')
+    protected = {score.resolve()}
+    if args.mxl is not None:
+        protected.add(args.mxl.resolve())
+    if any(path.resolve() in protected for path in generated):
+        ap.error('输出路径与输入文件相同，请选择其他输出前缀')
+
     work = args.work or (base.parent / 'work')
     work.mkdir(parents=True, exist_ok=True)
 
@@ -343,7 +356,9 @@ def main(argv: list[str]) -> int:
         out = base.parent / f'{base.name}.insitu.pdf'
         if args.engine == 'strip':
             ref = base.parent / f'{base.name}.jianpu.pdf'
-            if not ref.is_file():
+            # In insitu-only mode an existing PDF may belong to a previous
+            # MusicXML or source score; it is not a validated cache.
+            if args.mode == 'insitu':
                 musicxml_to_jianpu(jianpu_mxl, ref, title)
             insitu_strip(score, ref, out)
         else:
