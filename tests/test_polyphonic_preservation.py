@@ -10,6 +10,10 @@ from music21 import chord, converter, key, meter, note, stream
 from core.notation.jianpu import build_jianpu_ly_text, extract_jianpu_measures
 
 
+def without_meter_label(text):
+    return text.replace(' ^\\markup{\\concat{\\hspace#3"4/4"}}', '')
+
+
 def make_score():
     score, part, measure = stream.Score(), stream.Part(), stream.Measure(number=1)
     measure.insert(0, key.KeySignature(0))
@@ -29,8 +33,8 @@ class PolyphonicPreservationTest(unittest.TestCase):
     def test_single_measure_voice_with_overlapping_notes_is_not_dropped(self):
         text, groups, _ = build_jianpu_ly_text(make_score(), 'test', _return_groups=True)
         self.assertEqual(groups, [[0], [1]])
-        self.assertIn('1\' - - -', text)
-        self.assertIn('2 3 4 5', text)
+        self.assertIn('1\' - - -', without_meter_label(text))
+        self.assertIn('2 3 4 5', without_meter_label(text))
         self.assertEqual(text.count('NextPart'), 1)
 
     def test_more_than_four_voices_are_not_truncated(self):
@@ -63,7 +67,7 @@ class PolyphonicPreservationTest(unittest.TestCase):
             self.assertTrue(generate_jianpu_pdf_from_mxl(mxl, out, root, editor_workspace_dir=workspace))
             text = next(workspace.glob('*.jianpu.txt')).read_text()
             self.assertEqual(text.splitlines().count('NextPart'), 1)
-            self.assertIn('2 3 4 5', text)
+            self.assertIn('2 3 4 5', without_meter_label(text))
 
     @unittest.skipUnless(shutil.which('lilypond'), 'LilyPond is required')
     def test_insitu_renders_both_voices_as_separate_rows(self):

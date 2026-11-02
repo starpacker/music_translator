@@ -12,6 +12,10 @@ from music21 import converter, duration, meter, note, stream, tempo
 from core.notation.jianpu import build_jianpu_ly_text
 
 
+def without_meter_label(text):
+    return text.replace(' ^\\markup{\\concat{\\hspace#3"4/4"}}', '')
+
+
 def make_score():
     score, part = stream.Score(), stream.Part()
     for index in range(2):
@@ -35,7 +39,7 @@ class TempoPreservationTest(unittest.TestCase):
             path = Path(tmp) / 'score.musicxml'
             make_score().write('musicxml', fp=path)
             text = build_jianpu_ly_text(converter.parse(str(path)), 'test')
-            self.assertIn('1 2 4=70 3 4 | 4.=92 1 2 3 4 |', text)
+            self.assertIn('1 2 4=70 3 4 | 4.=92 1 2 3 4 |', without_meter_label(text))
             self.assertNotIn('\n4=70\n', text)
             script = Path(__file__).resolve().parents[1] / 'scripts/jianpu-ly.py'
             source = Path(tmp) / 'score.txt'
@@ -57,7 +61,7 @@ class TempoPreservationTest(unittest.TestCase):
         text = build_jianpu_ly_text(score, 'test', tempo=80)
         self.assertIn('\n4=80\n', text)
         self.assertNotIn('4=60', text)
-        self.assertIn('1 2 4=70 3 4 | 4.=92', text)
+        self.assertIn('1 2 4=70 3 4 | 4.=92', without_meter_label(text))
 
     def test_marks_directly_on_score_and_part_keep_their_offsets(self):
         score = make_score()
@@ -65,7 +69,7 @@ class TempoPreservationTest(unittest.TestCase):
         score.insert(0, tempo.MetronomeMark(number=50))
         part.insert(4, tempo.MetronomeMark(number=80, referent='eighth'))
         text = build_jianpu_ly_text(score, 'test')
-        self.assertIn('4=50 1 2 4=70 3 4 |', text)
+        self.assertIn('4=50 1 2 4=70 3 4 |', without_meter_label(text))
         self.assertIn('8=80', text)
 
     def test_unmeasured_score_retains_tempo(self):
@@ -85,7 +89,7 @@ class TempoPreservationTest(unittest.TestCase):
             workspace = root / 'workspace'
             self.assertTrue(generate_jianpu_pdf_from_mxl(source, target, root, editor_workspace_dir=workspace))
             text = next(workspace.glob('*.jianpu.txt')).read_text()
-            self.assertIn('1 2 4=70 3 4 | 4.=92 1 2 3 4 |', text)
+            self.assertIn('1 2 4=70 3 4 | 4.=92 1 2 3 4 |', without_meter_label(text))
             self.assertNotIn('\n4=70\n', text)
             self.assertTrue(target.is_file())
 

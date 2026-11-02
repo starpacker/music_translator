@@ -1,6 +1,7 @@
 # core/notation/jianpu/__init__.py — Public API for Jianpu conversion.
 # Orchestration functions live here; sub-modules provide the building blocks.
 import logging as _logging
+import re
 from typing import Literal, Optional, overload
 
 from ...utils import log_message
@@ -174,12 +175,33 @@ def _measure_dynamic_marks(score, part, measure_count: int) -> dict[int, list[tu
     return result
 
 
+def _measure_meter_marks(score, part, measure_count: int) -> dict[int, list[tuple[float, str]]]:
+    """Collect actual written meters, distinct from layout-only bar lengths."""
+    from music21 import meter
+    result: dict[int, list[tuple[float, str]]] = {}
+    previous = None
+    candidates = _measure_direction_events(score, part, measure_count, meter.TimeSignature, '拍号')
+    for index, offset, mark in sorted(candidates, key=lambda item: (item[0], item[1])):
+        ratio = str(mark.ratioString or '')
+        if len(ratio) > 64 or not re.fullmatch(r'[1-9][0-9]*/[1-9][0-9]*(?:\+[1-9][0-9]*/[1-9][0-9]*)*', ratio):
+            log_message(f'[jianpu] 小节 {index + 1} 的拍号 {ratio!r} 无法表示，请校对。', _logging.WARNING)
+            continue
+        if ratio != previous:
+            # A little leading space separates the mark from the key label at
+            # the start of the staff.  It has no effect on bar timing.
+            result.setdefault(index, []).append((offset, '^\\markup{\\concat{\\hspace#3"' + ratio + '"}}'))
+            previous = ratio
+    return result
+
+
 def _measure_text_with_tempos(notes: list[JianpuNote], marks: list[tuple[float, str]],
                               measure_number: int,
-                              dynamics: Optional[list[tuple[float, str]]] = None) -> str:
+                              dynamics: Optional[list[tuple[float, str]]] = None,
+                              meters: Optional[list[tuple[float, str]]] = None) -> str:
     """Insert marks only at a rendered event boundary, never move them silently."""
     pending = sorted(marks, key=lambda item: item[0])
     pending_dynamics = sorted(dynamics or [], key=lambda item: item[0])
+    pending_meters = sorted(meters or [], key=lambda item: item[0])
     words: list[str] = []
     position = 0.0
     for note in notes:
@@ -190,13 +212,15 @@ def _measure_text_with_tempos(notes: list[JianpuNote], marks: list[tuple[float, 
         if not note.is_grace:
             matched_dynamics = [mark for mark in pending_dynamics if abs(mark[0] - position) < 1e-6]
             pending_dynamics = [mark for mark in pending_dynamics if abs(mark[0] - position) >= 1e-6]
-            if matched_dynamics:
+            matched_meters = [mark for mark in pending_meters if abs(mark[0] - position) < 1e-6]
+            pending_meters = [mark for mark in pending_meters if abs(mark[0] - position) >= 1e-6]
+            if matched_dynamics or matched_meters:
                 # A long Jianpu event may expand to "1 - -".  LilyPond
                 # dynamics attach to the *preceding* event, so insert after
                 # the first note word, not after the last duration dash.
                 parts = token.split()
                 index = 1 if len(parts) > 1 and parts[0].endswith('[') else 0
-                parts[index + 1:index + 1] = [word for _, word in matched_dynamics]
+                parts[index + 1:index + 1] = [word for _, word in (*matched_dynamics, *matched_meters)]
                 token = ' '.join(parts)
         words.append(token)
         if not note.is_grace:
@@ -206,6 +230,9 @@ def _measure_text_with_tempos(notes: list[JianpuNote], marks: list[tuple[float, 
                     '不在可表示的音符边界，需人工校对。', _logging.WARNING)
     for offset, _ in pending_dynamics:
         log_message(f'[jianpu] 小节 {measure_number} 的力度记号位于 {offset:g} 拍，'
+                    '不在可表示的音符边界，需人工校对。', _logging.WARNING)
+    for offset, _ in pending_meters:
+        log_message(f'[jianpu] 小节 {measure_number} 的拍号位于 {offset:g} 拍，'
                     '不在可表示的音符边界，需人工校对。', _logging.WARNING)
     return ' '.join(words)
 
@@ -304,6 +331,9 @@ def build_jianpu_ly_text(score, title: str, use_strict_timing: bool = False,
         staves to avoid overlapping numbered notes.
     """
     key_tonic_semitone, key_header_line = _get_score_key_tonic(score)
+    if use_strict_timing:
+        log_message('[jianpu] 严格模式重分小节，无法可靠对应原始速度、力度和拍号位置；请校对。',
+                    _logging.WARNING)
 
     # ── Collect one measures-list per output section ──────────────────────────
     _parts = list(score.parts) if score.parts else []
@@ -420,11 +450,14 @@ def build_jianpu_ly_text(score, title: str, use_strict_timing: bool = False,
         # Each section gets its own staff and its own barLength, so the layout
         # tokens restart from the header's bar length for every section.
         section_time_sigs = layout_time_tokens(measures, bar_units)
-        tempo_marks = _measure_tempo_marks(score, _section_parts[section_idx], len(measures))
+        tempo_marks = ({} if use_strict_timing
+                       else _measure_tempo_marks(score, _section_parts[section_idx], len(measures)))
+        meter_marks = ({} if use_strict_timing
+                       else _measure_meter_marks(score, _section_parts[section_idx], len(measures)))
         # If sections are ever grouped on one staff, print its dynamic once.
         primary_section = next((group[0] for group in _voice_groups if section_idx in group), section_idx)
         dynamic_marks = (_measure_dynamic_marks(score, _section_parts[section_idx], len(measures))
-                         if section_idx == primary_section else {})
+                         if not use_strict_timing and section_idx == primary_section else {})
         if tempo > 0 and 0 in tempo_marks:
             # A caller-supplied initial tempo overrides source marks at time zero.
             tempo_marks[0] = [(offset, word) for offset, word in tempo_marks[0]
@@ -435,7 +468,7 @@ def build_jianpu_ly_text(score, title: str, use_strict_timing: bool = False,
                 # Emitted exactly as extracted: no padding, no trimming.
                 measure_texts = [
                     _measure_text_with_tempos(m, tempo_marks.get(i + offset, []), i + offset + 1,
-                                              dynamic_marks.get(i + offset, []))
+                                              dynamic_marks.get(i + offset, []), meter_marks.get(i + offset, []))
                     for offset, m in enumerate(line_measures)
                 ]
                 changes = getattr(measures, 'key_changes', {})

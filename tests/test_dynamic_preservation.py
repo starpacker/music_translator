@@ -35,7 +35,8 @@ class DynamicPreservationTest(unittest.TestCase):
             source = root / 'source.musicxml'
             make_score().write('musicxml', fp=source)
             text = build_jianpu_ly_text(converter.parse(str(source)), 'test')
-            self.assertIn('1 \\mp - 2 \\f - | 3 \\pp - - - |', text)
+            self.assertIn('1 \\mp ', text)
+            self.assertIn(' - 2 \\f - | 3 \\pp - - - |', text)
             txt = root / 'score.txt'
             txt.write_text(text)
             script = Path(__file__).resolve().parents[1] / 'scripts' / 'jianpu-ly.py'
@@ -65,7 +66,7 @@ class DynamicPreservationTest(unittest.TestCase):
         score = make_score()
         score.parts[0].measure(1).insert(0, note.Note('D4').getGrace())
         text = build_jianpu_ly_text(score, 'test')
-        self.assertIn('g[2] 1 \\mp -', text)
+        self.assertIn('g[2] 1 \\mp ', text)
 
     def test_dynamic_attaches_inside_tuplet_after_its_first_note(self):
         score, part, measure = stream.Score(), stream.Part(), stream.Measure(number=1)
