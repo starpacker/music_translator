@@ -1,6 +1,7 @@
 # core/notation/jianpu/primitives.py — Note/duration primitives for Jianpu conversion.
 
 import logging as _logging
+from fractions import Fraction
 
 from music21 import chord as m21chord, note as m21note
 
@@ -188,6 +189,10 @@ def get_duration_render(duration: float, dots: int) -> tuple[int, int, int]:
         return 0, 3, 1
     if abs(duration - 0.125) < tol:
         return 0, 3, 0
+    if abs(duration - 0.09375) < tol:
+        return 0, 4, 1
+    if abs(duration - 0.0625) < tol:
+        return 0, 4, 0
     return 0, 1, dots
 
 
@@ -309,6 +314,23 @@ def _pitch_to_fields(pitch, key_tonic_semitone: int) -> tuple[str, str, int, int
     return accidental, symbol, upper_dots, lower_dots, note_midi
 
 
+def _apply_tuplet_metadata(result: JianpuNote, element) -> JianpuNote:
+    tuplets = element.duration.tuplets
+    if len(tuplets) == 1 and not element.duration.isGrace:
+        tuplet = tuplets[0]
+        result.tuplet_actual = int(tuplet.numberNotesActual or 0)
+        result.tuplet_normal = int(tuplet.numberNotesNormal or 0)
+        if result.tuplet_actual <= 0 or result.tuplet_normal <= 0:
+            _log_message('[jianpu] 连音符比例无效，请校对该小节', _logging.WARNING)
+            result.tuplet_actual = result.tuplet_normal = 0
+            return result
+        result.tuplet_type = tuplet.type
+        result.written_duration = float(element.duration.quarterLength) * result.tuplet_actual / result.tuplet_normal
+    elif len(tuplets) > 1:
+        _log_message('[jianpu] 嵌套连音符尚不支持，请校对该小节', _logging.WARNING)
+    return result
+
+
 def note_to_jianpu(element, key_tonic_semitone: int = 0) -> JianpuNote:
     """Convert a music21 note, rest or chord to a JianpuNote dataclass (Movable-Do / 首调唱名法).
 
@@ -322,7 +344,7 @@ def note_to_jianpu(element, key_tonic_semitone: int = 0) -> JianpuNote:
     on one rhythmic slot instead of collapsing it to a single pitch.
     """
     if isinstance(element, m21note.Rest):
-        return JianpuNote(
+        return _apply_tuplet_metadata(JianpuNote(
             symbol='0',
             accidental='',
             upper_dots=0,
@@ -331,7 +353,7 @@ def note_to_jianpu(element, key_tonic_semitone: int = 0) -> JianpuNote:
             duration_dots=int(getattr(element.duration, 'dots', 0)),
             midi=None,
             is_rest=True,
-        )
+        ), element)
 
     # ── Chord: lowest pitch is the primary, higher pitches become chord_notes ──
     # A one-pitch Chord is still a Chord (music21 writes one when a single stem
@@ -346,7 +368,7 @@ def note_to_jianpu(element, key_tonic_semitone: int = 0) -> JianpuNote:
             _pitch_to_fields(p, key_tonic_semitone)[:5] for p in _sorted_pitches[1:]
         )
         # 规范化：_pitch_to_fields 返回 (acc, sym, up, low, midi)，即 chord_notes 的元素顺序
-        return JianpuNote(
+        return _apply_tuplet_metadata(JianpuNote(
             symbol=symbol,
             accidental=accidental,
             upper_dots=upper_dots,
@@ -357,23 +379,23 @@ def note_to_jianpu(element, key_tonic_semitone: int = 0) -> JianpuNote:
             is_rest=False,
             lyrics=_extract_lyrics(element),
             chord_notes=chord_notes,
-        )
+        ), element)
 
     pitch = element.pitch
     if pitch is None:
-        return JianpuNote(
+        return _apply_tuplet_metadata(JianpuNote(
             symbol='?', accidental='', upper_dots=0, lower_dots=0,
             duration=float(element.duration.quarterLength),
             duration_dots=int(getattr(element.duration, 'dots', 0)),
             midi=None, is_rest=False,
             lyrics=_extract_lyrics(element),
-        )
+        ), element)
 
     accidental, symbol, upper_dots, lower_dots, note_midi = _pitch_to_fields(
         pitch, key_tonic_semitone
     )
 
-    return JianpuNote(
+    return _apply_tuplet_metadata(JianpuNote(
         symbol=symbol,
         accidental=accidental,
         upper_dots=upper_dots,
@@ -383,7 +405,7 @@ def note_to_jianpu(element, key_tonic_semitone: int = 0) -> JianpuNote:
         midi=note_midi,
         is_rest=False,
         lyrics=_extract_lyrics(element),
-    )
+    ), element)
 
 
 def format_jianpu_note_text(note: JianpuNote) -> str:
@@ -442,7 +464,7 @@ def _jianpu_note_token_unmarked(note: JianpuNote) -> str:
         return f'g[{base_note}]'
 
     tol = 0.01
-    d = note.duration
+    d = note.written_duration if note.written_duration is not None else note.duration
 
     if note.is_rest:
         if abs(d - 4.0) < tol:
@@ -467,6 +489,10 @@ def _jianpu_note_token_unmarked(note: JianpuNote) -> str:
             return 'd0.'
         if abs(d - 0.125) < tol:
             return 'd0'
+        if abs(d - 0.09375) < tol:
+            return 'h0.'
+        if abs(d - 0.0625) < tol:
+            return 'h0'
         return '0'
 
     if abs(d - 4.0) < tol:
@@ -491,14 +517,26 @@ def _jianpu_note_token_unmarked(note: JianpuNote) -> str:
         return f'd{base_note}.'
     if abs(d - 0.125) < tol:
         return f'd{base_note}'
+    if abs(d - 0.09375) < tol:
+        return f'h{base_note}.'
+    if abs(d - 0.0625) < tol:
+        return f'h{base_note}'
     return f'q{base_note}'
 
 
 def jianpu_note_token(note: JianpuNote) -> str:
     """Format an event and its explicit slur boundaries for jianpu-ly."""
     token = _jianpu_note_token_unmarked(note)
-    return (token + ' (' * note.slur_carry_in + ' )' * note.slur_stops
-            + ' (' * note.slur_starts + ' )' * note.slur_carry_out)
+    prefix = ''
+    if note.tuplet_start:
+        power = 1 << (note.tuplet_actual - 1).bit_length()
+        default_normal = note.tuplet_actual * 3 // 2 if power == note.tuplet_actual else power // 2
+        ratio = (str(note.tuplet_actual) if note.tuplet_normal == default_normal
+                 else f'{note.tuplet_actual}:{note.tuplet_normal}')
+        prefix = f'{ratio}[ '
+    suffix = ' ]' if note.tuplet_stop else ''
+    return (prefix + token + ' (' * note.slur_carry_in + ' )' * note.slur_stops
+            + ' (' * note.slur_starts + ' )' * note.slur_carry_out + suffix)
 
 
 def normalize_jianpu_duration(duration: float) -> float:
@@ -507,12 +545,12 @@ def normalize_jianpu_duration(duration: float) -> float:
     for candidate in ALLOWED_JIANPU_DURATIONS:
         if duration + tol >= candidate:
             return candidate
-    return 0.125
+    return 0.0625
 
 
 def infer_duration_dots(duration: float) -> int:
     """Return 1 if the duration matches a dotted note value, otherwise 0."""
-    for candidate in (1.5, 0.75, 0.375, 0.1875):
+    for candidate in (1.5, 0.75, 0.375, 0.1875, 0.09375):
         if abs(duration - candidate) < 0.01:
             return 1
     return 0
@@ -534,6 +572,12 @@ def jianpu_note_units(note: JianpuNote) -> int:
     """
     if getattr(note, 'is_grace', False):
         return 0
+    if note.tuplet_actual and note.tuplet_normal:
+        written = note.written_duration if note.written_duration is not None else note.duration
+        for candidate, units in _TOKEN_UNITS:
+            if abs(written - candidate) < 0.01:
+                return units * Fraction(note.tuplet_normal, note.tuplet_actual)
+        return (16 if note.is_rest else 8) * Fraction(note.tuplet_normal, note.tuplet_actual)
     tol = 0.01
     d = note.duration
     if note.is_rest:
@@ -571,6 +615,12 @@ def clone_jianpu_note(note: JianpuNote, duration: float, carry_lyrics: bool = Tr
         is_grace=getattr(note, 'is_grace', False),
         slur_starts=getattr(note, 'slur_starts', 0),
         slur_stops=getattr(note, 'slur_stops', 0),
+        written_duration=note.written_duration,
+        tuplet_actual=note.tuplet_actual,
+        tuplet_normal=note.tuplet_normal,
+        tuplet_type=note.tuplet_type,
+        tuplet_start=note.tuplet_start,
+        tuplet_stop=note.tuplet_stop,
     )
 
 
@@ -599,18 +649,18 @@ def split_duration_chunks(duration: float) -> list[float]:
 
 # jianpu-ly.py sets barLength = int(64 * num / denom) and uses integer Fraction arithmetic.
 # Map each allowed quarter-length duration to its 64th-note unit count.
-_DURATION_TO_UNITS: dict[float, int] = {
+_DURATION_TO_UNITS: dict[float, int | Fraction] = {
     4.0: 64, 3.0: 48, 2.0: 32, 1.5: 24, 1.0: 16,
-    0.75: 12, 0.5: 8, 0.375: 6, 0.25: 4, 0.1875: 3, 0.125: 2,
+    0.75: 12, 0.5: 8, 0.375: 6, 0.25: 4, 0.1875: 3, 0.125: 2, 0.09375: Fraction(3, 2), 0.0625: 1,
 }
-_ALLOWED_UNITS_DESC: list[tuple[int, float]] = sorted(
+_ALLOWED_UNITS_DESC: list[tuple[int | Fraction, float]] = sorted(
     ((u, d) for d, u in _DURATION_TO_UNITS.items()), reverse=True
 )  # [(64, 4.0), (48, 3.0), ..., (2, 0.125)]
 
 # Quarter-length → units, in the same descending order and with the same 0.01
 # tolerance that ``jianpu_note_token`` matches on; ``jianpu_note_units`` reads
 # this table so the two can never disagree about how long a token is.
-_TOKEN_UNITS: tuple[tuple[float, int], ...] = tuple(
+_TOKEN_UNITS: tuple[tuple[float, int | Fraction], ...] = tuple(
     (d, u) for d, u in sorted(_DURATION_TO_UNITS.items(), reverse=True)
 )
 

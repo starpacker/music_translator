@@ -1,4 +1,6 @@
 # core/notation/jianpu/measure.py — Measure-level operations for Jianpu conversion.
+from fractions import Fraction
+import logging
 from typing import Optional
 
 from music21 import chord as m21chord, note as m21note
@@ -171,6 +173,9 @@ def layout_time_word(units: int) -> Optional[str]:
     """
     if units <= 0:
         return None
+    if isinstance(units, Fraction) and units.denominator != 1:
+        logging.getLogger(__name__).warning('小节时值不能用当前排版网格精确表示，请校对连音符。')
+        return None
     if units % 16 == 0:
         return f'{units // 16}/4'
     if units % 8 == 0:
@@ -249,5 +254,9 @@ def clone_monophonic_element(element, duration: float):
     else:
         new_element = m21note.Note(element.pitch)
         new_element.lyrics = list(element.lyrics)
-    new_element.duration.quarterLength = normalized_duration
+    if element.duration.tuplets:
+        import copy
+        new_element.duration = copy.deepcopy(element.duration)
+    else:
+        new_element.duration.quarterLength = normalized_duration
     return new_element

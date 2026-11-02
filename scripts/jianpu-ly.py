@@ -1806,12 +1806,14 @@ def getLY(score,headers=None,have_final_barline=True):
                 else:
                     out.append(word)
                     if word=="~" and not midi and not western and lastNonDashPtr < lastPtr: sys.stderr.write("Warning: jianpu long-note tie won't be done right because your Lilypond version is older than 2.20\n")
-            elif re.match(r"[1-9][0-9]*\[$",word):
-                # tuplet start, e.g. 3[
-                fitIn = int(word[:-1])
+            elif re.match(r"[1-9][0-9]*(?::[1-9][0-9]*)?\[$",word):
+                # 3[ uses the traditional default; 3:1[ specifies the ratio.
+                spec = word[:-1].split(':')
+                fitIn = int(spec[0])
                 i=2
                 while i<fitIn: i*=2
-                if i==fitIn: num=int(fitIn*3/2)
+                if len(spec) == 2: num = int(spec[1])
+                elif i==fitIn: num=int(fitIn*3/2)
                 else: num=int(i/2)
                 out.append("\\times %d/%d {" % (num,fitIn))
                 notehead_markup.tuplet = (num,fitIn)

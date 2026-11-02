@@ -40,6 +40,46 @@ def _element_duration(item) -> float:
     return float(getattr(duration, 'quarterLength', duration) or 0.0)
 
 
+def _mark_tuplet_groups(notes: list[JianpuNote]) -> None:
+    """Mark consecutive tuplet events for the jianpu-ly ``3[ ... ]`` syntax."""
+    # Grace notes do not consume a tuplet slot and must not split its group.
+    notes = [event for event in notes if not event.is_grace]
+    index = 0
+    while index < len(notes):
+        first = notes[index]
+        if not first.tuplet_actual or not first.tuplet_normal:
+            index += 1
+            continue
+        ratio = (first.tuplet_actual, first.tuplet_normal)
+        end = index + 1
+        while end < len(notes) and (notes[end].tuplet_actual, notes[end].tuplet_normal) == ratio:
+            end += 1
+        cursor = index
+        while cursor < end:
+            stop = cursor
+            explicit = any(n.tuplet_type in ('start', 'stop', 'startStop') for n in notes[cursor:end])
+            if explicit:
+                if notes[cursor].tuplet_type not in ('start', 'startStop'):
+                    log_message('[jianpu] 连音符缺少起始标记或跨越小节，请校对。', _logging.WARNING)
+                while stop < end:
+                    if stop > cursor and notes[stop].tuplet_type == 'start':
+                        stop -= 1
+                        break
+                    if notes[stop].tuplet_type in ('stop', 'startStop'):
+                        break
+                    stop += 1
+                stop = min(stop, end - 1)
+            else:
+                stop = min(end - 1, cursor + ratio[0] - 1)
+            if ((explicit and notes[stop].tuplet_type not in ('stop', 'startStop'))
+                    or (not explicit and stop - cursor + 1 < ratio[0])):
+                log_message('[jianpu] 连音符分组不完整或跨越小节，请校对。', _logging.WARNING)
+            notes[cursor].tuplet_start = True
+            notes[stop].tuplet_stop = True
+            cursor = stop + 1
+        index = end
+
+
 def strip_grace_notes(score) -> int:
     """Remove grace notes from *score* in place and return how many were removed.
 
@@ -438,6 +478,7 @@ def extract_jianpu_measures(score, key_tonic_semitone: int = 0,
         # so there is nothing left to fill.  (This is the step that used to append
         # the stray '0's whenever the OMR's own note total fell short of the
         # signature it had guessed.)
+        _mark_tuplet_groups(measure_notes)
         measures.append(measure_notes)
         # Log what this measure's notes add up to, verbatim.  The jianpu-ly text
         # builder recomputes the same sum from the emitted tokens and makes it the

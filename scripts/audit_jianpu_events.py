@@ -42,25 +42,37 @@ def audit(path: Path) -> dict:
             pitches = (sorted(p.midi for p in event.pitches)
                        if isinstance(event, chord.Chord) else [event.pitch.midi])
             source.append({'pitches': pitches, 'duration': round(float(event.duration.quarterLength), 6),
-                           'grace': bool(event.duration.isGrace)})
+                           'grace': bool(event.duration.isGrace),
+                           'tuplets': [[t.numberNotesActual, t.numberNotesNormal]
+                                       for t in event.duration.tuplets]})
         target = []
         for event in extracted[index]:
             if event.is_rest or event.symbol == '-':
                 continue
             target.append({'pitches': [event.midi, *[p[4] for p in event.chord_notes]],
-                           'duration': round(float(event.duration), 6), 'grace': event.is_grace})
+                           'duration': round(float(event.duration), 6), 'grace': event.is_grace,
+                           'tuplets': ([[event.tuplet_actual, event.tuplet_normal]]
+                                       if event.tuplet_actual else [])})
         source_rests = [round(float(event.duration.quarterLength), 6)
                         for event in original[index].recurse().notesAndRests
                         if isinstance(event, note.Rest)]
         target_rests = [round(float(event.duration), 6) for event in extracted[index] if event.is_rest]
+        source_rest_tuplets = [[[t.numberNotesActual, t.numberNotesNormal] for t in event.duration.tuplets]
+                               for event in original[index].recurse().notesAndRests
+                               if isinstance(event, note.Rest)]
+        target_rest_tuplets = [([[event.tuplet_actual, event.tuplet_normal]] if event.tuplet_actual else [])
+                               for event in extracted[index] if event.is_rest]
         source_order = ['rest' if isinstance(event, note.Rest) else 'note'
                         for event in original[index].recurse().notesAndRests]
         target_order = ['rest' if event.is_rest else 'note' for event in extracted[index]
                         if event.symbol != '-']
-        if source != target or source_rests != target_rests or source_order != target_order:
+        if (source != target or source_rests != target_rests or source_order != target_order
+                or source_rest_tuplets != target_rest_tuplets):
             mismatches.append({'index': index + 1, 'measure_number': str(original[index].number),
                                'source': source, 'jianpu': target,
                                'source_rests': source_rests, 'jianpu_rests': target_rests,
+                               'source_rest_tuplets': source_rest_tuplets,
+                               'jianpu_rest_tuplets': target_rest_tuplets,
                                'source_order': source_order, 'jianpu_order': target_order})
     starts = sum(event.slur_starts for measure in extracted for event in measure)
     stops = sum(event.slur_stops for measure in extracted for event in measure)
