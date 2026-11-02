@@ -22,9 +22,24 @@ class NoteheadAuditTest(unittest.TestCase):
             self.assertEqual(report['status'], 'partial_evidence')
             self.assertEqual(report['summary'], {'supported_head_positions_agree': 1})
             self.assertEqual(report['measures'][0]['musicxml_pitched_heads'], 2)
+            self.assertEqual(report['note_value_summary']['head_shapes_unverified'], 2)
             self.assertIn('accidentals_not_checked', report['limitations'])
-            self.assertIn('durations_and_other_rest_symbols_not_checked', report['limitations'])
+            self.assertIn('beam_counts_are_lower_bounds_not_complete_durations', report['limitations'])
             self.assertEqual((pdf.read_bytes(), xml.read_bytes()), before)
+
+    def test_incompatible_shape_is_reported_without_changing_the_musicxml(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            pdf, xml = make_sources(Path(tmp))
+            before = xml.read_bytes()
+            glyphs = [{'x': 100., 'y': 125., 'size': 20., 'kind': 'whole', 'bbox': (100, 110, 107, 127)},
+                      {'x': 200., 'y': 122.5, 'size': 20., 'kind': 'half', 'bbox': (200, 108, 207, 125)}]
+            with mock.patch.object(audit, '_page_marks', return_value=([], [(100, 125, 20), (200, 122.5, 20)], [])), \
+                 mock.patch.object(audit, 'verified_notehead_glyphs', return_value=glyphs):
+                result = audit.audit_pdf_noteheads(pdf, xml)
+            self.assertEqual(result['summary']['supported_head_positions_agree'], 1)
+            self.assertEqual(result['note_value_summary']['head_shape_conflicts'], 1)
+            self.assertEqual(result['measures'][0]['note_value_evidence']['head_shape_conflicts'][0]['musicxml_type'], 'half')
+            self.assertEqual(xml.read_bytes(), before)
 
     def test_missing_or_different_heads_are_review_not_guessed_corrections(self):
         cases = [([], 'no_supported_noteheads_detected'),

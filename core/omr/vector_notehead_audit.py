@@ -15,12 +15,15 @@ from music21 import clef
 from core.notation.musicxml_wedges import parse_musicxml_compatible
 from insitu.align import align_from_files
 from .vector_tempos import _matched_multirest_info, _matched_note_events, _page_marks
+from .vector_note_values import compare_note_values, verified_notehead_glyphs
 
 
 def audit_pdf_noteheads(pdf_path: Path, mxl_path: Path) -> dict:
     score = parse_musicxml_compatible(mxl_path)
     limits = ['supported_vector_glyphs_only', 'diatonic_staff_position_only',
-              'accidentals_not_checked', 'durations_and_other_rest_symbols_not_checked',
+              'accidentals_not_checked', 'beam_counts_are_lower_bounds_not_complete_durations',
+              'small_noteheads_may_be_cue_notes_not_grace_notes',
+              'dots_tuplets_flags_and_other_rest_symbols_not_checked',
               'system_and_measure_alignment_not_independently_verified',
               'not_a_measure_of_omr_accuracy']
     if len(score.parts) != 1:
@@ -35,6 +38,8 @@ def audit_pdf_noteheads(pdf_path: Path, mxl_path: Path) -> dict:
     with pymupdf.open(pdf_path) as doc:
         for page_index, page in enumerate(doc):
             _, heads, numbers = _page_marks(page)
+            value_glyphs = verified_notehead_glyphs(doc, page)
+            drawings = page.get_drawings()
             for layout, sl in zip(layouts, slices):
                 if layout.staff.page != page_index + 1:
                     continue
@@ -86,11 +91,24 @@ def audit_pdf_noteheads(pdf_path: Path, mxl_path: Path) -> dict:
                             item['status'] = 'head_positions_or_grouping_differ_review'
                         else:
                             item['status'] = 'supported_head_positions_agree'
+                            matched = _matched_note_events(measure, staff, left, right, heads)
+                            item['note_value_evidence'] = compare_note_values(
+                                measure, staff, left, right, matched, value_glyphs, drawings)
                     decisions.append(item)
     if not decisions:
         return {'status': 'unsupported', 'reason': 'no_measure_slots',
                 'musicxml_measure_count': len(measures), 'limitations': limits, 'measures': []}
     counts = dict(Counter(item['status'] for item in decisions))
+    value_counts = Counter()
+    for item in decisions:
+        evidence = item.get('note_value_evidence', {})
+        value_counts['head_shapes_agree'] += evidence.get('head_shapes_agree', 0)
+        value_counts['head_shapes_unverified'] += evidence.get('head_shapes_unverified', 0)
+        value_counts['head_shape_conflicts'] += len(evidence.get('head_shape_conflicts', []))
+        value_counts['grace_size_consistent'] += evidence.get('grace_size_consistent', 0)
+        value_counts['grace_size_reviews'] += len(evidence.get('grace_size_reviews', []))
+        for beam in evidence.get('beam_evidence', []):
+            value_counts[beam['status']] += 1
     expected_indices = set(range(1, len(measures) + 1))
     mapped = [item['musicxml_measure_index'] for item in decisions if 'musicxml_measure_index' in item]
     missing = sorted(expected_indices - set(mapped))
@@ -98,4 +116,4 @@ def audit_pdf_noteheads(pdf_path: Path, mxl_path: Path) -> dict:
     return {'status': 'partial_evidence', 'limitations': limits,
             'musicxml_measure_count': len(measures), 'mapped_measure_count': len(mapped),
             'unmapped_musicxml_indices': missing, 'duplicate_musicxml_indices': duplicate,
-            'summary': counts, 'measures': decisions}
+            'summary': counts, 'note_value_summary': dict(value_counts), 'measures': decisions}

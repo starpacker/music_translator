@@ -272,6 +272,13 @@ def write_pdf_notehead_audit(score_pdf: Path, mxl: Path, work: Path, stem: str) 
                              if status not in ('supported_head_positions_agree', 'printed_multirest_count_detected'))
             if unresolved or result['unmapped_musicxml_indices'] or result['duplicate_musicxml_indices']:
                 print(f'[audit] {unresolved} 个谱面位置缺少充分符头证据，或存在未映射/重复小节，请参阅报告。')
+            values = result.get('note_value_summary', {})
+            value_reviews = (values.get('head_shape_conflicts', 0)
+                             + values.get('grace_size_reviews', 0)
+                             + values.get('more_beams_than_musicxml_review', 0)
+                             + values.get('fewer_connected_beams_review', 0))
+            if value_reviews:
+                print(f'[audit] {value_reviews} 处符头、装饰音尺寸或符杠证据需核对：{report}')
     except Exception as exc:
         try:
             write({'status': 'error', 'source_pdf': str(score_pdf), 'source_musicxml': str(mxl),
