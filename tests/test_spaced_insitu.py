@@ -8,8 +8,49 @@ import unittest
 import zipfile
 from pathlib import Path
 import pymupdf
+import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+class PiecewiseCutTest(unittest.TestCase):
+    def test_tempo_moves_with_next_staff_while_previous_dynamic_stays(self):
+        from insitu.render_insitu import _copy_with_column_cuts, _tempo_cut_overrides
+        with tempfile.TemporaryDirectory() as tmp:
+            src_path = Path(tmp) / 'source.pdf'
+            source = pymupdf.open()
+            page = source.new_page(width=600, height=400)
+            page.insert_text((290, 80), 'q = 46', fontsize=12)
+            page.insert_text((150, 147), 'mp', fontsize=12)
+            page.insert_text((300, 165), 'q = 56', fontsize=12)
+            page.draw_line((40, 190), (560, 190), width=.5)
+            source.save(src_path)
+            source.close()
+            source = pymupdf.open(src_path)
+            overrides = _tempo_cut_overrides(source[0], 125, 168, 190)
+            self.assertEqual(len(overrides), 1)
+            left, right, cut = overrides[0]
+            self.assertLess(cut, 165)
+            self.assertLess(left, 300)
+            self.assertGreater(right, 330)
+            output = pymupdf.open()
+            target = output.new_page(width=600, height=450)
+            _copy_with_column_cuts(target, source, 0,
+                                   [(168, 50, 0, None, None, None, 0, overrides)])
+            for marker in ('q = 46', 'q = 56', 'mp'):
+                self.assertEqual(target.get_text().count(marker), 1)
+            # The two source markings are disjoint in x. Their pixels must
+            # survive exactly, but receive different vertical translations.
+            a = source[0].get_pixmap(matrix=pymupdf.Matrix(2, 2), colorspace=pymupdf.csGRAY, alpha=False)
+            b = target.get_pixmap(matrix=pymupdf.Matrix(2, 2), colorspace=pymupdf.csGRAY, alpha=False)
+            original = np.frombuffer(a.samples, dtype=np.uint8).reshape(a.height, a.stride)
+            result = np.frombuffer(b.samples, dtype=np.uint8).reshape(b.height, b.stride)
+            np.testing.assert_array_equal(original[260:300, 280:360], result[260:300, 280:360])
+            np.testing.assert_array_equal(original[300:340, 590:690], result[400:440, 590:690])
+            # The following staff is shifted uniformly across the column seams.
+            np.testing.assert_array_equal(original[375:385, 80:1120], result[475:485, 80:1120])
+            output.close()
+            source.close()
 
 
 @unittest.skipUnless(shutil.which('lilypond'), 'LilyPond is required')

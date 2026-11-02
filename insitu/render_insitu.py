@@ -259,6 +259,96 @@ def _blank_cut(page, low: float, high: float) -> float:
     return (start + int(row)) / 2
 
 
+def _tempo_cut_overrides(page, low: float, base_cut: float, next_top: float):
+    """Find safe column-local cuts above text tempos belonging to the next staff.
+
+    Return (left, right, cut) regions only when the surrounding pixel columns
+    are blank across the entire affected strip.  This avoids tearing source ink
+    where the insertion boundary changes height.  Other source annotations and
+    ambiguous cases keep the ordinary straight cut.
+    """
+    import numpy as np
+
+    pattern = re.compile(r'^\s*(?:q|h|e|♩|♪)\s*=\s*\d+\s*$', re.IGNORECASE)
+    spans = [span for block in page.get_text('dict')['blocks']
+             for line in block.get('lines', []) for span in line.get('spans', [])
+             if pattern.match(span.get('text', ''))
+             and low < float(span['origin'][1]) <= base_cut + 2
+             and 3 <= next_top - float(span['origin'][1]) <= 40]
+    if not spans:
+        return []
+    scale = 2
+    pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), alpha=False, colorspace=fitz.csGRAY)
+    pixels = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.stride)[:, :pix.width]
+    found = []
+    for span in spans:
+        origin_y = float(span['origin'][1])
+        x0, x1 = float(span['bbox'][0]), float(span['bbox'][2])
+        xa, xb = max(0, int((x0 - 2) * scale)), min(pix.width, int((x1 + 2) * scale))
+        ya, yb = max(0, int(low * scale)), min(pix.height, int((origin_y - 2) * scale))
+        if xb <= xa or yb <= ya:
+            continue
+        ink_rows = np.any(pixels[ya:yb, xa:xb] < 245, axis=1)
+        # Work upward from the tempo baseline; the first blank row is
+        # immediately above the connected rows of its printed mark.
+        ink_indices = np.flatnonzero(ink_rows)
+        if not len(ink_indices):
+            continue
+        top = int(ink_indices[-1])
+        while top > 0 and ink_rows[top - 1]:
+            top -= 1
+        if top == 0:
+            continue
+        cut = (ya + top - 0.5) / scale
+        if cut >= base_cut - 1:
+            continue
+        # Do not introduce a vertical seam through any source ink.
+        seam_top = max(0, int(cut * scale) - 1)
+        seam_bottom = min(pix.height, int(base_cut * scale) + 2)
+        clear_columns = np.all(pixels[seam_top:seam_bottom] >= 245, axis=0)
+        left_options = np.flatnonzero(clear_columns[max(0, xa - 40):xa])
+        right_options = np.flatnonzero(clear_columns[xb:min(pix.width, xb + 40)])
+        if not len(left_options) or not len(right_options):
+            continue
+        left = (max(0, xa - 40) + int(left_options[-1])) / scale
+        right = (xb + int(right_options[0])) / scale
+        cut_row = max(0, min(pix.height - 1, int(cut * scale)))
+        if (left < right and np.all(pixels[cut_row, int(left * scale):
+                                           int(right * scale)] >= 245)):
+            found.append((left, right, cut))
+    if len(found) < len(spans):
+        print(f'  ! 第 {page.number + 1} 页速度标记附近无法安全分区，请校对其所属谱表。')
+    return found
+
+
+def _copy_with_column_cuts(output_page, source_doc, page_index: int, insertions):
+    """Copy vectors, limiting column clipping to the affected inter-staff gap."""
+    page = source_doc[page_index]
+    width, height = page.rect.width, page.rect.height
+    def copy_region(x0, y0, x1, y1, shift):
+        if x1 <= x0 or y1 <= y0:
+            return
+        clip = fitz.Rect(x0, y0, x1, y1)
+        target = fitz.Rect(x0, y0 + shift, x1, y1 + shift)
+        output_page.show_pdf_page(target, source_doc, page_index, clip=clip, keep_proportion=False)
+
+    previous = shift = 0.0
+    for base_cut, added, _, _, _, _, _, overrides in insertions:
+        first_cut = min([base_cut] + [y for _, _, y in overrides])
+        copy_region(0, previous, width, first_cut, shift)
+        boundaries = {0.0, width}
+        for left, right, _ in overrides:
+            boundaries.update((max(0.0, left), min(width, right)))
+        columns = sorted(boundaries)
+        for x0, x1 in zip(columns, columns[1:]):
+            mid = (x0 + x1) / 2
+            cut = min([base_cut] + [y for left, right, y in overrides if left <= mid <= right])
+            copy_region(x0, first_cut, x1, cut, shift)
+            copy_region(x0, cut, x1, base_cut, shift + added)
+        previous, shift = base_cut, shift + added
+    copy_region(0, previous, width, height, shift)
+
+
 def _tile_barlines(page, ink: fitz.Rect, count: int) -> list[float] | None:
     """Find one rendered row's opening and closing measure dividers."""
     candidates = []
@@ -455,26 +545,22 @@ def build(pdf_path: Path, mxl_path: Path, out_path: Path,
                 low = min(staff.bottom + 6, next_top - 1)
                 high = min(next_top - 5, staff.bottom + 55)
                 cut = _blank_cut(page, low, max(low + 1, high))
+                overrides = (_tempo_cut_overrides(page, low, cut, next_top)
+                             if row + 1 < len(page_rows) else [])
                 tile, ink, count = tiles[index]
-                insertions.append((cut, max(34.0, ink.height + 18.0), index, layout, tile, ink, count))
+                spread = max([0.0] + [cut - y for _, _, y in overrides])
+                insertions.append((cut, max(34.0, ink.height + 18.0) + spread,
+                                   index, layout, tile, ink, count, overrides))
             added = sum(item[1] for item in insertions)
             target_page = output.new_page(width=page.rect.width, height=page.rect.height + added)
-            previous = shift = 0.0
-            for cut, height, index, layout, tile, ink, count in insertions:
-                if cut > previous:
-                    clip = fitz.Rect(0, previous, page.rect.width, cut)
-                    target_page.show_pdf_page(fitz.Rect(0, previous + shift, page.rect.width, cut + shift),
-                                              doc, page_index, clip=clip)
+            _copy_with_column_cuts(target_page, doc, page_index, insertions)
+            shift = 0.0
+            for cut, height, index, layout, tile, ink, count, _ in insertions:
                 placement = _place_tile(target_page, tile, ink, layout, cut + shift + 9, count)
                 if placement != 'aligned':
                     fallback_rows += 1
                     print(f'  ! 第 {page_index + 1} 页谱表 {index + 1}: 对齐回退 ({placement})')
                 shift += height
-                previous = cut
-            if previous < page.rect.height:
-                clip = fitz.Rect(0, previous, page.rect.width, page.rect.height)
-                target_page.show_pdf_page(fitz.Rect(0, previous + shift, page.rect.width,
-                                                    page.rect.height + shift), doc, page_index, clip=clip)
         output.save(str(out_path), garbage=3, deflate=True)
         output.close()
     else:
