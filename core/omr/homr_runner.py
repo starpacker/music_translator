@@ -685,8 +685,14 @@ def _run_homr_multipage_pdf(
                             source_pdf, mxl, page_index=page_num - 1,
                             log=log_message,
                         )
-                    except ValueError:
-                        raise
+                    except ValueError as _mr_exc:
+                        # Ambiguous source/OMR alignment must not abort the
+                        # entire score or rewrite the original page MusicXML.
+                        log_message(
+                            f'[homr] 第 {page_num} 页多小节休止对齐不确定，'
+                            f'保留原始识别结果继续处理：{_mr_exc}',
+                            logging.WARNING,
+                        )
                     except Exception as _mr_exc:
                         log_message(
                             f'[homr] 第 {page_num} 页多小节休止折叠异常（不影响输出）：{_mr_exc}',
@@ -711,6 +717,10 @@ def _run_homr_multipage_pdf(
         return None
 
     # ── 合并所有页的 MusicXML ──────────────────────────────────────────────────
+    partial = len(page_mxl_files) != total_pages
+    if partial:
+        log_message(f'[homr] 警告：仅有 {len(page_mxl_files)}/{total_pages} 页识别成功，'
+                    '输出不完整，将不会缓存为完整结果。', logging.WARNING)
     merged_mxl_path = output_dir / f'{source_pdf.stem}.musicxml'
     if len(page_mxl_files) == 1:
         shutil.copy2(str(page_mxl_files[0]), str(merged_mxl_path))
@@ -719,10 +729,16 @@ def _run_homr_multipage_pdf(
         log_message(f'[homr] 正在合并 {len(page_mxl_files)} 页 MusicXML…')
         if not _merge_homr_musicxml_pages(page_mxl_files, merged_mxl_path):
             shutil.copy2(str(page_mxl_files[0]), str(merged_mxl_path))
+            partial = True
             log_message('[homr] 合并失败，降级使用第 1 页结果。', logging.WARNING)
         else:
             log_message(f'[homr] 合并完成: {merged_mxl_path.name}')
 
+    marker = output_dir / '.partial-omr'
+    if partial:
+        marker.write_text('Recognition or page merge was incomplete.\n', encoding='utf-8')
+    else:
+        marker.unlink(missing_ok=True)
     return output_dir
 
 

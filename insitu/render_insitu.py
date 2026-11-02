@@ -9,8 +9,8 @@ similar.
 
 How the jianpu-ly source is assembled
 -------------------------------------
-`core.notation.jianpu` renders each measure with `jianpu_note_token` +
-`pad_measure_to_bar`, and emits the ordinary jianpu-ly grammar where a measure is
+`core.notation.jianpu` renders each measure with `jianpu_note_token` and
+per-measure layout time signatures, using jianpu-ly grammar where a measure is
 a token list and `-` means "hold", `'` raises an octave, `q`/`s`/`d` shorten the
 note.  We reuse those two functions verbatim so the tokens are the reference
 renderer's, and only differ in **how many measures go on one line**: instead of
@@ -40,6 +40,7 @@ import re
 import subprocess
 import sys
 import tempfile
+import shutil
 from pathlib import Path
 from typing import Optional
 
@@ -53,9 +54,8 @@ ensure_sumisora()
 
 from core.notation.jianpu import (  # noqa: E402
     jianpu_note_token,
-    pad_measure_to_bar,
-    _parse_bar_units,
-    _parse_anacrusis_units,
+    layout_time_tokens,
+    _with_time_signatures,
     extract_jianpu_measures,
     _get_score_key_tonic,
 )
@@ -83,12 +83,9 @@ _LINE_WIDTH_PT = 540
 
 def _measure_texts(measures, time_sig: str) -> list[str]:
     """Return one jianpu-ly token string per measure, exactly as the library does."""
-    bar_units = _parse_bar_units(time_sig)
-    pickup_units = _parse_anacrusis_units(time_sig)
     out = []
-    for i, m in enumerate(measures):
-        units = pickup_units if (i == 0 and pickup_units is not None) else bar_units
-        out.append(' '.join(jianpu_note_token(n) for n in pad_measure_to_bar(m, units)))
+    for m in measures:
+        out.append(' '.join(jianpu_note_token(n) for n in m))
     return out
 
 
@@ -106,11 +103,7 @@ def _jianpu_ly_source(lines: list[str], key_header: str, time_sig: str, title: s
     # digit it belongs to or jianpu-ly aborts with "Ambiguous octave marks".
     # The library's own header sets this too (see core/notation/jianpu).
     head.append('OctavesAfter')
-    if time_sig:
-        pass  # dropped: jianpu-ly prints \time <sig> (an Emmentaler "4/4"
-              # glyph) on the staff, which is unrelated to jianpu and shows up
-              # below every engraved staff.  Bars stay correct because we pad
-              # every measure to the full signature ourselves.
+    # Layout time signatures are inserted per measure and hidden below.
     head += ['']
     body = [' | '.join(ln) + ' |' for ln in lines if ln]
     return '\n'.join(head + body) + '\n'
@@ -222,24 +215,48 @@ def _render_ly_tile(ly_text: str, workdir: Path) -> tuple[Path, fitz.Rect]:
 
 # ── main ─────────────────────────────────────────────────────────────────────
 
+def _blank_cut(page, low: float, high: float) -> float:
+    """Choose a low-ink horizontal cut in the gap between adjacent systems."""
+    low = max(0.0, min(low, page.rect.height - 1))
+    high = max(low + 0.5, min(high, page.rect.height))
+    pix = page.get_pixmap(matrix=fitz.Matrix(2, 2), alpha=False, colorspace=fitz.csGRAY)
+    import numpy as np
+    pixels = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.stride)
+    start, end = int(low * 2), min(pix.height, int(high * 2))
+    counts = np.count_nonzero(pixels[start:end, :pix.width] < 245, axis=1)
+    if not len(counts):
+        return low
+    best = int(counts.min())
+    choices = np.flatnonzero(counts == best)
+    middle = (len(counts) - 1) / 2
+    row = min(choices, key=lambda i: abs(i - middle))
+    if best:
+        print(f'  ! 无完全空白的插入位置，使用墨迹最少的横线（{best} 像素）')
+    return (start + int(row)) / 2
+
+
 def build(pdf_path: Path, mxl_path: Path, out_path: Path,
-          title: Optional[str] = None) -> Path:
+          title: Optional[str] = None, expand: bool = False) -> Path:
     staves, slices = align_from_files(pdf_path, mxl_path)
 
     score = converter.parse(str(mxl_path))
     tonic, key_header = _get_score_key_tonic(score)
     measures, time_sig = extract_jianpu_measures(score, tonic)
-    per_measure = _measure_texts(measures, time_sig)
     if title is None:
         title = pdf_path.stem
 
     doc = fitz.open(str(pdf_path))
     tmpdir = Path(tempfile.mkdtemp(prefix='insitu_ly_'))
     placed = 0
+    tiles = {}
 
     for sl, layout in zip(slices, staves):
         staff = layout.staff
-        chunk = per_measure[sl.omr_start:sl.omr_end]
+        line_measures = measures[sl.omr_start:sl.omr_end]
+        chunk = _with_time_signatures(
+            _measure_texts(line_measures, time_sig), 0,
+            layout_time_tokens(line_measures, 64),
+        )
         if not chunk:
             continue
         # `1=C` appears once, on the first rendered line only - exactly as in
@@ -255,6 +272,11 @@ def build(pdf_path: Path, mxl_path: Path, out_path: Path,
             print(f'  ! staff {sl.staff_index}: {exc}')
             continue
 
+        if expand:
+            tiles[sl.staff_index] = (tile_pdf, ink)
+            placed += 1
+            continue
+
         page = doc[staff.page - 1]
         # Natural size, left-aligned at the staff's own left edge.  No rescaling,
         # so every line keeps the reference 10.96pt glyph size.
@@ -266,8 +288,43 @@ def build(pdf_path: Path, mxl_path: Path, out_path: Path,
         src.close()
         placed += 1
 
-    doc.save(str(out_path), garbage=3, deflate=True)
+    if expand:
+        output = fitz.open()
+        for page_index, page in enumerate(doc):
+            page_rows = [(i, layout.staff) for i, layout in enumerate(staves)
+                         if layout.staff.page == page_index + 1 and i in tiles]
+            insertions = []
+            for row, (index, staff) in enumerate(page_rows):
+                next_top = page_rows[row + 1][1].top if row + 1 < len(page_rows) else page.rect.height
+                low = min(staff.bottom + 6, next_top - 1)
+                high = min(next_top - 5, staff.bottom + 55)
+                cut = _blank_cut(page, low, max(low + 1, high))
+                tile, ink = tiles[index]
+                insertions.append((cut, max(34.0, ink.height + 18.0), staff.x0, tile, ink))
+            added = sum(item[1] for item in insertions)
+            target_page = output.new_page(width=page.rect.width, height=page.rect.height + added)
+            previous = shift = 0.0
+            for cut, height, left, tile, ink in insertions:
+                if cut > previous:
+                    clip = fitz.Rect(0, previous, page.rect.width, cut)
+                    target_page.show_pdf_page(fitz.Rect(0, previous + shift, page.rect.width, cut + shift),
+                                              doc, page_index, clip=clip)
+                with fitz.open(str(tile)) as src:
+                    target_page.show_pdf_page(fitz.Rect(left, cut + shift + 9,
+                                                        left + ink.width, cut + shift + 9 + ink.height),
+                                              src, 0, clip=ink, overlay=True)
+                shift += height
+                previous = cut
+            if previous < page.rect.height:
+                clip = fitz.Rect(0, previous, page.rect.width, page.rect.height)
+                target_page.show_pdf_page(fitz.Rect(0, previous + shift, page.rect.width,
+                                                    page.rect.height + shift), doc, page_index, clip=clip)
+        output.save(str(out_path), garbage=3, deflate=True)
+        output.close()
+    else:
+        doc.save(str(out_path), garbage=3, deflate=True)
     doc.close()
+    shutil.rmtree(tmpdir, ignore_errors=True)
     print(f'placed {placed}/{len(staves)} lines')
     return out_path
 

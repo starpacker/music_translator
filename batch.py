@@ -14,7 +14,7 @@ def main(argv=None):
     parser.add_argument('-o', '--output', type=Path, default=Path('output'))
     parser.add_argument('--work', type=Path, default=None)
     parser.add_argument('--mode', choices=('both', 'jianpu', 'insitu'), default='both')
-    parser.add_argument('--engine', choices=('strip', 'stamp'), default='strip')
+    parser.add_argument('--engine', choices=('spaced', 'strip', 'stamp'), default='spaced')
     parser.add_argument('--gpu', choices=('auto', 'on', 'off'), default='auto')
     args = parser.parse_args(argv)
     if not args.input.is_dir():

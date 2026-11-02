@@ -437,6 +437,9 @@ def jianpu_note_token(note: JianpuNote) -> str:
     else:
         base_note = note.accidental + note.symbol + jianpu_octave_symbol(note.upper_dots, note.lower_dots)
 
+    if getattr(note, 'is_grace', False):
+        return f'g[{base_note}]'
+
     tol = 0.01
     d = note.duration
 
@@ -521,6 +524,8 @@ def jianpu_note_units(note: JianpuNote) -> int:
     that ``jianpu_note_token`` and this function agree for every allowed
     duration.
     """
+    if getattr(note, 'is_grace', False):
+        return 0
     tol = 0.01
     d = note.duration
     if note.is_rest:
@@ -555,6 +560,7 @@ def clone_jianpu_note(note: JianpuNote, duration: float, carry_lyrics: bool = Tr
         is_rest=note.is_rest,
         lyrics=note.lyrics if carry_lyrics else {},
         chord_notes=getattr(note, 'chord_notes', ()),
+        is_grace=getattr(note, 'is_grace', False),
     )
 
 

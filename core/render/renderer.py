@@ -969,16 +969,13 @@ def generate_jianpu_pdf_from_mxl(
             except Exception:
                 pass
 
-        # 装饰音只留在 MusicXML 里（存档给移调器、五线谱渲染用），简谱和 MIDI 都不要：
-        # - 简谱没有装饰音记法，留着会被当成普通音符排进小节、把后面的音挤出节拍；
-        # - music21 写 MIDI 时把第一个装饰音当成一整拍、其余的丢掉，后面的音全部后移。
-        _graces = strip_grace_notes(source_score)
-        if _graces:
-            log_message(f'[jianpu] 简谱与 MIDI 不含装饰音，已略去 {_graces} 个', logging.DEBUG)
-
-        # Use the original parsed score for MIDI — preserves all parts and voices.
+        # Keep grace notes in Jianpu. music21 MIDI export mishandles their
+        # duration, so remove them only from the separate MIDI copy.
         if midi_output_path is not None:
-            if not render_midi_from_score(source_score, midi_output_path):
+            import copy
+            midi_score = copy.deepcopy(source_score)
+            strip_grace_notes(midi_score)
+            if not render_midi_from_score(midi_score, midi_output_path):
                 log_message('简谱 MIDI 生成失败，跳过 MIDI 输出，继续生成简谱 PDF。', logging.WARNING)
 
         # Use the MXL-parsed score directly — preserves exact note durations and pitches

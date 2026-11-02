@@ -193,48 +193,22 @@ def align(pdf_counts: list[int], omr_counts: list[int]) -> list[SystemSlice]:
 
     slices.sort(key=lambda sl: sl.staff_index)
 
-    if abs(sum(omr_counts) - sum(pdf_counts)) > _MIN_DRIFT:
-        _conservation_fix(slices, pdf_counts, omr_counts)
+    # Split OMR systems not paired by the DP still contain real music. Assign
+    # gaps to neighbouring staves without ever dropping or duplicating bars.
+    if slices:
+        total = sum(omr_counts)
+        boundaries = [0]
+        for left, right in zip(slices, slices[1:]):
+            boundary = (left.omr_end + right.omr_start) // 2
+            boundaries.append(max(boundaries[-1], min(boundary, total)))
+        boundaries.append(total)
+        for index, sl in enumerate(slices):
+            sl.omr_start, sl.omr_end = boundaries[index:index + 2]
+            if sl.omr_measures != sl.pdf_measures:
+                print(f'  ! 谱表 {sl.staff_index + 1}: 五线谱 {sl.pdf_measures} 格，'
+                      f'识谱分配 {sl.omr_measures} 小节，请校对')
 
     return slices
-
-
-# The engraving and the OMR disagree on the total number of measures by this
-# much or less without it meaning anything: OMR drops or invents the odd measure
-# across a system boundary.  Above it, the two streams are counting different
-# music and we have to re-derive the boundary the alignment drifted across.
-_MIN_DRIFT = 1
-
-
-def _conservation_fix(
-    slices: list[SystemSlice], pdf_counts: list[int], omr_counts: list[int]
-) -> None:
-    """Repair the drift the fused-system step introduces into the tail.
-
-    When the OMR fuses a run of staves into one system, everything after that
-    run is shifted by one system — the DP still tracks the *relative* drift, but
-    the slices downstream then describe the wrong measures.  The engraving is
-    authoritative for the music, so we slide each slice's OMR range so that its
-    start lands on the cumulative engraved measure total of its staff, keeping
-    every slice inside the OMR stream.  Everything before the fused run is
-    already correct and is left untouched.
-    """
-    if not slices:
-        return
-
-    # Cumulative measure counts; the k-th staff begins at cumulative[k].
-    cum_pdf: list[int] = [0]
-    for c in pdf_counts:
-        cum_pdf.append(cum_pdf[-1] + c)
-    total_omr = sum(omr_counts)
-
-    for sl in slices:
-        want_start = min(cum_pdf[sl.staff_index], max(0, total_omr - 1))
-        want_end = min(want_start + sl.pdf_measures, total_omr)
-        if want_end <= want_start:  # keep an empty-but-valid slice valid
-            want_end = min(want_start + 1, total_omr)
-        sl.omr_start, sl.omr_end = want_start, want_end
-
 
 
 def align_from_files(pdf_path, mxl_path) -> tuple[list, list[SystemSlice]]:

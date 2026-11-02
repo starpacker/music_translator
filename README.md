@@ -46,7 +46,7 @@
 
 OMR 用的是 **Homr**（端到端光学乐谱识别，也可切到 Audiveris），
 排版走 **music21 → jianpu-ly → LilyPond**，页面合成用 **PyMuPDF** 的矢量操作，
-所以输出全部是**矢量 PDF**，放大不糊、可检索、可再编辑。
+默认 `spaced` 和 `stamp` 使用矢量 PDF 合成；`strip` 引擎会栅格化页面。
 
 ---
 
@@ -83,14 +83,19 @@ OMR 用的是 **Homr**（端到端光学乐谱识别，也可切到 Audiveris）
 | 方式 | 参数 | 产物 | 页面尺寸 | 典型用途 |
 | --- | --- | --- | --- | --- |
 | 整页简谱 | `--mode jianpu` | `<曲名>.jianpu.pdf` | A4 纵向 | 打印、发谱、只看简谱 |
+| 原位简谱（加行距，默认） | `--mode insitu --engine spaced` | `<曲名>.insitu.pdf` | **页面加长** | 尽量避免简谱与原谱重叠 |
 | 原位简谱（贴字） | `--mode insitu --engine stamp` | `<曲名>.insitu.pdf` | **与原谱完全一致** | 对照学习、校对、原版式交付 |
 | 原位简谱（插条） | `--mode insitu --engine strip` | `<曲名>.insitu.pdf` | 每行谱表下方**加长** | 需要给简谱留出连续白位、页面可重排 |
 
-### `stamp` 与 `strip` 的区别
+### 三种原位排版引擎
 
-两个引擎都做「五线谱一行 ↔ 简谱一行」的对齐，区别在于简谱放在哪里：
+三个引擎都做「五线谱一行 ↔ 简谱一行」的对齐，区别在于简谱放在哪里：
 
-- **`stamp`（默认，矢量贴字）**
+- **`spaced`（默认，矢量插入空间）**
+  在谱表之间选取空白横线，插入足够的空间放置简谱，并相应加长页面。
+  若找不到完全空白的横线，将使用墨迹最少的位置并输出提示。
+
+- **`stamp`（矢量贴字）**
   逐行把简谱渲染成一张透明小图，裁掉空白后，用 `page.show_pdf_page(..., overlay=True)` 贴到该行五线谱下方的空白处。
   **不新增页面、不改变页面尺寸**，原谱的版式、页码、裁剪框全部保持原样。
   实测：5 页源谱 → 5 页原位简谱，页面仍为 595×842 pt，`placed 40/40 lines`（40 行谱表全部贴到）。
@@ -100,7 +105,7 @@ OMR 用的是 **Homr**（端到端光学乐谱识别，也可切到 Audiveris）
   好处是简谱永远有连续、完整的一块地方，不会被原谱的歌词或标注挤到；代价是页面变长。
   实测：5 页源谱 → 5 页原位简谱，页面宽度不变、高度按该页行数加高（842 → 1316~1452 pt）。
 
-> 如果你要的是「原版式 + 简谱」，选 `stamp`；如果原谱下方已经很挤、或者要重新排版打印，选 `strip`。
+> 需要原有页面尺寸时选 `stamp`；需要更多行间空间时选 `spaced` 或 `strip`。
 
 ---
 
@@ -116,6 +121,28 @@ cd music_translator
 
 python -m venv .venv && source .venv/bin/activate      # 建议 Python 3.10+
 pip install -r requirements.txt
+```
+
+#### 本机环境记录（2026-11-02）
+
+历史运行记录使用 `/opt/conda/envs/sumisora/bin/python` 与 `/usr/bin/lilypond`；
+本次检查时二者均已不存在，不能直接照搬旧路径。本次在当前容器重建的环境为
+`/tmp/music_translator_env/bin/python`（Python 3.13，按本仓库 `requirements.txt` 安装）；
+`/tmp` 和系统安装可能随容器重置而消失。重建方式：
+
+```bash
+python -m venv /tmp/music_translator_env
+/tmp/music_translator_env/bin/pip install -r requirements.txt
+sudo apt-get update && sudo apt-get install -y --no-install-recommends lilypond
+```
+
+运行时可直接使用 `/tmp/music_translator_env/bin/python jianpu.py ...`；新环境首次识谱
+可能需要联网下载 Homr 模型。项目克隆到其他机器时建议使用上面的 `.venv` 安装方式。
+若环境变量 `TMPDIR` 指向不存在的目录，LilyPond 无法生成 PDF；可在命令前指定
+`TMPDIR=/tmp`。例如：
+
+```bash
+TMPDIR=/tmp /tmp/music_translator_env/bin/python jianpu.py test.pdf --mode both -o output/test_baseline/test
 ```
 
 ### 2. LilyPond（必需，系统级）
@@ -169,7 +196,7 @@ python batch.py input/吹管 -o output --mode both --engine strip --gpu auto
 ```
 
 逐份处理目录内 PDF，输出 `<曲名>.jianpu.pdf`、`<曲名>.insitu.pdf` 和逐份日志。
-批处理默认使用与当前吹管生成流程相同的 `strip` 引擎；单文件命令保留 `stamp` 默认值。
+批处理和单文件命令默认使用 `spaced` 引擎。
 单份失败后继续处理其他输入，最后汇总并返回非零退出码。
 中间识谱结果保存在 `output/work/<曲名>/`，再次运行会复用缓存；需要重新识谱时指定新的 `--work` 目录。
 
@@ -183,7 +210,7 @@ python jianpu.py 曲笛.pdf
 
 ```
 曲笛.jianpu.pdf     # 整页简谱
-曲笛.insitu.pdf     # 原位简谱（stamp 引擎）
+曲笛.insitu.pdf     # 原位简谱（spaced 引擎）
 ```
 
 ### 只要其中一种
@@ -205,7 +232,7 @@ python jianpu.py 曲笛.pdf --mode insitu --engine strip
 python jianpu.py 曲笛.pdf --mxl 曲笛.musicxml --mode both
 ```
 
-OMR 结果默认缓存在 `<输出目录>/work/<曲名>.musicxml`，第二次运行会直接复用：
+OMR 结果默认缓存在 `<输出目录>/work/<曲名>.musicxml`，输入内容、设备选择、Homr 版本及识谱处理代码一致时才复用；没有缓存元数据的旧缓存会重新识谱：
 
 ```
 [omr] 复用已有结果 .../work/曲笛.musicxml
@@ -228,7 +255,7 @@ python jianpu.py 曲笛.pdf --mode jianpu -o out/曲笛-简谱.pdf
 | `score` | 源五线谱 PDF（**矢量 PDF 最佳**，扫描件需先 OMR 成矢量或提高分辨率） |
 | `-o, --output` | 输出文件；`mode=both` 时作为前缀。默认与输入同名同目录 |
 | `--mode {jianpu,insitu,both}` | 产物类型，默认 `both` |
-| `--engine {stamp,strip}` | 原位简谱的实现方式，默认 `stamp` |
+| `--engine {spaced,stamp,strip}` | 原位简谱的实现方式，默认 `spaced` |
 | `--mxl` | 已有的 MusicXML，给出后跳过 OMR |
 | `--work` | OMR 中间结果目录，默认 `<输出目录>/work` |
 | `--title` | 简谱标题，默认取输入文件名 |
@@ -265,7 +292,7 @@ python jianpu.py 曲笛.pdf --mode jianpu -o out/曲笛-简谱.pdf
 
 三段关键逻辑：
 
-1. **OMR + 缓存** — `jianpu.py:omr_to_musicxml()`。产物落在 `work/` 下，有就直接复用。
+1. **OMR + 缓存** — `jianpu.py:omr_to_musicxml()`。产物落在 `work/` 下，元数据匹配时复用。
 2. **MusicXML → 简谱文本** — `music21` 取出调号（首调）、拍号、每个音的时值与八度，
    拼成 `jianpu-ly.py` 能吃的文本。和弦音需要 `OctavesAfter` 头，否则 jianpu-ly 会报
    `Ambiguous octave marks`；`\time` 则被故意丢掉，否则它会在每条五线谱下多印一个节拍记号字形。

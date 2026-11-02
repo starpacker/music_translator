@@ -39,6 +39,7 @@ _STAFF_MAX_HEIGHT = 1.0       # 谱线最大厚度
 _SYSTEM_GAP = 7.0             # 同一系统内相邻谱线的最大 y 间距
 _BARLINE_MAX_WIDTH = 0.6      # 小节线最大厚度
 _BARLINE_HEIGHT_TOL = 0.7     # 小节线高度与谱表高的容差
+_BARLINE_TOP_TOL = 0.20       # 符干可能几乎跨满谱表，但端点不在顶线上
 _THICK_MIN_WIDTH = 20.0       # 粗实线最小长度
 _THICK_MIN_LW = 1.4           # 粗实线最小线宽（谱线为 0.48）
 _THICK_Y_TOL = 1.5            # 粗实线 y 与中间线的容差
@@ -109,7 +110,7 @@ def page_system_slot_kinds(page, *, _geometry=None) -> list[list[str]]:
             round(d['rect'].x0, 2) for d in drawings
             if d['type'] == 's'
             and d['rect'].width < _BARLINE_MAX_WIDTH
-            and abs(d['rect'].y0 - top) <= 0.6
+            and abs(d['rect'].y0 - top) <= _BARLINE_TOP_TOL
             and abs(d['rect'].height - height) <= _BARLINE_HEIGHT_TOL
             and (d.get('width') or 1.0) < 1.0
         })

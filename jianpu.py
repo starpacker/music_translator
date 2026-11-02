@@ -17,6 +17,10 @@ OMR 结果会缓存为 ``<work>/<曲名>.musicxml``，第二次运行不再识�
 from __future__ import annotations
 
 import argparse
+import hashlib
+import json
+import importlib.metadata
+import os
 import shutil
 import sys
 import tempfile
@@ -33,11 +37,36 @@ HERE = Path(__file__).resolve().parent
 def omr_to_musicxml(score_pdf: Path, work: Path, use_gpu: Optional[bool] = None) -> Path:
     """PDF → MusicXML（HOMR 引擎）。已存在则直接复用。"""
     cached = work / f'{score_pdf.stem}.musicxml'
-    if cached.is_file() and cached.stat().st_size > 0:
+    metadata = work / f'{score_pdf.stem}.omr-cache.json'
+    digest = hashlib.sha256()
+    with score_pdf.open('rb') as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b''):
+            digest.update(chunk)
+    try:
+        version = importlib.metadata.version('homr')
+    except importlib.metadata.PackageNotFoundError:
+        version = None
+    pipeline = hashlib.sha256()
+    root = ensure_sumisora()
+    pipeline.update((HERE / 'homr_shim.py').read_bytes())
+    for name in ('core/config.py', 'core/utils.py', 'core/omr/homr_runner.py',
+                 'core/omr/multirest_collapse.py', 'core/omr/vector_whole_chords.py',
+                 'core/image/image_preprocess.py', 'core/image/sr_upscale.py'):
+        pipeline.update((root / name).read_bytes())
+    expected = {'source_sha256': digest.hexdigest(), 'gpu': use_gpu,
+                'pipeline_sha256': pipeline.hexdigest(),
+                'homr_version': version, 'cache_schema': 1}
+    try:
+        cached_metadata = json.loads(metadata.read_text(encoding='utf-8'))
+    except (OSError, ValueError):
+        cached_metadata = None
+    if cached.is_file() and cached.stat().st_size > 0 and cached_metadata == expected:
         print(f'[omr] 复用已有结果 {cached}')
         return cached
+    # Do not leave a manifest authorizing an old cache during an interrupted
+    # refresh of a different source with the same stem.
+    metadata.unlink(missing_ok=True)
 
-    ensure_sumisora()
     import homr_shim
     homr_shim.install()
     from core.omr.homr_runner import run_homr_batch          # noqa: PLC0415
@@ -45,6 +74,7 @@ def omr_to_musicxml(score_pdf: Path, work: Path, use_gpu: Optional[bool] = None)
 
     out_dir = work / f'{score_pdf.stem}.omr'
     out_dir.mkdir(parents=True, exist_ok=True)
+    (out_dir / '.partial-omr').unlink(missing_ok=True)
     print(f'[omr] 识别 {score_pdf.name} …')
     res = run_homr_batch(score_pdf, out_dir, use_gpu_inference=use_gpu)
     if not res:
@@ -53,6 +83,10 @@ def omr_to_musicxml(score_pdf: Path, work: Path, use_gpu: Optional[bool] = None)
     if mxl is None:
         raise RuntimeError(f'OMR 没有产生 MusicXML（{out_dir}）')
     shutil.copy2(mxl, cached)
+    if (Path(res) / '.partial-omr').exists():
+        print('[omr] 警告：识谱结果不完整，本次继续生成，但不作为完整结果缓存。')
+    else:
+        metadata.write_text(json.dumps(expected, ensure_ascii=False, indent=2), encoding='utf-8')
     print(f'[omr] -> {cached}')
     return cached
 
@@ -80,13 +114,13 @@ def musicxml_to_jianpu(mxl: Path, out_pdf: Path, title: Optional[str] = None) ->
 # ── 步骤 3：原位简谱 ────────────────────────────────────────────────────────
 
 def insitu_stamp(score_pdf: Path, mxl: Path, out_pdf: Path,
-                 title: Optional[str] = None) -> Path:
+                 title: Optional[str] = None, expand: bool = False) -> Path:
     """矢量贴字：把每行简谱贴到对应谱表正下方，页码和原谱完全一致。"""
     sys.path.insert(0, str(HERE / 'insitu'))
     import render_insitu                                     # noqa: PLC0415
 
     out_pdf.parent.mkdir(parents=True, exist_ok=True)
-    render_insitu.build(score_pdf, mxl, out_pdf, title=title or score_pdf.stem)
+    render_insitu.build(score_pdf, mxl, out_pdf, title=title or score_pdf.stem, expand=expand)
     print(f'[insitu] -> {out_pdf}  ({out_pdf.stat().st_size/1024:.0f} KB)')
     return out_pdf
 
@@ -106,6 +140,11 @@ def insitu_strip(score_pdf: Path, jianpu_pdf: Path, out_pdf: Path) -> Path:
 # ── CLI ─────────────────────────────────────────────────────────────────────
 
 def main(argv: list[str]) -> int:
+    # Some hosted environments export TMPDIR pointing to a removed directory.
+    # Python silently falls back, but LilyPond uses the invalid value directly.
+    configured_tmp = os.environ.get('TMPDIR')
+    if configured_tmp and not Path(configured_tmp).is_dir():
+        os.environ['TMPDIR'] = tempfile.gettempdir()
     ap = argparse.ArgumentParser(
         description='五线谱 PDF → 简谱：整页简谱（jianpu）或原位简谱（insitu）',
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -114,8 +153,8 @@ def main(argv: list[str]) -> int:
     ap.add_argument('-o', '--output', type=Path, default=None,
                     help='输出文件（mode=both 时作为前缀，默认与输入同名）')
     ap.add_argument('--mode', choices=('jianpu', 'insitu', 'both'), default='both')
-    ap.add_argument('--engine', choices=('stamp', 'strip'), default='stamp',
-                    help='原位简谱的两种做法：stamp=矢量贴字（默认，页码不变）；'
+    ap.add_argument('--engine', choices=('spaced', 'stamp', 'strip'), default='spaced',
+                    help='原位简谱：spaced=矢量插入空白（默认）；stamp=矢量贴字；'
                          'strip=插条并加长页面')
     ap.add_argument('--mxl', type=Path, default=None, help='已有的 MusicXML（跳过 OMR）')
     ap.add_argument('--work', type=Path, default=None,
@@ -153,7 +192,7 @@ def main(argv: list[str]) -> int:
                 musicxml_to_jianpu(mxl, ref, title)
             insitu_strip(score, ref, out)
         else:
-            insitu_stamp(score, mxl, out, title)
+            insitu_stamp(score, mxl, out, title, expand=args.engine == 'spaced')
     return 0
 
 

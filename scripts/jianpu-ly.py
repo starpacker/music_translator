@@ -1641,7 +1641,7 @@ def getLY(score,headers=None,have_final_barline=True):
         # First, merge multiple grace notes.  This is needed for the
         # output of some MusicXML conversions, and might be useful to
         # have around anyway:
-        line=re.sub(r"(?<=\s)(g\[[#b',1-9qsdh]+\]\s*)+g\[([#b',1-9qsdh]+)\](?=\s)",lambda m:re.sub(r"\]\s*g\[","",m.group()),line)
+        line=re.sub(r"(?<!\S)(g\[[#b',1-9qsdh]+\]\s*)+g\[([#b',1-9qsdh]+)\](?=\s|$)",lambda m:re.sub(r"\]\s*g\[","",m.group()),line)
         # To support multi-word text above/below the stave, we'll
         # replace space with chr(0) inside quoted strings so they
         # end up being one word per item (we'll put it back to space

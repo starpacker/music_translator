@@ -140,3 +140,5 @@ class JianpuNote:
     # 的同时音，每项为 (accidental, symbol, upper_dots, lower_dots, midi)。
     # 简谱渲染为 jianpu-ly 的 “,135” 和弦形式；单音为空元组，行为与旧版完全一致。
     chord_notes: tuple[tuple[str, str, int, int, int], ...] = ()
+    # Grace notes are printed but consume no time in the measure.
+    is_grace: bool = False

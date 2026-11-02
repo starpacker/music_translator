@@ -341,6 +341,12 @@ def extract_jianpu_measures(score, key_tonic_semitone: int = 0,
 
         for element in _flat_all:
             offset = _canonical_offset(_offset_seen, float(element.offset))
+            if getattr(element.duration, 'isGrace', False):
+                grace = note_to_jianpu(element, key_tonic_semitone)
+                grace.is_grace = True
+                grace.duration = 0.0
+                by_offset.setdefault(offset, []).append(grace)
+                continue
             # 跨小节 tie-stop/continue：上一小节 tie-start 音符在本小节内的延续。
             # 渲染为延音 dash（'-'），而非独立音符或休止符。
             _tie = getattr(element, 'tie', None)

@@ -41,6 +41,7 @@ _MIN_RULES_PER_STAFF = 5
 # Barlines are drawn from exactly the top rule to exactly the bottom rule;
 # this tolerance absorbs sub-point rounding in the segment endpoints.
 _BARLINE_TOL = 0.6
+_BARLINE_TOP_TOL = 0.20
 # MuseScore overshoots the bottom staff rule by exactly this much when stroking
 # a barline.  Measured on all three source scores: 507/507 barlines start at
 # offset 0.00 from the top rule and end at +0.24 from the bottom rule.
@@ -92,6 +93,16 @@ def extract_staves(page, page_number: int) -> list[Staff]:
         horizontal.append(((y0 + y1) / 2.0, left, right))
 
     horizontal.sort()
+    # A long annotation can lie on top of a staff rule. Treat coincident
+    # strokes as one rule, retaining the full-width staff line.
+    unique: list[tuple[float, float, float]] = []
+    for line in horizontal:
+        if unique and abs(line[0] - unique[-1][0]) < 0.15:
+            if line[2] - line[1] > unique[-1][2] - unique[-1][1]:
+                unique[-1] = line
+        else:
+            unique.append(line)
+    horizontal = unique
 
     staves: list[Staff] = []
     run: list[tuple[float, float, float]] = []
@@ -154,7 +165,7 @@ def staff_barlines(page, staff: Staff) -> list[float]:
         # has 168 (stems, ledger-line strokes and repeat-barline pairs each
         # added phantom measure boxes), so every measure count downstream was
         # wrong.
-        if abs(top - staff.top) > _BARLINE_TOL:
+        if abs(top - staff.top) > _BARLINE_TOP_TOL:
             continue                        # does not start on the top rule
         if abs(bottom - (staff.bottom + _BARLINE_OVERSHOOT)) > _BARLINE_TOL:
             continue                        # does not end where a barline ends
@@ -173,6 +184,14 @@ def staff_barlines(page, staff: Staff) -> list[float]:
         if merged and x - merged[-1] < _BARLINE_MERGE:
             continue
         merged.append(x)
+    # A system-opening repeat bar follows the clef but is not a measure.
+    thick_repeat = [d['rect'].x0 for d in page.get_drawings()
+                    if d['type'] == 's' and (d.get('width') or 0) >= 1.5
+                    and d['rect'].width < 1.2 and d['rect'].height > 8.0
+                    and abs(d['rect'].y0 - staff.top) < 1.0]
+    if (len(merged) > 1 and merged[0] - staff.x0 < 45.0
+            and any(abs(x - merged[0]) < 8.0 for x in thick_repeat)):
+        merged.pop(0)
     return merged
 
 
