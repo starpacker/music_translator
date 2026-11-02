@@ -113,6 +113,35 @@ class CellAlignmentTest(unittest.TestCase):
         self.assertIsNone(_slur_seam(page, pymupdf.Rect(10, 5, 110, 40), 80))
         source.close()
 
+    def test_slur_band_can_expand_without_distorting_digits(self):
+        from insitu.render_insitu import _place_cell, _slur_seam
+        source = pymupdf.open()
+        page = source.new_page(width=160, height=80)
+        for x in (10, 110):
+            page.draw_line((x, 7), (x, 39), width=.5)
+        shape = page.new_shape()
+        shape.draw_bezier((20, 16), (35, 6), (85, 6), (100, 16))
+        shape.finish(color=(0, 0, 0), width=.6, closePath=False)
+        shape.commit()
+        for x in (20, 43, 66, 89):
+            page.draw_rect(pymupdf.Rect(x, 23, x + 9, 32), color=None, fill=(0, 0, 0))
+        clip = pymupdf.Rect(10, 5, 110, 40)
+        self.assertIsNotNone(_slur_seam(page, clip, 110))
+        # Excessive expansion would move the curve endpoints away from the
+        # corresponding digits, so it must use the reported fallback.
+        self.assertIsNone(_slur_seam(page, clip, 160))
+        target = pymupdf.open()
+        output = target.new_page(width=160, height=80)
+        self.assertTrue(_place_cell(output, source, clip, pymupdf.Rect(20, 20, 130, 55)))
+        pix = output.get_pixmap(matrix=pymupdf.Matrix(2, 2), colorspace=pymupdf.csGRAY, alpha=False)
+        data = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.stride)
+        row = data[2 * (20 + 23 - 5 + 4)]
+        indices = np.flatnonzero(row[44:256] < 100) + 44
+        runs = np.split(indices, np.where(np.diff(indices) > 1)[0] + 1)
+        self.assertEqual([len(run) for run in runs if len(run) >= 10], [18, 18, 18, 18])
+        target.close()
+        source.close()
+
     def test_each_barline_lands_under_its_source_boundary(self):
         from insitu.render_insitu import _place_tile
         from insitu.pdf_structure import Staff, StaffLayout

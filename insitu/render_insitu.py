@@ -585,7 +585,7 @@ def _slur_seam(page, clip: fitz.Rect, target_width: float):
     """
     import numpy as np
 
-    if target_width >= clip.width or clip.height < 6 or clip.width < 12:
+    if abs(target_width - clip.width) < .1 or clip.height < 6 or clip.width < 12:
         return None
     drawings = page.get_drawings()
     curves = [d for d in drawings if d['rect'].intersects(clip)
@@ -626,8 +626,9 @@ def _slur_seam(page, clip: fitz.Rect, target_width: float):
     gaps = _blank_column_runs(page, lower)
     capacity = [max(0.0, right - left - 1.5) for left, right in gaps]
     total = sum(capacity)
-    remove = clip.width - target_width
-    if total < remove + .01:
+    delta = target_width - clip.width
+    remove = max(0.0, -delta)
+    if (delta < 0 and total < remove + .01) or (delta > 0 and not gaps):
         return None
     # Keep every visible slur endpoint near its associated digit after the
     # two bands undergo different horizontal mappings.
@@ -635,12 +636,15 @@ def _slur_seam(page, clip: fitz.Rect, target_width: float):
         for item in drawing['items']:
             for point in (item[1], item[4]):
                 if clip.x0 < point.x < clip.x1:
-                    removed = 0.0
-                    for (left, right), cap in zip(gaps, capacity):
-                        amount = remove * cap / total
-                        mid = (left + right) / 2
-                        removed += min(amount, max(0.0, point.x - (mid - amount / 2)))
-                    elastic = point.x - clip.x0 - removed
+                    elastic = point.x - clip.x0
+                    if delta < 0:
+                        for (left, right), cap in zip(gaps, capacity):
+                            amount = remove * cap / total
+                            mid = (left + right) / 2
+                            elastic -= min(amount, max(0.0, point.x - (mid - amount / 2)))
+                    else:
+                        elastic += delta * sum(point.x > (left + right) / 2
+                                               for left, right in gaps) / len(gaps)
                     uniform = (point.x - clip.x0) * target_width / clip.width
                     if abs(elastic - uniform) > 1.0:
                         return None
@@ -694,7 +698,8 @@ def _place_cell(target_page, source_doc, clip: fitz.Rect, target: fitz.Rect) -> 
     if abs(delta) < 0.1:
         target_page.show_pdf_page(target, source_doc, 0, clip=clip, keep_proportion=False)
         return True
-    if delta < 0 and sum(max(0.0, right - left - 1.5) for left, right in gaps) < -delta - .01:
+    if ((delta < 0 and sum(max(0.0, right - left - 1.5) for left, right in gaps) < -delta - .01)
+            or (delta > 0 and not gaps)):
         seam = _slur_seam(source_doc[0], clip, target.width)
         if seam is not None:
             dest_y = target.y0 + (seam - clip.y0) * target.height / clip.height
