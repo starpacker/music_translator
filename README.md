@@ -132,24 +132,33 @@ pip install -r requirements.txt
 
 #### 本机环境记录（2026-11-02）
 
-历史运行记录使用 `/opt/conda/envs/sumisora/bin/python` 与 `/usr/bin/lilypond`；
-本次检查时二者均已不存在，不能直接照搬旧路径。本次在当前容器重建的环境为
-`/tmp/music_translator_env/bin/python`（Python 3.13，按本仓库 `requirements.txt` 安装）；
-`/tmp` 和系统安装可能随容器重置而消失。重建方式：
+本机 Conda 安装在 `/opt/conda`，当前 `conda env list` 只列出 `base`，没有旧记录中的
+`sumisora` 环境。`base` 使用 Python 3.13.5；LilyPond 位于 `/usr/bin/lilypond`，版本 2.22.1。
+当前容器还存在 `/tmp/music_translator_env`（Python 3.13，按本仓库 `requirements.txt` 安装），
+但 `/tmp` 环境可能随容器重置而消失。登录这台服务器后，激活当前 Conda `base`：
 
 ```bash
-python -m venv /tmp/music_translator_env
-/tmp/music_translator_env/bin/pip install -r requirements.txt
-sudo apt-get update && sudo apt-get install -y --no-install-recommends lilypond
+source /opt/conda/etc/profile.d/conda.sh
+conda activate base
+python --version
 ```
 
-运行时可直接使用 `/tmp/music_translator_env/bin/python jianpu.py ...`；新环境首次识谱
-可能需要联网下载 Homr 模型。项目克隆到其他机器时建议使用上面的 `.venv` 安装方式。
+建议为项目创建独立 Conda 环境，而不是把项目依赖安装进 `base`：
+
+```bash
+source /opt/conda/etc/profile.d/conda.sh
+conda create -n music_translator python=3.13 -y  # 首次创建一次即可
+conda activate music_translator
+python -m pip install -r requirements.txt
+```
+
+以后在新 shell 中运行项目前，执行 `source /opt/conda/etc/profile.d/conda.sh && conda activate music_translator`。
+新环境首次识谱可能需要联网下载 Homr 模型。项目克隆到其他机器时建议使用上面的 `.venv` 安装方式。
 若环境变量 `TMPDIR` 指向不存在的目录，LilyPond 无法生成 PDF；可在命令前指定
 `TMPDIR=/tmp`。例如：
 
 ```bash
-TMPDIR=/tmp /tmp/music_translator_env/bin/python jianpu.py test.pdf --mode both -o output/test_baseline/test
+TMPDIR=/tmp python jianpu.py test.pdf --mode both -o output/test_baseline/test
 ```
 
 ### 2. LilyPond（必需，系统级）
