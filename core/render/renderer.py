@@ -959,16 +959,6 @@ def generate_jianpu_pdf_from_mxl(
             if _raw_composer.lower() not in ('', 'music21', 'composer'):
                 composer = _raw_composer
 
-        # Extract tempo from score if not pre-supplied.
-        if tempo_bpm <= 0:
-            try:
-                from music21 import tempo as m21tempo
-                _tempos = list(source_score.flatten().getElementsByClass(m21tempo.MetronomeMark))
-                if _tempos:
-                    tempo_bpm = int(round(_tempos[0].number))
-            except Exception:
-                pass
-
         # Keep grace notes in Jianpu. music21 MIDI export mishandles their
         # duration, so remove them only from the separate MIDI copy.
         if midi_output_path is not None:

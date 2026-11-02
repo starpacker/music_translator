@@ -108,6 +108,69 @@ def _with_time_signatures(measure_texts: list[str], start: int,
     ]
 
 
+def _measure_tempo_marks(score, part, measure_count: int) -> dict[int, list[tuple[float, str]]]:
+    """Collect representable metronome marks at their original measure offsets."""
+    from music21 import stream, tempo as m21tempo
+
+    if part is None or not measure_count:
+        return {}
+    source_measures = list(part.getElementsByClass(stream.Measure))[:measure_count]
+    has_measures = bool(source_measures)
+    if not source_measures:
+        source_measures = [part]
+    result: dict[int, list[tuple[float, str]]] = {}
+    units = {'whole': 1, 'half': 2, 'quarter': 4, 'eighth': 8,
+             '16th': 16, '32nd': 32, '64th': 64}
+    starts = [float(m.getOffsetInHierarchy(part)) if m is not part else 0.0
+              for m in source_measures]
+    candidates = [(index, float(mark.getOffsetInHierarchy(measure)), mark)
+                  for index, measure in enumerate(source_measures)
+                  for mark in measure.recurse().getElementsByClass(m21tempo.MetronomeMark)]
+    # Marks may also belong directly to a Part or Score instead of a Measure.
+    direct_sources = [(part, 0.0)] if has_measures else []
+    if score is not part:
+        direct_sources.append((score, float(part.getOffsetInHierarchy(score))))
+    for container, part_offset in direct_sources:
+        for mark in container.getElementsByClass(m21tempo.MetronomeMark):
+            absolute = float(mark.offset) - part_offset
+            indices = [i for i, start in enumerate(starts) if start <= absolute + 1e-7]
+            if not indices:
+                log_message('[jianpu] 谱表之前的速度记号无法定位，需人工校对。', _logging.WARNING)
+                continue
+            index = indices[-1]
+            candidates.append((index, absolute - starts[index], mark))
+    for index, offset, mark in candidates:
+        referent = mark.referent
+        unit = units.get(getattr(referent, 'type', None))
+        number = mark.number
+        if (unit is None or number is None or number <= 0
+                or abs(float(number) - round(float(number))) > 1e-7):
+            log_message(f'[jianpu] 小节 {index + 1} 的速度记号无法表示，需人工校对。', _logging.WARNING)
+            continue
+        dots = int(getattr(referent, 'dots', 0) or 0)
+        result.setdefault(index, []).append((offset, f'{unit}{"." * dots}={round(float(number))}'))
+    return result
+
+
+def _measure_text_with_tempos(notes: list[JianpuNote], marks: list[tuple[float, str]],
+                              measure_number: int) -> str:
+    """Insert marks only at a rendered event boundary, never move them silently."""
+    pending = sorted(marks, key=lambda item: item[0])
+    words: list[str] = []
+    position = 0.0
+    for note in notes:
+        matched = [mark for mark in pending if abs(mark[0] - position) < 1e-6]
+        words.extend(word for _, word in matched)
+        pending = [mark for mark in pending if abs(mark[0] - position) >= 1e-6]
+        words.append(jianpu_note_token(note))
+        if not note.is_grace:
+            position += note.duration
+    for offset, _ in pending:
+        log_message(f'[jianpu] 小节 {measure_number} 的速度记号位于 {offset:g} 拍，'
+                    '不在可表示的音符边界，需人工校对。', _logging.WARNING)
+    return ' '.join(words)
+
+
 def parse_score_to_jianpu(score) -> tuple[list[list[JianpuNote]], list[str], str]:
     """Parse a score into jianpu format; return (measures, header_lines, time_sig)."""
     key_tonic_semitone, key_header = _get_score_key_tonic(score)
@@ -204,18 +267,10 @@ def build_jianpu_ly_text(score, title: str, use_strict_timing: bool = False,
     """
     key_tonic_semitone, key_header_line = _get_score_key_tonic(score)
 
-    if tempo <= 0:
-        try:
-            from music21 import tempo as m21tempo
-            tempos = list(score.flatten().getElementsByClass(m21tempo.MetronomeMark))
-            if tempos:
-                tempo = int(round(tempos[0].number))
-        except Exception:
-            pass
-
     # ── Collect one measures-list per output section ──────────────────────────
     _parts = list(score.parts) if score.parts else []
     _sections: list[list[list[JianpuNote]]] = []
+    _section_parts: list = []
     _voice_groups: list[list[int]] = []   # parallel to _sections groups
     _time_sig: str = '4/4'
     _ts_set = False
@@ -230,6 +285,7 @@ def build_jianpu_ly_text(score, title: str, use_strict_timing: bool = False,
             fn = extract_strict_jianpu_measures if use_strict_timing else extract_jianpu_measures
             measures, _time_sig = fn(score, key_tonic_semitone)
             _sections = [measures]
+            _section_parts = [part if part is not None else score]
             _voice_groups = [[0]]
         else:
             # Multiple voices within a single part — extract each voice separately
@@ -255,6 +311,7 @@ def build_jianpu_ly_text(score, title: str, use_strict_timing: bool = False,
                 if measures:
                     _group_idxs.append(len(_sections))
                     _sections.append(measures)
+                    _section_parts.append(part)
             _voice_groups = [_group_idxs] if _group_idxs else [[0]]
     else:
         # Multi-part path: one section per part / voice combination
@@ -267,6 +324,7 @@ def build_jianpu_ly_text(score, title: str, use_strict_timing: bool = False,
                 if measures:
                     _voice_groups.append([len(_sections)])
                     _sections.append(measures)
+                    _section_parts.append(part)
             else:
                 voice_ids = _get_voice_ids_in_part(part)
                 if len(voice_ids) <= 1:
@@ -277,6 +335,7 @@ def build_jianpu_ly_text(score, title: str, use_strict_timing: bool = False,
                     if measures:
                         _voice_groups.append([len(_sections)])
                         _sections.append(measures)
+                        _section_parts.append(part)
                 else:
                     # Multiple voices: one section per voice (max 4).
                     # In a multi-part score each Part already maps to a separate staff;
@@ -301,6 +360,7 @@ def build_jianpu_ly_text(score, title: str, use_strict_timing: bool = False,
                         if measures:
                             _voice_groups.append([len(_sections)])
                             _sections.append(measures)
+                            _section_parts.append(part)
 
     # ── Assemble jianpu-ly text ───────────────────────────────────────────────
     header = ['% jianpu-ly.py', f'title={title}']
@@ -332,13 +392,18 @@ def build_jianpu_ly_text(score, title: str, use_strict_timing: bool = False,
         # Each section gets its own staff and its own barLength, so the layout
         # tokens restart from the header's bar length for every section.
         section_time_sigs = layout_time_tokens(measures, bar_units)
+        tempo_marks = _measure_tempo_marks(score, _section_parts[section_idx], len(measures))
+        if tempo > 0 and 0 in tempo_marks:
+            # A caller-supplied initial tempo overrides source marks at time zero.
+            tempo_marks[0] = [(offset, word) for offset, word in tempo_marks[0]
+                              if abs(offset) >= 1e-6]
         for i in range(0, len(measures), measures_per_line):
             line_measures = measures[i:i + measures_per_line]
             try:
                 # Emitted exactly as extracted: no padding, no trimming.
                 measure_texts = [
-                    ' '.join(jianpu_note_token(note) for note in m)
-                    for m in line_measures
+                    _measure_text_with_tempos(m, tempo_marks.get(i + offset, []), i + offset + 1)
+                    for offset, m in enumerate(line_measures)
                 ]
                 header.append(
                     ' | '.join(_with_time_signatures(measure_texts, i, section_time_sigs)) + ' |')
