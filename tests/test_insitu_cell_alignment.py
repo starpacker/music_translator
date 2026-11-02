@@ -100,8 +100,12 @@ class CellAlignmentTest(unittest.TestCase):
             output = pymupdf.open()
             page = output.new_page(width=350, height=100)
             layout = StaffLayout(Staff(1, 0, 20, 20, 300, 5), [120, 300])
-            result = _place_tile(page, tile, pymupdf.Rect(9, 9, 181, 31), layout, 40, 2)
+            measures = []
+            result = _place_tile(page, tile, pymupdf.Rect(9, 9, 181, 31), layout, 40, 2,
+                                 measure_report=measures)
             self.assertIn(result, ('aligned', 'scaled'))
+            self.assertEqual([entry['measure_offset'] for entry in measures], [0, 1])
+            self.assertEqual([entry['target_width_points'] for entry in measures], [100, 180])
             pix = page.get_pixmap(matrix=pymupdf.Matrix(2, 2), colorspace=pymupdf.csGRAY, alpha=False)
             data = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.stride)
             for x in (20, 120, 300):

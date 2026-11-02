@@ -42,6 +42,8 @@ import sys
 import tempfile
 import shutil
 import copy
+import hashlib
+import json
 from pathlib import Path
 from typing import Optional
 
@@ -573,7 +575,8 @@ def _place_cell(target_page, source_doc, clip: fitz.Rect, target: fitz.Rect) -> 
     return False
 
 
-def _place_tile(target_page, tile: Path, ink: fitz.Rect, layout, top: float, count: int) -> str:
+def _place_tile(target_page, tile: Path, ink: fitz.Rect, layout, top: float, count: int,
+                *, measure_report=None) -> str:
     """Place each Jianpu measure below the corresponding engraved measure."""
     with fitz.open(str(tile)) as src:
         bars = _tile_barlines(src[0], ink, count)
@@ -588,10 +591,16 @@ def _place_tile(target_page, tile: Path, ink: fitz.Rect, layout, top: float, cou
             target_page.show_pdf_page(fitz.Rect(targets[0] - clip.width, top, targets[0], top + ink.height),
                                       src, 0, clip=clip, keep_proportion=False)
         unscaled = True
-        for left, right, x0, x1 in zip(bars, bars[1:], targets, targets[1:]):
+        for offset, (left, right, x0, x1) in enumerate(zip(bars, bars[1:], targets, targets[1:])):
             clip = fitz.Rect(left, ink.y0, right, ink.y1)
             target = fitz.Rect(x0, top, x1, top + ink.height)
-            unscaled = _place_cell(target_page, src, clip, target) and unscaled
+            cell_unscaled = _place_cell(target_page, src, clip, target)
+            if measure_report is not None:
+                measure_report.append({'measure_offset': offset,
+                                       'placement': 'unscaled' if cell_unscaled else 'scaled',
+                                       'source_width_points': round(clip.width, 3),
+                                       'target_width_points': round(target.width, 3)})
+            unscaled = cell_unscaled and unscaled
         if ink.x1 - bars[-1] > 0.2:
             clip = fitz.Rect(bars[-1], ink.y0, ink.x1, ink.y1)
             target_page.show_pdf_page(fitz.Rect(targets[-1], top, targets[-1] + clip.width, top + ink.height),
@@ -599,8 +608,34 @@ def _place_tile(target_page, tile: Path, ink: fitz.Rect, layout, top: float, cou
         return 'aligned' if unscaled else 'scaled'
 
 
+def _write_json_report(path: Path, report: dict) -> None:
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=path.parent,
+                                         prefix='.insitu-report-', suffix='.json', delete=False) as f:
+            temporary = Path(f.name)
+            json.dump(report, f, ensure_ascii=False, indent=2)
+        temporary.replace(path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
 def build(pdf_path: Path, mxl_path: Path, out_path: Path,
           title: Optional[str] = None, expand: bool = False) -> Path:
+    report_path = out_path.with_suffix('.report.json')
+    protected = {pdf_path.resolve(), mxl_path.resolve(), out_path.resolve()}
+    while report_path.resolve() in protected:
+        report_path = report_path.with_name(report_path.stem + '.report.json')
+    try:
+        # An interrupted run must not leave an earlier success report that
+        # appears to describe the output currently being regenerated.
+        _write_json_report(report_path, {'status': 'in_progress',
+                                         'scope': 'in_situ_rendering_not_omr_accuracy',
+                                         'source_pdf': str(pdf_path), 'source_musicxml': str(mxl_path),
+                                         'output_pdf': str(out_path)})
+    except Exception as exc:
+        print(f'  ! 无法初始化原位逐行报告：{exc}')
     staves, slices = align_from_files(pdf_path, mxl_path)
 
     score = parse_musicxml_compatible(mxl_path)
@@ -629,11 +664,24 @@ def build(pdf_path: Path, mxl_path: Path, out_path: Path,
     fallback_rows = 0
     incomplete_voice_rows = 0
     tiles = {}
+    row_reports = []
+    for index, layout in enumerate(staves):
+        sl = slices[index] if index < len(slices) else None
+        row_reports.append({'staff_index': index + 1, 'page': layout.staff.page,
+                            'musicxml_start_index': sl.omr_start if sl else None,
+                            'musicxml_end_index_exclusive': sl.omr_end if sl else None,
+                            'pdf_measures': sl.pdf_measures if sl else None,
+                            'musicxml_measures': sl.omr_measures if sl else None,
+                            'voices': [], 'rendered': False})
 
     for sl, layout in zip(slices, staves):
         staff = layout.staff
         line_tiles = []
+        row_report = row_reports[sl.staff_index]
         for voice_index, (measures, time_sig) in enumerate(tracks):
+            voice_report = {'voice_index': voice_index + 1, 'rendered': False,
+                            'placement': None, 'error': None, 'measures': []}
+            row_report['voices'].append(voice_report)
             line_measures = _line_slur_continuations(measures, sl.omr_start, sl.omr_end)
             chunk = _with_time_signatures(
                 _measure_texts(line_measures, time_sig), 0,
@@ -644,6 +692,7 @@ def build(pdf_path: Path, mxl_path: Path, out_path: Path,
                      if sl.omr_start + offset in key_changes else text
                      for offset, text in enumerate(chunk)]
             if not chunk:
+                voice_report['error'] = 'no_measures_assigned'
                 continue
             line_key = key_header if placed == 0 and voice_index == 0 else ''
             try:
@@ -655,13 +704,16 @@ def build(pdf_path: Path, mxl_path: Path, out_path: Path,
                                  if sl.omr_start <= index < sl.omr_end}
                 ly_text = _insert_repeat_bar_commands(ly_text, local_repeats)
                 tile_pdf, ink = _render_ly_tile(ly_text, workdir)
-                line_tiles.append((tile_pdf, ink, len(chunk)))
+                line_tiles.append((tile_pdf, ink, len(chunk), voice_report))
+                voice_report['rendered'] = True
             except Exception as exc:                   # keep the rest of the run
+                voice_report['error'] = str(exc)
                 print(f'  ! staff {sl.staff_index} voice {voice_index + 1}: {exc}')
         if not line_tiles:
             continue
         if len(line_tiles) != len(tracks):
             incomplete_voice_rows += 1
+        row_report['rendered'] = True
 
         if expand:
             tiles[sl.staff_index] = line_tiles
@@ -670,8 +722,10 @@ def build(pdf_path: Path, mxl_path: Path, out_path: Path,
 
         page = doc[staff.page - 1]
         top = staff.bottom + Y_OFFSET
-        for tile_pdf, ink, count in line_tiles:
-            placement = _place_tile(page, tile_pdf, ink, layout, top, count)
+        for tile_pdf, ink, count, voice_report in line_tiles:
+            placement = _place_tile(page, tile_pdf, ink, layout, top, count,
+                                    measure_report=voice_report['measures'])
+            voice_report['placement'] = placement
             if placement != 'aligned':
                 fallback_rows += 1
                 print(f'  ! 第 {staff.page} 页谱表 {sl.staff_index + 1}: 对齐回退 ({placement})')
@@ -681,19 +735,26 @@ def build(pdf_path: Path, mxl_path: Path, out_path: Path,
     if expand:
         output = fitz.open()
         for page_index, page in enumerate(doc):
-            page_rows = [(i, layout) for i, layout in enumerate(staves)
-                         if layout.staff.page == page_index + 1 and i in tiles]
+            all_page_rows = [(i, layout) for i, layout in enumerate(staves)
+                             if layout.staff.page == page_index + 1]
+            # A failed tile still has a source staff that must remain intact.
+            # Using only successfully rendered rows here can choose a cut
+            # through that skipped staff and tear the original notation.
+            next_tops = {index: (all_page_rows[row + 1][1].staff.top
+                                 if row + 1 < len(all_page_rows) else page.rect.height)
+                         for row, (index, _) in enumerate(all_page_rows)}
+            page_rows = [(index, layout) for index, layout in all_page_rows if index in tiles]
             insertions = []
-            for row, (index, layout) in enumerate(page_rows):
+            for index, layout in page_rows:
                 staff = layout.staff
-                next_top = page_rows[row + 1][1].staff.top if row + 1 < len(page_rows) else page.rect.height
+                next_top = next_tops[index]
                 low = min(staff.bottom + 6, next_top - 1)
                 high = min(next_top - 5, staff.bottom + 55)
                 cut = _blank_cut(page, low, max(low + 1, high))
                 overrides = (_tempo_cut_overrides(page, low, cut, next_top)
-                             if row + 1 < len(page_rows) else [])
+                             if next_top < page.rect.height else [])
                 line_tiles = tiles[index]
-                total_ink = sum(ink.height for _, ink, _ in line_tiles) + 9 * (len(line_tiles) - 1)
+                total_ink = sum(ink.height for _, ink, _, _ in line_tiles) + 9 * (len(line_tiles) - 1)
                 spread = max([0.0] + [cut - y for _, _, y in overrides])
                 insertions.append((cut, max(34.0, total_ink + 18.0) + spread,
                                    index, layout, line_tiles, None, None, overrides))
@@ -703,8 +764,10 @@ def build(pdf_path: Path, mxl_path: Path, out_path: Path,
             shift = 0.0
             for cut, height, index, layout, line_tiles, _, _, _ in insertions:
                 top = cut + shift + 9
-                for tile, ink, count in line_tiles:
-                    placement = _place_tile(target_page, tile, ink, layout, top, count)
+                for tile, ink, count, voice_report in line_tiles:
+                    placement = _place_tile(target_page, tile, ink, layout, top, count,
+                                            measure_report=voice_report['measures'])
+                    voice_report['placement'] = placement
                     if placement != 'aligned':
                         fallback_rows += 1
                         print(f'  ! 第 {page_index + 1} 页谱表 {index + 1}: 对齐回退 ({placement})')
@@ -721,6 +784,32 @@ def build(pdf_path: Path, mxl_path: Path, out_path: Path,
         print(f'  ! {fallback_rows} 行因分隔线不明确或空间不足，使用整体放置或压缩；请校对。')
     if incomplete_voice_rows:
         print(f'  ! {incomplete_voice_rows} 个谱表存在未生成的声部，结果不完整；请校对。')
+    missing = sum(not row['rendered'] or len(row['voices']) != len(tracks)
+                  or any(not voice['rendered'] for voice in row['voices']) for row in row_reports)
+    mismatches = sum(row['pdf_measures'] != row['musicxml_measures'] for row in row_reports)
+    status = ('incomplete' if not staves or missing else
+              'needs_review' if fallback_rows or mismatches or len(score.parts) > 1 else 'rendered')
+    try:
+        def digest(path):
+            hasher = hashlib.sha256()
+            with path.open('rb') as source:
+                for block in iter(lambda: source.read(1024 * 1024), b''):
+                    hasher.update(block)
+            return hasher.hexdigest()
+        report = {'status': status, 'scope': 'in_situ_rendering_not_omr_accuracy',
+                  'source_pdf': str(pdf_path), 'source_pdf_sha256': digest(pdf_path),
+                  'source_musicxml': str(mxl_path), 'source_musicxml_sha256': digest(mxl_path),
+                  'output_pdf': str(out_path), 'output_pdf_sha256': digest(out_path),
+                  'staff_count': len(staves), 'rendered_staff_count': placed,
+                  'incomplete_staff_count': missing, 'alignment_mismatch_count': mismatches,
+                  'placement_fallback_count': fallback_rows,
+                  'musicxml_part_count': len(score.parts), 'rows': row_reports}
+        _write_json_report(report_path, report)
+        print(f'[insitu] 逐行报告: {report_path}（{status}）')
+    except Exception as exc:
+        print(f'  ! 无法保存原位逐行报告，请校对输出：{exc}')
+    if status == 'incomplete':
+        print('  ! 原位输出不完整：至少有谱表或声部未生成，请查看逐行报告。')
     return out_path
 
 

@@ -6,6 +6,9 @@ import sys
 import tempfile
 import unittest
 import zipfile
+import json
+import hashlib
+from unittest import mock
 from pathlib import Path
 import pymupdf
 import numpy as np
@@ -95,6 +98,15 @@ class SpacedInsituTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertIn('placed 2/2 lines', result.stdout)
             self.assertEqual(xml.read_text(), content)
+            report = json.loads((root / 'out.insitu.report.json').read_text())
+            self.assertEqual(report['staff_count'], 2)
+            self.assertEqual(report['rendered_staff_count'], 2)
+            self.assertEqual(report['incomplete_staff_count'], 0)
+            self.assertEqual(len(report['rows']), 2)
+            self.assertTrue(all(row['voices'][0]['placement'] in ('aligned', 'scaled', 'line')
+                                for row in report['rows']))
+            self.assertEqual(report['source_musicxml_sha256'], hashlib.sha256(xml.read_bytes()).hexdigest())
+            self.assertEqual(report['output_pdf_sha256'], hashlib.sha256((root / 'out.insitu.pdf').read_bytes()).hexdigest())
             with pymupdf.open(root / 'out.insitu.pdf') as output:
                 self.assertEqual(len(output), 1)
                 self.assertGreaterEqual(output[0].rect.height, 568)
@@ -121,3 +133,80 @@ class SpacedInsituTest(unittest.TestCase):
                                     capture_output=True, text=True, env={**os.environ, 'TMPDIR': tmp}, timeout=90)
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertIn('placed 2/2 lines', result.stdout)
+
+    def test_failed_row_is_reported_as_incomplete_but_pdf_is_saved(self):
+        from insitu.render_insitu import build
+        from test_vector_tempos import make_sources
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source, xml = make_sources(root)
+            output = root / 'out.insitu.pdf'
+            with mock.patch('insitu.render_insitu._run_jianpu_ly', side_effect=RuntimeError('test failure')):
+                build(source, xml, output, expand=True)
+            report = json.loads((root / 'out.insitu.report.json').read_text())
+            self.assertTrue(output.is_file())
+            self.assertEqual(report['status'], 'incomplete')
+            self.assertEqual(report['staff_count'], 1)
+            self.assertEqual(report['rendered_staff_count'], 0)
+            self.assertEqual(report['incomplete_staff_count'], 1)
+            self.assertEqual(report['rows'][0]['voices'][0]['error'], 'test failure')
+
+    def test_interrupted_run_does_not_leave_previous_success_report(self):
+        from insitu.render_insitu import build
+        from test_vector_tempos import make_sources
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source, xml = make_sources(root)
+            report = root / 'out.insitu.report.json'
+            report.write_text('{"status": "rendered"}')
+            with mock.patch('insitu.render_insitu.align_from_files', side_effect=RuntimeError('test interruption')):
+                with self.assertRaisesRegex(RuntimeError, 'test interruption'):
+                    build(source, xml, root / 'out.insitu.pdf', expand=True)
+            self.assertEqual(json.loads(report.read_text())['status'], 'in_progress')
+
+    def test_missing_middle_row_does_not_let_cut_cross_its_staff(self):
+        import insitu.render_insitu as renderer
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source, xml = root / 'score.pdf', root / 'score.musicxml'
+            doc = pymupdf.open()
+            page = doc.new_page(width=600, height=350)
+            for top in (100, 145, 230):
+                for dy in (0, 5, 10, 15, 20):
+                    page.draw_line((40, top + dy), (540, top + dy), width=.5)
+                page.draw_line((540, top), (540, top + 20), width=.5)
+            doc.save(source)
+            doc.close()
+            xml.write_text('''<score-partwise version="4.0"><part-list><score-part id="P1">
+<part-name>Flute</part-name></score-part></part-list><part id="P1">
+<measure number="1"><attributes><divisions>1</divisions><key><fifths>0</fifths></key>
+<time><beats>4</beats><beat-type>4</beat-type></time><clef><sign>G</sign><line>2</line></clef>
+</attributes><note><pitch><step>C</step><octave>4</octave></pitch><duration>4</duration><type>whole</type></note></measure>
+<measure number="2"><print new-system="yes"/><note><pitch><step>D</step><octave>4</octave></pitch>
+<duration>4</duration><type>whole</type></note></measure>
+<measure number="3"><print new-system="yes"/><note><pitch><step>E</step><octave>4</octave></pitch>
+<duration>4</duration><type>whole</type></note></measure></part></score-partwise>''')
+            original = renderer._run_jianpu_ly
+            calls = []
+            def render_line(text, workdir):
+                calls.append(workdir)
+                if len(calls) == 2:
+                    raise RuntimeError('middle row unavailable')
+                return original(text, workdir)
+            with mock.patch.object(renderer, '_run_jianpu_ly', side_effect=render_line), \
+                 mock.patch.object(renderer, '_blank_cut', wraps=renderer._blank_cut) as cuts:
+                output = root / 'out.insitu.pdf'
+                renderer.build(source, xml, output, expand=True)
+            report = json.loads((root / 'out.insitu.report.json').read_text())
+            self.assertEqual(report['status'], 'incomplete')
+            self.assertEqual([row['rendered'] for row in report['rows']], [True, False, True])
+            self.assertLessEqual(cuts.call_args_list[0].args[2], 140)
+            with pymupdf.open(output) as result:
+                pix = result[0].get_pixmap(matrix=pymupdf.Matrix(2, 2), colorspace=pymupdf.csGRAY, alpha=False)
+                pixels = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.stride)
+                ys = np.flatnonzero(pixels[:, 100] < 180)
+                centers = [int(run[len(run) // 2]) for run in np.split(ys, np.where(np.diff(ys) > 1)[0] + 1) if len(run)]
+                self.assertTrue(any(all(any(abs(y - (start + 10 * j)) <= 1 for y in centers)
+                                        for j in range(5))
+                                    for start in centers if 2 * 179 <= start < 2 * 264),
+                                'the skipped middle staff should remain five continuous lines')
