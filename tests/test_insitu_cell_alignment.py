@@ -142,6 +142,60 @@ class CellAlignmentTest(unittest.TestCase):
         target.close()
         source.close()
 
+    def test_cross_bar_curves_fit_without_stretching_digits_or_breaking(self):
+        from insitu.render_insitu import (_jianpu_ly_source, _place_cell, _render_ly_tile,
+                                          _run_jianpu_ly, _tile_barlines)
+        with tempfile.TemporaryDirectory() as tmp:
+            work = Path(tmp)
+            measures = ['6 - - -', r'7 - - ^\fermata -', "1=C #4' - - -",
+                        '- - - -', '- - - -', '- - - -', '0 - - -']
+            ly = _run_jianpu_ly(_jianpu_ly_source([measures], '', '4/4', 'test'), work)
+            tile, ink = _render_ly_tile(ly, work)
+            with pymupdf.open(tile) as source, pymupdf.open() as target:
+                bars = _tile_barlines(source[0], ink, len(measures))
+                self.assertIsNotNone(bars)
+                page = target.new_page(width=300, height=100)
+                x = 20
+                boundaries = []
+                for i, width in ((2, 77.88), (3, 58.92), (4, 57.24)):
+                    clip = pymupdf.Rect(bars[i], ink.y0, bars[i + 1], ink.y1)
+                    self.assertTrue(_place_cell(page, source, clip,
+                                                pymupdf.Rect(x, 10, x + width, 10 + ink.height)))
+                    x += width
+                    boundaries.append(x)
+
+                def digit_widths(p):
+                    return [c['bbox'][2] - c['bbox'][0]
+                            for b in p.get_text('rawdict')['blocks'] for line in b.get('lines', [])
+                            for span in line['spans'] for c in span['chars'] if c['c'] == '4']
+
+                source_width = digit_widths(source[0])[0]
+                self.assertEqual(len(digit_widths(page)), 3)
+                for width in digit_widths(page):
+                    self.assertAlmostEqual(width, source_width, places=2)
+                pix = page.get_pixmap(matrix=pymupdf.Matrix(4, 4), colorspace=pymupdf.csGRAY, alpha=False)
+                data = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.stride)
+                for boundary in boundaries[:-1]:
+                    # The curve crosses each boundary above the barline.
+                    for offset in (-2, 2):
+                        col = round(boundary * 4) + offset
+                        self.assertLess(data[14 * 4:24 * 4, col].min(), 200)
+
+    def test_curve_columns_protect_other_artwork(self):
+        from insitu.render_insitu import _curve_column_runs
+        with pymupdf.open() as source:
+            page = source.new_page(width=160, height=80)
+            shape = page.new_shape()
+            shape.draw_bezier((20, 16), (35, 6), (85, 6), (100, 16))
+            shape.finish(color=(0, 0, 0), width=.6, closePath=False)
+            shape.commit()
+            for x in (20, 90):
+                page.draw_rect(pymupdf.Rect(x, 23, x + 5, 30), color=None, fill=(0, 0, 0))
+            page.draw_rect(pymupdf.Rect(38, 8, 42, 15), color=None, fill=(0, 0, 0))
+            gaps = _curve_column_runs(page, pymupdf.Rect(10, 5, 110, 40))
+            self.assertTrue(gaps)
+            self.assertFalse(any(left < 42 and right > 38 for left, right in gaps))
+
     def test_each_barline_lands_under_its_source_boundary(self):
         from insitu.render_insitu import _place_tile
         from insitu.pdf_structure import Staff, StaffLayout

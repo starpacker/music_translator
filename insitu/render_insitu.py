@@ -575,6 +575,114 @@ def _blank_column_runs(page, clip: fitz.Rect) -> list[tuple[float, float]]:
     return runs
 
 
+def _curve_column_runs(page, clip: fitz.Rect) -> list[tuple[float, float]]:
+    """Find columns containing only long slur curves, suitable for elastic fitting.
+
+    Text bounding boxes are protected even where their raster happens to
+    overlap a curve. Other artwork remains protected by the raster mask.
+    """
+    import numpy as np
+
+    drawings = page.get_drawings()
+    curves = [d for d in drawings if d['rect'].intersects(clip)
+              and d['items'] and all(item[0] == 'c' for item in d['items'])
+              and d['rect'].width >= clip.width * .35
+              and d['rect'].height <= min(15, d['rect'].width * .3)
+              and d['type'] in ('s', 'f')]
+    if not curves:
+        return []
+    scale = 4
+    pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), clip=clip,
+                          alpha=False, colorspace=fitz.csGRAY)
+    pixels = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.stride)[:, :pix.width]
+    mask_doc = fitz.open()
+    try:
+        mask_page = mask_doc.new_page(width=page.rect.width, height=page.rect.height)
+        for drawing in curves:
+            shape = mask_page.new_shape()
+            for _, a, b, c, d in drawing['items']:
+                shape.draw_bezier(a, b, c, d)
+            shape.finish(color=(0, 0, 0), fill=(0, 0, 0) if drawing['type'] == 'f' else None,
+                         width=max(1.0, drawing.get('width') or 0), closePath=False)
+            shape.commit()
+        mpix = mask_page.get_pixmap(matrix=fitz.Matrix(scale, scale), clip=clip,
+                                    alpha=False, colorspace=fitz.csGRAY)
+        mask = np.frombuffer(mpix.samples, dtype=np.uint8).reshape(mpix.height, mpix.stride)[:, :mpix.width] < 245
+        if mask.shape != pixels.shape:
+            return []
+        expanded = mask.copy()
+        expanded[1:] |= mask[:-1]
+        expanded[:-1] |= mask[1:]
+        expanded[:, 1:] |= mask[:, :-1]
+        expanded[:, :-1] |= mask[:, 1:]
+        clear = ~np.any((pixels < 245) & ~expanded, axis=0)
+        curve_ids = {id(d) for d in curves}
+        for drawing in drawings:
+            box = drawing['rect']
+            if id(drawing) not in curve_ids and box.intersects(clip):
+                left = max(0, int(box.x0 * scale - pix.x) - 1)
+                right = min(pix.width, int(box.x1 * scale - pix.x) + 2)
+                clear[left:right] = False
+        for info in page.get_image_info():
+            box = fitz.Rect(info['bbox'])
+            if box.intersects(clip):
+                left = max(0, int(box.x0 * scale - pix.x) - 1)
+                right = min(pix.width, int(box.x1 * scale - pix.x) + 2)
+                clear[left:right] = False
+        for block in page.get_text('rawdict')['blocks']:
+            for line in block.get('lines', []):
+                for span in line.get('spans', []):
+                    for char in span['chars']:
+                        box = fitz.Rect(char['bbox'])
+                        if box.intersects(clip):
+                            left = max(0, int(box.x0 * scale - pix.x) - 1)
+                            right = min(pix.width, int(box.x1 * scale - pix.x) + 2)
+                            clear[left:right] = False
+        runs = []
+        start = None
+        for index, blank in enumerate(clear):
+            if blank and start is None:
+                start = index
+            elif not blank and start is not None:
+                if index - start >= 6 and start > 0:
+                    left = (pix.x + start + .5) / scale
+                    right = (pix.x + index - .5) / scale
+                    if right > left:
+                        runs.append((left, right))
+                start = None
+        return runs
+    finally:
+        mask_doc.close()
+
+
+def _place_curve_gaps(target_page, source_doc, clip: fitz.Rect, target: fitz.Rect) -> bool:
+    """Resize curve-only columns continuously, leaving all other ink unchanged."""
+    gaps = _curve_column_runs(source_doc[0], clip)
+    delta = target.width - clip.width
+    if not gaps:
+        return False
+    capacity = [max(0.0, right - left - 1.5) for left, right in gaps]
+    if delta < 0 and sum(capacity) < -delta + .01:
+        return False
+    changes = ([delta / len(gaps)] * len(gaps) if delta >= 0 else
+               [delta * value / sum(capacity) for value in capacity])
+    previous, dest_x = clip.x0, target.x0
+    for (left, right), change in zip(gaps, changes):
+        for a, b, width in ((previous, left, left - previous),
+                            (left, right, right - left + change)):
+            if b > a and width > 0:
+                target_page.show_pdf_page(fitz.Rect(dest_x, target.y0, dest_x + width, target.y1),
+                                         source_doc, 0, clip=fitz.Rect(a, clip.y0, b, clip.y1),
+                                         keep_proportion=False)
+                dest_x += width
+        previous = right
+    if clip.x1 > previous:
+        target_page.show_pdf_page(fitz.Rect(dest_x, target.y0, target.x1, target.y1), source_doc, 0,
+                                 clip=fitz.Rect(previous, clip.y0, clip.x1, clip.y1),
+                                 keep_proportion=False)
+    return True
+
+
 def _slur_seam(page, clip: fitz.Rect, target_width: float):
     """Find an empty separator below long curves, if they are the only upper ink.
 
@@ -700,6 +808,8 @@ def _place_cell(target_page, source_doc, clip: fitz.Rect, target: fitz.Rect) -> 
         return True
     if ((delta < 0 and sum(max(0.0, right - left - 1.5) for left, right in gaps) < -delta - .01)
             or (delta > 0 and not gaps)):
+        if _place_curve_gaps(target_page, source_doc, clip, target):
+            return True
         seam = _slur_seam(source_doc[0], clip, target.width)
         if seam is not None:
             dest_y = target.y0 + (seam - clip.y0) * target.height / clip.height
