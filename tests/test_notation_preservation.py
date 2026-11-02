@@ -5,6 +5,7 @@ import shutil
 import tempfile
 import unittest
 from unittest import mock
+import xml.etree.ElementTree as ET
 
 import pymupdf
 from music21 import articulations, chord, converter, expressions, key, meter, note, stream, tie
@@ -63,10 +64,10 @@ class NotationPreservationTest(unittest.TestCase):
         first = [jianpu_note_token(n) for n in measures[0]]
         self.assertEqual(first[0], r'1 \accent _\staccato')
         self.assertEqual(first[1], r'g[2] GraceMark:^\tenuto')
-        self.assertEqual(first[2], r'3 \fermata ^\trill - -')
+        self.assertEqual(first[2], r'3 _\fermata ^\trill - -')
         self.assertEqual(jianpu_note_token(measures[1][0]), r'13 \accent -')
-        self.assertEqual(jianpu_note_token(measures[2][0]), r'- \fermata -')
-        self.assertEqual(jianpu_note_token(measures[2][1]), r'0 \fermata -')
+        self.assertEqual(jianpu_note_token(measures[2][0]), r'- _\fermata -')
+        self.assertEqual(jianpu_note_token(measures[2][1]), r'0 _\fermata -')
         self.assertEqual([sum(n.duration for n in bar) for bar in measures], [4, 4, 4])
         # Reading marks and cloning do not alter the music21 source.
         source = list(score.parts[0].getElementsByClass(stream.Measure))[0]
@@ -119,6 +120,39 @@ class NotationPreservationTest(unittest.TestCase):
                 missing = audit(xml)
             self.assertTrue(any(item.get('reason') == 'note_mark_placement' for item in missing['mismatches']))
 
+    def test_musicxml_fermata_defaults_and_directions_are_preserved(self):
+        from core.notation.musicxml_wedges import parse_musicxml_compatible
+        from scripts.audit_jianpu_events import audit
+        with tempfile.TemporaryDirectory() as tmp:
+            xml = Path(tmp) / 'directions.musicxml'
+            marked_score().write('musicxml', fp=xml)
+            tree = ET.parse(xml)
+            fermatas = tree.findall('.//fermata')
+            fermatas[0].attrib.pop('type', None)
+            fermatas[1].set('type', 'upright')
+            fermatas[2].set('type', 'inverted')
+            tree.write(xml, encoding='utf-8', xml_declaration=True)
+            original = xml.read_bytes()
+            score = parse_musicxml_compatible(xml)
+            actual = [mark.type for event in score.parts[0].recurse().notesAndRests
+                      for mark in event.expressions if isinstance(mark, expressions.Fermata)]
+            self.assertEqual(actual, ['upright', 'upright', 'inverted'])
+            tonic, _ = _get_score_key_tonic(score)
+            measures, _ = extract_jianpu_measures(score, tonic, follow_key_changes=True)
+            extracted = [mark for bar in measures for event in bar
+                         for mark in event.notations if mark.endswith(r'\fermata')]
+            self.assertEqual(extracted, [r'^\fermata', r'^\fermata', r'_\fermata'])
+            self.assertEqual(audit(xml)['mismatch_count'], 0)
+            from core.notation.jianpu import primitives
+            original_notations = primitives._source_notations
+            def wrong_direction(event):
+                return tuple(mark.replace(r'_\fermata', r'^\fermata')
+                             for mark in original_notations(event))
+            with mock.patch.object(primitives, '_source_notations', side_effect=wrong_direction):
+                result = audit(xml)
+            self.assertTrue(any(m.get('reason') == 'fermata_direction' for m in result['mismatches']))
+            self.assertEqual(xml.read_bytes(), original)
+
     def test_graphical_fallback_warns_that_marks_may_be_lost(self):
         from core.render import renderer
         with tempfile.TemporaryDirectory() as tmp:
@@ -147,6 +181,11 @@ class NotationPreservationTest(unittest.TestCase):
             long_name = r'g[2] GraceMark:\staccatissimo g[3] 1 - - -'
             ly = _run_jianpu_ly(_jianpu_ly_source([[long_name]], '1=C', '4/4', 'test'), root)
             self.assertIn(r"d'16 \staccatissimo e'16", ly)
+            self.assertTrue(_render_ly_tile(ly, root)[0].is_file())
+            ly = _run_jianpu_ly(_jianpu_ly_source([[r'1 ^\fermata 2 _\fermata - -']],
+                                                    '1=C', '4/4', 'test'), root)
+            self.assertIn(r'^\fermata', ly)
+            self.assertIn(r'_\fermata', ly)
             self.assertTrue(_render_ly_tile(ly, root)[0].is_file())
 
     @unittest.skipUnless(shutil.which('lilypond'), 'LilyPond is required')

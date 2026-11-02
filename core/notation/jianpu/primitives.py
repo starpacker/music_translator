@@ -322,6 +322,10 @@ def _source_notations(element) -> tuple[str, ...]:
             _log_message('[jianpu] 装饰音附带的升降号未完整表示，请校对。', _logging.WARNING)
         placement = getattr(mark, 'placement', None)
         direction = '^' if placement == 'above' else '_' if placement == 'below' else ''
+        if isinstance(mark, m21expr.Fermata):
+            # MusicXML type describes the glyph orientation. music21 does not
+            # import fermata placement, so use LilyPond's directed script.
+            direction = '_' if mark.type == 'inverted' else '^' if mark.type == 'upright' else direction
         result.append(direction + '\\' + command)
     return tuple(result)
 

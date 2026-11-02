@@ -22,19 +22,26 @@ def _root(path: Path):
 
 
 def remove_continuation_markers_for_parser(path: Path, temporary_dir: Path) -> Path:
-    """Remove layout-only wedge continuations in a temporary parser input.
+    """Prepare a temporary parser input for music21 compatibility.
 
     music21 rejects the valid MusicXML ``continue`` type. Start and stop
     positions are separately read from the untouched original MusicXML.
+    MusicXML defaults an omitted fermata type to upright, whereas music21
+    defaults its Fermata object to inverted. Make that default explicit before
+    parsing so an omitted type remains distinguishable from an inverted one.
     """
     root = _root(path)
-    removed = 0
+    changed = 0
     for parent in root.iter():
         for child in list(parent):
             if child.tag.rsplit('}', 1)[-1] == 'wedge' and child.get('type') == 'continue':
                 parent.remove(child)
-                removed += 1
-    if not removed:
+                changed += 1
+            elif (child.tag.rsplit('}', 1)[-1] == 'fermata'
+                  and child.get('type') is None):
+                child.set('type', 'upright')
+                changed += 1
+    if not changed:
         return path
     out = temporary_dir / '__wedge_continuations_for_parser.musicxml'
     ET.ElementTree(root).write(out, encoding='utf-8', xml_declaration=True)

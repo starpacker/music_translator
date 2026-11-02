@@ -14,8 +14,9 @@ from pathlib import Path
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from music21 import articulations, chord, converter, expressions, note, spanner
+from music21 import articulations, chord, expressions, note, spanner
 from core.notation.jianpu import _get_score_key_tonic, extract_jianpu_measures
+from core.notation.musicxml_wedges import parse_musicxml_compatible
 
 
 _SUPPORTED_MARKS = {
@@ -29,7 +30,7 @@ _SUPPORTED_MARKS = {
 
 
 def audit(path: Path) -> dict:
-    score = converter.parse(str(path))
+    score = parse_musicxml_compatible(path)
     if not score.parts:
         raise ValueError('MusicXML 没有独立声部，无法逐小节比较')
     part = score.parts[0]
@@ -104,8 +105,10 @@ def audit(path: Path) -> dict:
                         for event in canonical_measure.recurse().notesAndRests]
         target_order = ['rest' if event.is_rest else 'note' for event in extracted[index]]
         source_marks = []
+        source_fermatas = []
         for event in canonical_measure.recurse().notesAndRests:
             marks = []
+            fermatas = []
             for mark in (*event.articulations, *event.expressions):
                 name = _SUPPORTED_MARKS.get(type(mark))
                 if name is None:
@@ -113,18 +116,30 @@ def audit(path: Path) -> dict:
                 else:
                     marks.append(name)
                     source_mark_counts[name] += 1
+                    if type(mark) is expressions.Fermata:
+                        fermatas.append(mark.type)
             source_marks.append(sorted(marks))
+            source_fermatas.append(sorted(fermatas))
         target_marks = []
+        target_fermatas = []
         for event in extracted[index]:
             marks = sorted(mark.lstrip('^_').removeprefix('\\') for mark in event.notations)
             target_marks.append(marks)
             jianpu_mark_counts.update(marks)
+            target_fermatas.append(sorted('inverted' if mark.startswith('_') else
+                                           'upright' if mark.startswith('^') else 'unspecified'
+                                           for mark in event.notations
+                                           if mark.lstrip('^_') == r'\fermata'))
         # Empty per-event mark lists can differ merely because an unmarked
         # note or rest is missing; the event comparison already reports that.
         if source_marks != target_marks and (any(source_marks) or any(target_marks)):
             mismatches.append({'index': index + 1, 'measure_number': str(original[index].number),
                                'reason': 'note_mark_placement', 'source_marks': source_marks,
                                'jianpu_marks': target_marks})
+        if source_fermatas != target_fermatas and (any(source_fermatas) or any(target_fermatas)):
+            mismatches.append({'index': index + 1, 'measure_number': str(original[index].number),
+                               'reason': 'fermata_direction', 'source': source_fermatas,
+                               'jianpu': target_fermatas})
         if (source != target or source_rests != target_rests or source_order != target_order
                 or source_rest_tuplets != target_rest_tuplets):
             mismatches.append({'index': index + 1, 'measure_number': str(original[index].number),
