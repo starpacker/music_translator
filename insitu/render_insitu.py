@@ -402,6 +402,118 @@ def _blank_column_runs(page, clip: fitz.Rect) -> list[tuple[float, float]]:
     return runs
 
 
+def _slur_seam(page, clip: fitz.Rect, target_width: float):
+    """Find an empty separator below long curves, if they are the only upper ink.
+
+    The upper band can then be scaled while the lower band retains unscaled
+    digits. Reject ambiguous artwork, cuts through text, and misaligned curve
+    endpoints. All tests use the visible raster; PDF text bboxes alone are too
+    large for LilyPond's music font.
+    """
+    import numpy as np
+
+    if target_width >= clip.width or clip.height < 6 or clip.width < 12:
+        return None
+    drawings = page.get_drawings()
+    curves = [d for d in drawings if d['rect'].intersects(clip)
+              and d['items'] and all(item[0] == 'c' for item in d['items'])
+              and d['rect'].width >= clip.width * .35
+              and d['rect'].y1 < clip.y1 - 2
+              and d['type'] in ('s', 'f')]
+    if not curves:
+        return None
+    bottom = max(d['rect'].y1 for d in curves)
+    scale = 4
+    pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale), clip=clip,
+                          alpha=False, colorspace=fitz.csGRAY)
+    pixels = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.height, pix.stride)[:, :pix.width]
+    # The first and last two points can contain the measure's vertical
+    # barlines, which may safely be divided at the horizontal seam.
+    margin = 2 * scale
+    if pix.width <= 2 * margin:
+        return None
+    start = max(0, int((bottom + .25) * scale) - pix.y)
+    end = min(pix.height - 2, int((bottom + 3) * scale) - pix.y)
+    choices = [i for i in range(start, end) if np.all(pixels[i:i + 2, margin:-margin] >= 245)]
+    if not choices:
+        return None
+    seam = (pix.y + choices[0] + 1) / scale
+    if not clip.y0 + 1 < seam < clip.y1 - 2:
+        return None
+    # Never split a glyph close to the barline edge that was excluded above.
+    for block in page.get_text('rawdict')['blocks']:
+        for line in block.get('lines', []):
+            for span in line.get('spans', []):
+                for char in span['chars']:
+                    box = fitz.Rect(char['bbox'])
+                    if box.y0 < seam < box.y1 and ((box.x1 > clip.x0 and box.x0 < clip.x0 + 2)
+                                                    or (box.x0 < clip.x1 and box.x1 > clip.x1 - 2)):
+                        return None
+    lower = fitz.Rect(clip.x0, seam, clip.x1, clip.y1)
+    gaps = _blank_column_runs(page, lower)
+    capacity = [max(0.0, right - left - 1.5) for left, right in gaps]
+    total = sum(capacity)
+    remove = clip.width - target_width
+    if total < remove + .01:
+        return None
+    # Keep every visible slur endpoint near its associated digit after the
+    # two bands undergo different horizontal mappings.
+    for drawing in curves:
+        for item in drawing['items']:
+            for point in (item[1], item[4]):
+                if clip.x0 < point.x < clip.x1:
+                    removed = 0.0
+                    for (left, right), cap in zip(gaps, capacity):
+                        amount = remove * cap / total
+                        mid = (left + right) / 2
+                        removed += min(amount, max(0.0, point.x - (mid - amount / 2)))
+                    elastic = point.x - clip.x0 - removed
+                    uniform = (point.x - clip.x0) * target_width / clip.width
+                    if abs(elastic - uniform) > 1.0:
+                        return None
+    # Construct a generous mask of the known curves. Any other visible ink in
+    # the upper band makes the separation unsafe, including text and symbols.
+    mask_doc = fitz.open()
+    try:
+        mask_page = mask_doc.new_page(width=page.rect.width, height=page.rect.height)
+        for drawing in curves:
+            shape = mask_page.new_shape()
+            for _, a, b, c, d in drawing['items']:
+                shape.draw_bezier(a, b, c, d)
+            shape.finish(color=(0, 0, 0), fill=(0, 0, 0) if drawing['type'] == 'f' else None,
+                         width=max(1.0, drawing.get('width') or 0), closePath=False)
+            shape.commit()
+        # Include only vertical measure boundaries in the edge mask; other
+        # ink near the clipping edge must still be accounted for.
+        for drawing in drawings:
+            rect = drawing['rect']
+            if (drawing['type'] == 's' and rect.width < 2.5 and rect.height > 12
+                    and min(abs(rect.x0 - clip.x0), abs(rect.x0 - clip.x1)) < 1.5
+                    and drawing['items'] and all(item[0] == 'l' for item in drawing['items'])):
+                shape = mask_page.new_shape()
+                for _, a, b in drawing['items']:
+                    shape.draw_line(a, b)
+                shape.finish(color=(0, 0, 0), width=max(1.0, drawing.get('width') or 0), closePath=False)
+                shape.commit()
+        mask_pix = mask_page.get_pixmap(matrix=fitz.Matrix(scale, scale), clip=clip,
+                                         alpha=False, colorspace=fitz.csGRAY)
+        mask = np.frombuffer(mask_pix.samples, dtype=np.uint8).reshape(mask_pix.height, mask_pix.stride)[:, :mask_pix.width] < 245
+        if mask.shape != pixels.shape:
+            return None
+        # Tolerate small rasterization differences without accepting other ink.
+        expanded = mask.copy()
+        expanded[1:] |= mask[:-1]
+        expanded[:-1] |= mask[1:]
+        expanded[:, 1:] |= mask[:, :-1]
+        expanded[:, :-1] |= mask[:, 1:]
+        seam_row = max(0, min(pix.height, int(seam * scale) - pix.y))
+        if np.any((pixels[:seam_row] < 245) & ~expanded[:seam_row]):
+            return None
+    finally:
+        mask_doc.close()
+    return seam
+
+
 def _place_cell(target_page, source_doc, clip: fitz.Rect, target: fitz.Rect) -> bool:
     """Fit a cell by changing blank gaps, preserving glyph proportions when possible."""
     delta = target.width - clip.width
@@ -409,6 +521,14 @@ def _place_cell(target_page, source_doc, clip: fitz.Rect, target: fitz.Rect) -> 
     if abs(delta) < 0.1:
         target_page.show_pdf_page(target, source_doc, 0, clip=clip, keep_proportion=False)
         return True
+    if delta < 0 and sum(max(0.0, right - left - 1.5) for left, right in gaps) < -delta - .01:
+        seam = _slur_seam(source_doc[0], clip, target.width)
+        if seam is not None:
+            dest_y = target.y0 + (seam - clip.y0) * target.height / clip.height
+            target_page.show_pdf_page(fitz.Rect(target.x0, target.y0, target.x1, dest_y), source_doc, 0,
+                                     clip=fitz.Rect(clip.x0, clip.y0, clip.x1, seam), keep_proportion=False)
+            return _place_cell(target_page, source_doc, fitz.Rect(clip.x0, seam, clip.x1, clip.y1),
+                               fitz.Rect(target.x0, dest_y, target.x1, target.y1))
     if delta > 0 and gaps:
         cuts = [clip.x0, *[(left + right) / 2 for left, right in gaps], clip.x1]
         shift = 0.0
