@@ -32,6 +32,14 @@ from _env import ensure_sumisora
 HERE = Path(__file__).resolve().parent
 
 
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open('rb') as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b''):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 # ── 步骤 1：OMR ──────────────────────────────────────────────────────────────
 
 def omr_to_musicxml(score_pdf: Path, work: Path, use_gpu: Optional[bool] = None) -> Path:
@@ -105,8 +113,6 @@ def omr_to_musicxml(score_pdf: Path, work: Path, use_gpu: Optional[bool] = None)
 
 def recover_pdf_tempos(score_pdf: Path, mxl: Path, work: Path, stem: str) -> Path:
     """Use verifiable PDF tempo marks in a derived XML, leaving the input intact."""
-    from core.omr.vector_tempos import discover_pdf_tempos, write_enriched_tempos
-
     report_path = work / f'{stem}.pdf-tempos.json'
     enriched = work / f'{stem}.pdf-tempos.musicxml'
     protected_paths = {mxl.resolve(), score_pdf.resolve()}
@@ -115,19 +121,14 @@ def recover_pdf_tempos(score_pdf: Path, mxl: Path, work: Path, stem: str) -> Pat
     while enriched.resolve() in protected_paths:
         enriched = enriched.with_name(enriched.stem + '.derived.musicxml')
     try:
+        from core.omr.vector_tempos import discover_pdf_tempos, write_enriched_tempos
         candidates, decisions = discover_pdf_tempos(score_pdf, mxl)
         inserted, skipped = (write_enriched_tempos(mxl, enriched, candidates)
                              if candidates else ([], []))
-        def digest(path):
-            h = hashlib.sha256()
-            with path.open('rb') as source:
-                for chunk in iter(lambda: source.read(1024 * 1024), b''):
-                    h.update(chunk)
-            return h.hexdigest()
         report_path.write_text(json.dumps({'source_pdf': str(score_pdf),
-                                          'source_pdf_sha256': digest(score_pdf),
+                                          'source_pdf_sha256': _sha256_file(score_pdf),
                                           'source_musicxml': str(mxl),
-                                          'source_musicxml_sha256': digest(mxl),
+                                          'source_musicxml_sha256': _sha256_file(mxl),
                                           'inserted': inserted, 'skipped': skipped,
                                           'decisions': decisions}, ensure_ascii=False, indent=2),
                                encoding='utf-8')
@@ -141,8 +142,57 @@ def recover_pdf_tempos(score_pdf: Path, mxl: Path, work: Path, stem: str) -> Pat
             print(f'[jianpu] {len(skipped)} 个候选未写入（例如该小节已有速度），请参阅 {report_path}。')
         return enriched if inserted else mxl
     except Exception as exc:
+        try:
+            report_path.write_text(json.dumps({'source_pdf': str(score_pdf), 'source_musicxml': str(mxl),
+                                               'inserted': [], 'error': str(exc)}, ensure_ascii=False, indent=2),
+                                   encoding='utf-8')
+        except Exception:
+            pass
         print(f'[jianpu] PDF 速度标记恢复失败，保留原始识谱结果继续：{exc}')
         return mxl
+
+
+def recover_pdf_dynamics(score_pdf: Path, source_mxl: Path, input_mxl: Path, work: Path, stem: str) -> Path:
+    """Add font- and notehead-verified dynamics to another derived XML."""
+    report_path = work / f'{stem}.pdf-dynamics.json'
+    enriched = work / f'{stem}.pdf-dynamics.musicxml'
+    protected = {score_pdf.resolve(), source_mxl.resolve(), input_mxl.resolve()}
+    while report_path.resolve() in protected:
+        report_path = report_path.with_name(report_path.stem + '.report.json')
+    while enriched.resolve() in protected:
+        enriched = enriched.with_name(enriched.stem + '.derived.musicxml')
+    try:
+        from core.omr.vector_dynamics import discover_pdf_dynamics, write_enriched_dynamics
+        candidates, decisions = discover_pdf_dynamics(score_pdf, source_mxl)
+        inserted, skipped = (write_enriched_dynamics(input_mxl, enriched, candidates)
+                             if candidates else ([], []))
+        report_path.write_text(json.dumps({'source_pdf': str(score_pdf),
+                                           'source_pdf_sha256': _sha256_file(score_pdf),
+                                           'source_musicxml': str(source_mxl),
+                                           'source_musicxml_sha256': _sha256_file(source_mxl),
+                                           'input_musicxml': str(input_mxl),
+                                           'input_musicxml_sha256': _sha256_file(input_mxl),
+                                           'inserted': inserted, 'skipped': skipped,
+                                           'decisions': decisions}, ensure_ascii=False, indent=2),
+                               encoding='utf-8')
+        if inserted:
+            print(f'[jianpu] 从 PDF 字体和音符位置恢复 {len(inserted)} 个力度记号'
+                  f'（推断结果，请核对；原始 MusicXML 未修改，详情：{report_path}）')
+        unresolved = sum(1 for item in decisions if item.get('reason') != 'verified_candidate')
+        if unresolved:
+            print(f'[jianpu] {unresolved} 个 PDF 力度记号无法可靠定位，请参阅 {report_path} 校对。')
+        if skipped:
+            print(f'[jianpu] {len(skipped)} 个力度候选未写入，请参阅 {report_path}。')
+        return enriched if inserted else input_mxl
+    except Exception as exc:
+        try:
+            report_path.write_text(json.dumps({'source_pdf': str(score_pdf), 'source_musicxml': str(source_mxl),
+                                               'input_musicxml': str(input_mxl), 'inserted': [],
+                                               'error': str(exc)}, ensure_ascii=False, indent=2), encoding='utf-8')
+        except Exception:
+            pass
+        print(f'[jianpu] PDF 力度记号恢复失败，保留已有识谱结果继续：{exc}')
+        return input_mxl
 
 
 def musicxml_to_jianpu(mxl: Path, out_pdf: Path, title: Optional[str] = None) -> Path:
@@ -211,6 +261,8 @@ def main(argv: list[str]) -> int:
     ap.add_argument('--mxl', type=Path, default=None, help='已有的 MusicXML（跳过 OMR）')
     ap.add_argument('--no-vector-tempos', action='store_true',
                     help='不从 PDF 矢量文字推断速度记号')
+    ap.add_argument('--no-vector-dynamics', action='store_true',
+                    help='不从 PDF 字体和音符位置推断力度记号')
     ap.add_argument('--work', type=Path, default=None,
                     help='OMR 中间结果目录（默认 <输出目录>/work）')
     ap.add_argument('--title', default=None, help='标题（默认取输入文件名）')
@@ -237,6 +289,8 @@ def main(argv: list[str]) -> int:
     jianpu_mxl = mxl
     if not args.no_vector_tempos and (args.mode in ('jianpu', 'both') or args.engine == 'strip'):
         jianpu_mxl = recover_pdf_tempos(score, mxl, work, base.name)
+    if not args.no_vector_dynamics and (args.mode in ('jianpu', 'both') or args.engine == 'strip'):
+        jianpu_mxl = recover_pdf_dynamics(score, mxl, jianpu_mxl, work, base.name)
 
     if args.mode in ('jianpu', 'both'):
         musicxml_to_jianpu(jianpu_mxl, base.parent / f'{base.name}.jianpu.pdf', title)

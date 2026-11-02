@@ -48,8 +48,8 @@ def _page_marks(page):
     return tempos, heads, numbers
 
 
-def _matched_first_note_x(measure, staff, left, right, heads):
-    """Match every notehead's order and diatonic position, or return None."""
+def _matched_note_events(measure, staff, left, right, heads):
+    """Match every notehead to its event and offset, or return None."""
     own_clefs = list(measure.recurse().getElementsByClass(clef.Clef))
     current = own_clefs[0] if own_clefs else measure.getContextByClass(clef.Clef)
     if type(current) is not clef.TrebleClef or getattr(current, 'octaveChange', 0):
@@ -57,20 +57,15 @@ def _matched_first_note_x(measure, staff, left, right, heads):
     events = list(measure.recurse().notes)
     if not events:
         return None
-    if abs(float(events[0].getOffsetInHierarchy(measure))) > 1e-7:
-        # A mark on the first pitched event after a leading rest is not
-        # necessarily a measure-start mark.
-        return None
     predicted = []
-    first_count = 0
-    for index, event in enumerate(events):
+    sizes = []
+    for event in events:
         event_pitches = getattr(event, 'pitches', ())
         if not event_pitches or any(p.octave is None or p.step not in ('C', 'D', 'E', 'F', 'G', 'A', 'B')
                                     for p in event_pitches):
             return None
         pitches = sorted(event_pitches, key=lambda p: -(p.octave * 7 + 'CDEFGAB'.index(p.step)))
-        if index == 0:
-            first_count = len(pitches)
+        sizes.append(len(pitches))
         for pitch in pitches:
             diatonic = pitch.octave * 7 + 'CDEFGAB'.index(pitch.step)
             predicted.append(staff.bottom - (diatonic - 30) * staff.line_spacing / 2)
@@ -84,9 +79,25 @@ def _matched_first_note_x(measure, staff, left, right, heads):
     if any(abs(y - target) > max(.8, staff.line_spacing * .2)
            for (_, y), target in zip(observed, predicted)):
         return None
-    if first_count > 1 and observed[first_count - 1][0] - observed[0][0] > 2 * staff.line_spacing:
+    result = []
+    cursor = 0
+    for event, count in zip(events, sizes):
+        group = observed[cursor:cursor + count]
+        if count > 1 and group[-1][0] - group[0][0] > 2 * staff.line_spacing:
+            return None
+        result.append((tuple(x for x, _ in group), event.getOffsetInHierarchy(measure),
+                       bool(event.duration.isGrace)))
+        cursor += count
+    return result
+
+
+def _matched_first_note_x(measure, staff, left, right, heads):
+    events = _matched_note_events(measure, staff, left, right, heads)
+    if not events or abs(float(events[0][1])) > 1e-7:
+        # A mark on the first pitched event after a leading rest is not
+        # necessarily a measure-start mark.
         return None
-    return observed[0][0], observed[first_count][0] if first_count < len(observed) else None
+    return events[0][0][0], events[1][0][0] if len(events) > 1 else None
 
 
 def _matched_multirest_x(page, measure, staff, left, right, numbers):
