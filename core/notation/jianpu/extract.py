@@ -43,11 +43,8 @@ def _element_duration(item) -> float:
 def strip_grace_notes(score) -> int:
     """Remove grace notes from *score* in place and return how many were removed.
 
-    Jianpu output has no grace-note notation, and the extractors treat every note
-    as sounding: a grace note left in is laid out as an extra note and pushes the
-    rest of its measure off the beat. music21's MIDI export mishandles them too (the
-    first one sounds for a full beat and shifts everything after it; the rest are
-    dropped), so the renderer strips them before writing either.
+    Used on a separate MIDI copy because music21's MIDI export mishandles grace
+    duration. The Jianpu extractor keeps them as zero-time ornaments.
     """
     removed = 0
     for container in score.recurse(streamsOnly=True, includeSelf=True):
@@ -179,29 +176,6 @@ def _extract_part_repeat_barlines(part) -> dict[int, dict[str, bool]]:
         has_end   = isinstance(rb, m21bar.Repeat) and getattr(rb, 'direction', None) == 'end'
         if has_start or has_end:
             result[i] = {'start': has_start, 'end': has_end}
-
-    # Validate: drop repeat sections that span too few notes (likely Audiveris false positives).
-    # Pair each start-repeat measure with the nearest following end-repeat measure;
-    # if the section contains fewer than 4 non-rest notes, discard the entire pair.
-    _MIN_NOTES = 4
-    starts = sorted(mi for mi, f in result.items() if f.get('start'))
-    ends   = sorted(mi for mi, f in result.items() if f.get('end'))
-    _used_ends: set[int] = set()
-    _drop: set[int] = set()
-    for _s in starts:
-        _e = next((x for x in ends if x >= _s and x not in _used_ends), None)
-        if _e is not None:
-            _used_ends.add(_e)
-            _note_count = sum(
-                1 for _mi in range(_s, min(_e + 1, len(measures)))
-                for _el in measures[_mi].flatten().notesAndRests
-                if not getattr(_el, 'isRest', True)
-            )
-            if _note_count < _MIN_NOTES:
-                _drop.add(_s)
-                _drop.add(_e)
-    for _mi in _drop:
-        result.pop(_mi, None)
 
     return result
 

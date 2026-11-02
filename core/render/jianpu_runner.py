@@ -513,13 +513,11 @@ def _inject_barlines_into_voice_block(block: str, repeat_info: 'dict[int, dict[s
         elif has_start:
             injections.append((m.end(), f' {_START}'))
 
-    if matches:
-        last_N = max(int(m.group(1)) for m in matches)
-        last_mi = last_N - 1
-        if repeat_info.get(last_mi, {}).get('end', False):
-            final_m = re.search(r'\|\s*\\bar\s*"\|\."\s*$', block.rstrip())
-            if final_m:
-                injections.append((final_m.start(), f'{_END} '))
+    last_mi = max((int(m.group(1)) - 1 for m in matches), default=0)
+    if repeat_info.get(last_mi, {}).get('end', False):
+        final_m = re.search(r'\|\s*\\bar\s*"\|\."\s*$', block.rstrip())
+        if final_m:
+            injections.append((final_m.start(), f'{_END} '))
 
     result = block
     for pos, text in sorted(injections, key=lambda x: x[0], reverse=True):

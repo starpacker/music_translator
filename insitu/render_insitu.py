@@ -58,7 +58,9 @@ from core.notation.jianpu import (  # noqa: E402
     _with_time_signatures,
     extract_jianpu_measures,
     _get_score_key_tonic,
+    _extract_part_repeat_barlines,
 )
+from core.render.jianpu_runner import _insert_repeat_bar_commands  # noqa: E402
 from music21 import converter  # noqa: E402
 
 from align import align_from_files  # noqa: E402
@@ -242,6 +244,7 @@ def build(pdf_path: Path, mxl_path: Path, out_path: Path,
     score = converter.parse(str(mxl_path))
     tonic, key_header = _get_score_key_tonic(score)
     measures, time_sig = extract_jianpu_measures(score, tonic)
+    repeat_bars = _extract_part_repeat_barlines(score.parts[0]) if score.parts else {}
     if title is None:
         title = pdf_path.stem
 
@@ -267,6 +270,9 @@ def build(pdf_path: Path, mxl_path: Path, out_path: Path,
             workdir.mkdir(parents=True, exist_ok=True)
             ly_text = _run_jianpu_ly(
                 _jianpu_ly_source([chunk], line_key, time_sig, title), workdir)
+            local_repeats = {index - sl.omr_start: info for index, info in repeat_bars.items()
+                             if sl.omr_start <= index < sl.omr_end}
+            ly_text = _insert_repeat_bar_commands(ly_text, local_repeats)
             tile_pdf, ink = _render_ly_tile(ly_text, workdir)
         except Exception as exc:                       # keep the rest of the run
             print(f'  ! staff {sl.staff_index}: {exc}')

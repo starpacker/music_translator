@@ -8,6 +8,7 @@ import shutil
 from pathlib import Path
 from music21 import meter, note, stream
 from core.notation.jianpu import extract_jianpu_measures, jianpu_note_token
+from core.notation.jianpu.primitives import build_lyric_lines
 from core.notation.jianpu.measure import measure_units
 
 
@@ -40,3 +41,16 @@ class GraceNoteTest(unittest.TestCase):
                 render = subprocess.run(['lilypond', '-o', str(Path(tmp) / 'score'), str(ly)],
                                         capture_output=True, text=True, env={**os.environ, 'TMPDIR': tmp})
                 self.assertEqual(render.returncode, 0, render.stderr)
+
+    def test_graces_do_not_consume_lyric_syllables(self):
+        score = stream.Score()
+        part = stream.Part()
+        measure = stream.Measure(number=1)
+        measure.insert(0, note.Note('D4').getGrace())
+        main = note.Note('C4', quarterLength=4)
+        main.lyric = 'la'
+        measure.insert(0, main)
+        part.append(measure)
+        score.insert(0, part)
+        measures, _ = extract_jianpu_measures(score, 0)
+        self.assertEqual(build_lyric_lines(measures), ['L: la'])

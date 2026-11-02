@@ -221,7 +221,8 @@ def build_lyric_lines(measures: 'list[list[JianpuNote]]') -> list[str]:
     if not ENABLE_LYRICS_OUTPUT:
         return []
 
-    non_rest = [note for measure in measures for note in measure if not note.is_rest]
+    non_rest = [note for measure in measures for note in measure
+                if not note.is_rest and not getattr(note, 'is_grace', False)]
     verses: set[int] = set()
     for note in non_rest:
         verses.update(note.lyrics.keys())
