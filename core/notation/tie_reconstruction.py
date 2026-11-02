@@ -485,7 +485,7 @@ def _add_tie_to_note(note_elem: ET.Element, tie_type: str, ns: str) -> bool:
 
 # ─── 公开 API ─────────────────────────────────────────────────────────────────
 
-def reconstruct_ties_in_musicxml(xml_path: Path) -> int:
+def reconstruct_ties_in_musicxml(xml_path: Path, *, paired_slurs_only: bool = False) -> int:
     """解析 MusicXML 文件，重建延音线，原地写回。返回新增的 tie 对数。"""
     try:
         tree = ET.parse(str(xml_path))
@@ -525,6 +525,18 @@ def reconstruct_ties_in_musicxml(xml_path: Path) -> int:
             # 同一 tick 的重复音高（记谱错误）跳过
             if a.start_tick == b.start_tick:
                 continue
+
+            if paired_slurs_only:
+                # Only reinterpret an unambiguous, numbered pair of curves.
+                # Keep unmatched and overlapping slurs for manual review.
+                a_notations = a.element.find(f'{ns}notations')
+                b_notations = b.element.find(f'{ns}notations')
+                starts = ([s.get('number', '1') for s in a_notations.findall(f'{ns}slur')
+                           if s.get('type') == 'start'] if a_notations is not None else [])
+                stops = ([s.get('number', '1') for s in b_notations.findall(f'{ns}slur')
+                          if s.get('type') == 'stop'] if b_notations is not None else [])
+                if len(starts) != 1 or len(stops) != 1 or starts[0] != stops[0]:
+                    continue
 
             decision = _decide(a, b)
 

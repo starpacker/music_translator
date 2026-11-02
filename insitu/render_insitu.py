@@ -104,7 +104,7 @@ def _line_slur_continuations(measures, start: int, end: int):
         for event in measure:
             active = max(0, active - event.slur_stops) + event.slur_starts
     audible = [event for measure in line for event in measure
-               if not event.is_rest and not event.is_grace and event.symbol != '-']
+               if not event.is_rest and not event.is_grace]
     if audible:
         audible[0].slur_carry_in += entering
         audible[-1].slur_carry_out += active

@@ -319,12 +319,9 @@ def extract_jianpu_measures(score, key_tonic_semitone: int = 0,
                 flags[0] += int(slur.isFirst(source_note))
                 flags[1] += int(slur.isLast(source_note))
 
-        # 合并同小节延音线（cross-measure tie-stop 音符在本小节内无对应 start，
-        # stripTies 会保留其时值不变；仅合并同小节内的 start→stop 对）
-        try:
-            measure_src = measure.stripTies()
-        except Exception:
-            measure_src = measure
+        # Keep tied fragments separate: merging can create a duration such as
+        # 2.5 quarters that one Jianpu token cannot express, causing truncation.
+        measure_src = measure
 
         # 简谱为单声部格式；使用 _voice_id 参数选取目标声部。
         # 单声部模式下 _voice_id='1'，多声部渲染时由调用方传入具体 ID。
@@ -382,17 +379,13 @@ def extract_jianpu_measures(score, key_tonic_semitone: int = 0,
             # 渲染为延音 dash（'-'），而非独立音符或休止符。
             _tie = getattr(element, 'tie', None)
             if _tie is not None and _tie.type in ('stop', 'continue'):
-                cont_dur = normalize_jianpu_duration(float(element.duration.quarterLength or 1.0))
-                cont = JianpuNote(
-                    symbol='-',
-                    accidental='',
-                    upper_dots=0,
-                    lower_dots=0,
-                    duration=cont_dur,
-                    duration_dots=infer_duration_dots(cont_dur),
-                    midi=None,
-                    is_rest=False,
-                )
+                cont = note_to_jianpu(element, key_tonic_semitone)
+                pitches = (cont.midi, *[p[4] for p in cont.chord_notes])
+                starts, stops = slur_boundaries.pop((round(offset, 7), pitches), (0, 0))
+                cont.slur_starts, cont.slur_stops = starts, stops
+                cont.symbol, cont.accidental = '-', ''
+                cont.upper_dots = cont.lower_dots = 0
+                cont.midi, cont.chord_notes, cont.lyrics = None, (), {}
                 existing = by_offset.get(offset)
                 if existing is None:
                     by_offset[offset] = [cont]

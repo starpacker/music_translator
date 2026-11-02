@@ -51,7 +51,8 @@ def omr_to_musicxml(score_pdf: Path, work: Path, use_gpu: Optional[bool] = None)
     pipeline.update((HERE / 'homr_shim.py').read_bytes())
     for name in ('core/config.py', 'core/utils.py', 'core/omr/homr_runner.py',
                  'core/omr/multirest_collapse.py', 'core/omr/vector_whole_chords.py',
-                 'core/image/image_preprocess.py', 'core/image/sr_upscale.py'):
+                 'core/image/image_preprocess.py', 'core/image/sr_upscale.py',
+                 'core/notation/tie_reconstruction.py'):
         pipeline.update((root / name).read_bytes())
     expected = {'source_sha256': digest.hexdigest(), 'gpu': use_gpu,
                 'pipeline_sha256': pipeline.hexdigest(),
@@ -83,8 +84,17 @@ def omr_to_musicxml(score_pdf: Path, work: Path, use_gpu: Optional[bool] = None)
     if mxl is None:
         raise RuntimeError(f'OMR 没有产生 MusicXML（{out_dir}）')
     shutil.copy2(mxl, cached)
-    if (Path(res) / '.partial-omr').exists():
-        print('[omr] 警告：识谱结果不完整，本次继续生成，但不作为完整结果缓存。')
+    ties_ok = True
+    try:
+        from core.notation.tie_reconstruction import reconstruct_ties_in_musicxml
+        ties = reconstruct_ties_in_musicxml(cached, paired_slurs_only=True)
+        if ties:
+            print(f'[omr] 从成对同音曲线恢复 {ties} 对延音线（原始识谱文件仍保留在 work 中）')
+    except Exception as exc:
+        ties_ok = False
+        print(f'[omr] 延音线恢复失败，保留原始识谱结果继续：{exc}')
+    if (Path(res) / '.partial-omr').exists() or not ties_ok:
+        print('[omr] 警告：识谱或后处理不完整，本次继续生成，但不作为完整结果缓存。')
     else:
         metadata.write_text(json.dumps(expected, ensure_ascii=False, indent=2), encoding='utf-8')
     print(f'[omr] -> {cached}')

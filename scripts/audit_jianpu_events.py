@@ -33,39 +33,47 @@ def audit(path: Path) -> dict:
                 and not any(getattr(event.duration, 'isGrace', False) for event in (ends[0], ends[-1]))):
             comparable_slurs.append(slur)
     mismatches = []
+    previous_pitches = None
     for index in range(max(len(original), len(extracted))):
         if index >= len(original) or index >= len(extracted):
             mismatches.append({'index': index + 1, 'reason': 'measure_count'})
             continue
         source = []
-        for event in original[index].recurse().notes:
+        canonical_measure = original[index]
+        for event in canonical_measure.recurse().notes:
             pitches = (sorted(p.midi for p in event.pitches)
                        if isinstance(event, chord.Chord) else [event.pitch.midi])
             source.append({'pitches': pitches, 'duration': round(float(event.duration.quarterLength), 6),
                            'grace': bool(event.duration.isGrace),
+                           'continuation': bool(event.tie and event.tie.type in ('stop', 'continue')),
                            'tuplets': [[t.numberNotesActual, t.numberNotesNormal]
                                        for t in event.duration.tuplets]})
         target = []
         for event in extracted[index]:
-            if event.is_rest or event.symbol == '-':
+            if event.is_rest:
+                previous_pitches = None
                 continue
-            target.append({'pitches': [event.midi, *[p[4] for p in event.chord_notes]],
+            continuation = event.symbol == '-'
+            pitches = previous_pitches if continuation else [event.midi, *[p[4] for p in event.chord_notes]]
+            target.append({'pitches': pitches,
                            'duration': round(float(event.duration), 6), 'grace': event.is_grace,
+                           'continuation': continuation,
                            'tuplets': ([[event.tuplet_actual, event.tuplet_normal]]
                                        if event.tuplet_actual else [])})
+            if not event.is_grace and not continuation:
+                previous_pitches = pitches
         source_rests = [round(float(event.duration.quarterLength), 6)
-                        for event in original[index].recurse().notesAndRests
+                        for event in canonical_measure.recurse().notesAndRests
                         if isinstance(event, note.Rest)]
         target_rests = [round(float(event.duration), 6) for event in extracted[index] if event.is_rest]
         source_rest_tuplets = [[[t.numberNotesActual, t.numberNotesNormal] for t in event.duration.tuplets]
-                               for event in original[index].recurse().notesAndRests
+                               for event in canonical_measure.recurse().notesAndRests
                                if isinstance(event, note.Rest)]
         target_rest_tuplets = [([[event.tuplet_actual, event.tuplet_normal]] if event.tuplet_actual else [])
                                for event in extracted[index] if event.is_rest]
         source_order = ['rest' if isinstance(event, note.Rest) else 'note'
-                        for event in original[index].recurse().notesAndRests]
-        target_order = ['rest' if event.is_rest else 'note' for event in extracted[index]
-                        if event.symbol != '-']
+                        for event in canonical_measure.recurse().notesAndRests]
+        target_order = ['rest' if event.is_rest else 'note' for event in extracted[index]]
         if (source != target or source_rests != target_rests or source_order != target_order
                 or source_rest_tuplets != target_rest_tuplets):
             mismatches.append({'index': index + 1, 'measure_number': str(original[index].number),
@@ -83,6 +91,10 @@ def audit(path: Path) -> dict:
             'source_measures': len(original), 'jianpu_measures': len(extracted),
             'comparable_melodic_slurs': len(comparable_slurs),
             'jianpu_slur_starts': starts, 'jianpu_slur_stops': stops,
+            'source_tie_continuations': sum(1 for event in part.recurse().notes
+                                            if event.tie and event.tie.type in ('stop', 'continue')),
+            'jianpu_tie_continuations': sum(1 for measure in extracted for event in measure
+                                            if event.symbol == '-'),
             'mismatch_count': len(mismatches), 'mismatches': mismatches}
 
 

@@ -3,12 +3,30 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
-from music21 import meter, note, stream
+from music21 import meter, note, stream, tie
 from scripts.audit_jianpu_events import audit
 from core.notation.jianpu import extract_jianpu_measures
 
 
 class EventAuditTest(unittest.TestCase):
+    def test_same_and_cross_measure_ties_are_audited(self):
+        score, part = stream.Score(), stream.Part()
+        first, second, third = (stream.Measure(number=n) for n in (1, 2, 3))
+        first.insert(0, meter.TimeSignature('4/4'))
+        def tied(pitch, length, kind):
+            event = note.Note(pitch, quarterLength=length)
+            event.tie = tie.Tie(kind)
+            return event
+        first.append([tied('C4', 2, 'start'), tied('C4', 2, 'stop')])
+        second.append(tied('D4', 4, 'start'))
+        third.append(tied('D4', 4, 'stop'))
+        part.append([first, second, third])
+        score.insert(0, part)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'score.musicxml'
+            score.write('musicxml', fp=path)
+            self.assertEqual(audit(path)['mismatch_count'], 0)
+
     def test_reports_missing_rest(self):
         score = stream.Score()
         part = stream.Part()

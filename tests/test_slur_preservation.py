@@ -6,13 +6,32 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from music21 import meter, note, spanner, stream
+from music21 import meter, note, spanner, stream, tie
 from core.notation.jianpu import extract_jianpu_measures, jianpu_note_token
 from core.notation.jianpu.measure import measure_units
 from scripts.audit_jianpu_events import audit
 
 
 class SlurPreservationTest(unittest.TestCase):
+    def test_slur_can_begin_on_tied_continuation(self):
+        score, part = stream.Score(), stream.Part()
+        first, second = stream.Measure(number=1), stream.Measure(number=2)
+        first.insert(0, meter.TimeSignature('4/4'))
+        start = note.Note('C4', quarterLength=4)
+        start.tie = tie.Tie('start')
+        continuation = note.Note('C4', quarterLength=2)
+        continuation.tie = tie.Tie('stop')
+        end = note.Note('D4', quarterLength=2)
+        first.append(start)
+        second.append([continuation, end])
+        part.append([first, second])
+        score.insert(0, part)
+        score.insert(0, spanner.Slur(continuation, end))
+        measures, _ = extract_jianpu_measures(score, 0)
+        self.assertEqual(measures[1][0].symbol, '-')
+        self.assertEqual(measures[1][0].slur_starts, 1)
+        self.assertEqual(measures[1][1].slur_stops, 1)
+
     def test_cross_line_slur_is_closed_and_reopened_without_mutating_source(self):
         if not shutil.which('lilypond'):
             self.skipTest('LilyPond is required by the in-situ renderer')
