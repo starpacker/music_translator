@@ -12,6 +12,19 @@ instrument names on the first system) while continuation systems share a
 common x0.  The x0 also tells us which vertical lines really are barlines of
 *this* staff rather than a neighbouring staff's (e.g. a second instrument) or a
 marking such as a rehearsal letter.
+
+Engraving scale
+---------------
+A source can be engraved at any size; the bundled 梆笛 score uses a 5.13pt
+staff space while the same music re-engraved at 72% has 3.72pt.  Every
+tolerance below is a distance on the page, so a tolerance tuned for one size
+silently rejects the other: with a point-valued barline test the 3.72pt score
+yielded *zero* staves and the in-situ PDF was an empty copy of the source.
+
+All scale-dependent values therefore live in `StaffMetrics`, derived from the
+measured `Staff.line_spacing`.  The reference engraving (`REFERENCE_SPACING`)
+is the 梆笛 score; multipliers are its calibration values expressed per staff
+space, following the same convention as `core/omr/vector_*.py`.
 """
 from __future__ import annotations
 
@@ -20,35 +33,100 @@ from typing import Optional
 
 import pymupdf as fitz
 
-# MuseScore's Maestro font encodes digits in the private use area.
-_PUA_DIGIT = {chr(0xF030 + i): str(i) for i in range(10)}
-# A printed multi-measure-rest count sits this far above the staff's top rule.
-_REST_COUNT_TOP = 33.0
-_REST_COUNT_BOTTOM = 40.0
+# The staff space of the engraving every multiplier below was calibrated on.
+REFERENCE_SPACING = 5.13
 
+# Accepted staff space range.  A piano-style brace, a beam cluster or a row of
+# ledger lines also produces horizontal rules, but their spacing falls outside
+# this band.  The 3.72pt source sits comfortably inside it; the old 4.0pt floor
+# was an artefact of calibrating on the 5.13pt score only.
+_STAFF_LINE_SPACING_MIN = 2.0
+_STAFF_LINE_SPACING_MAX = 6.5
 # Two horizontal rules belong to the same staff when they sit no more than this
-# far apart.  Real staff line spacing is 5.1-5.2pt; the next staff's first rule
-# is >50pt away, so anything in between works; 7.0 leaves comfortable margin
-# while still refusing to fuse two distinct systems.
-_STAFF_LINE_MAX_GAP = 7.0
+# far apart.  Must stay above the largest accepted staff space (so one staff is
+# never split) and below the distance between systems (always > 50pt).
+_STAFF_LINE_MAX_GAP = _STAFF_LINE_SPACING_MAX * 1.35
 # A rule has to be at least this long to be a staff line rather than a ledger
-# line, a beam, or a barline fragment.
+# line, a beam, or a barline fragment.  This is a page-scale measure, not a
+# staff-scale one, so it stays in points.
 _MIN_STAFF_LINE_LEN = 200.0
 # Same line spacing across all rules of one staff (used to validate 5 lines).
 _MIN_RULES_PER_STAFF = 5
-# A vertical rule counts as a barline when it spans at least this fraction of
-# the staff height, measured from the top rule down.
-# Barlines are drawn from exactly the top rule to exactly the bottom rule;
-# this tolerance absorbs sub-point rounding in the segment endpoints.
-_BARLINE_TOL = 0.6
-_BARLINE_TOP_TOL = 0.20
-# MuseScore overshoots the bottom staff rule by exactly this much when stroking
-# a barline.  Measured on all three source scores: 507/507 barlines start at
-# offset 0.00 from the top rule and end at +0.24 from the bottom rule.
-_BARLINE_OVERSHOOT = 0.24
-# Two vertical strokes closer than this are one barline (repeat barlines are a
-# thin+thick pair ~3-4pt apart).  Real barlines are >40pt apart.
-_BARLINE_MERGE = 5.5
+
+# MuseScore's music fonts encode digits in the private use area; Maestro is
+# MuseScore 3, Opus is MuseScore 4.  Only digit runs inside the multi-measure
+# rest-count band are used, so time signatures and note-adjacent numbers are
+# ignored regardless of the font.
+_PUA_DIGIT = {chr(0xF030 + i): str(i) for i in range(10)}
+_MUSIC_FONT_PREFIXES = ("Maestro", "Opus")
+# Measure numbers use Times New Roman Italic in both MuseScore 3 and 4 exports.
+_MEASURE_NUMBER_FONT = "TimesNewRomanPS-Italic"
+
+
+@dataclass(frozen=True)
+class StaffMetrics:
+    """Every staff-scale-dependent tolerance, derived from one staff space.
+
+    Multipliers are written relative to the staff space (`s`).  The comment on
+    each field gives the value measured on the reference 5.13pt engraving.
+    """
+    line_spacing: float
+
+    # Barline endpoints.  A barline is drawn from exactly the top rule to the
+    # bottom rule plus a small overshoot; sub-point rounding is proportional to
+    # the engraving scale.
+    barline_top_tol: float        # 0.20pt
+    barline_tol: float            # 0.60pt
+    barline_overshoot: float      # 0.24pt
+    barline_x_margin: float       # 2.0pt  beyond the staff's x-extent
+    barline_merge: float          # 5.5pt  thin+thick repeat pair is one barline
+
+    # Printed multi-measure-rest count above the staff.  Time signatures sit
+    # 14-25pt above the reference staff, rest counts 33-40pt.
+    rest_count_top: float         # 33.0pt
+    rest_count_bottom: float      # 40.0pt
+    rest_inset_left: float        # 4.0pt  keep the count inside its own box
+    rest_inset_right: float       # 2.0pt
+
+    # Measure-number ruler in the left margin.
+    measure_number_top: float     # 60.0pt above the staff top
+    measure_number_margin: float  # 2.0pt  around the staff's left edge
+
+    # System-opening repeat bar: a thick stroke just right of the clef.
+    repeat_stroke_max_width: float   # 1.2pt
+    repeat_stroke_min_height: float  # 8.0pt
+    repeat_top_tol: float            # 1.0pt (stroke starts on the top rule)
+    repeat_margin: float             # 45.0pt from the staff's left edge
+    repeat_merge: float              # 8.0pt  near the first barline
+
+    # Space above the first staff / below the last one that belongs to page
+    # furniture (title block, page number) rather than to the music.
+    page_furniture_margin: float  # 38.0pt
+
+    @classmethod
+    def from_spacing(cls, line_spacing: float) -> "StaffMetrics":
+        """Derive the tolerances for a staff with the given line spacing."""
+        s = line_spacing if line_spacing and line_spacing > 0 else REFERENCE_SPACING
+        return cls(
+            line_spacing=s,
+            barline_top_tol=0.04 * s,
+            barline_tol=0.12 * s,
+            barline_overshoot=0.047 * s,
+            barline_x_margin=0.4 * s,
+            barline_merge=1.07 * s,
+            rest_count_top=6.43 * s,
+            rest_count_bottom=7.80 * s,
+            rest_inset_left=0.78 * s,
+            rest_inset_right=0.39 * s,
+            measure_number_top=11.7 * s,
+            measure_number_margin=max(1.0, 0.4 * s),
+            repeat_stroke_max_width=0.23 * s,
+            repeat_stroke_min_height=1.56 * s,
+            repeat_top_tol=0.20 * s,
+            repeat_margin=8.8 * s,
+            repeat_merge=1.56 * s,
+            page_furniture_margin=7.4 * s,
+        )
 
 
 @dataclass
@@ -68,6 +146,11 @@ class Staff:
     @property
     def center(self) -> float:
         return (self.top + self.bottom) / 2.0
+
+    @property
+    def metrics(self) -> StaffMetrics:
+        """Tolerances scaled to this staff's own engraving size."""
+        return StaffMetrics.from_spacing(self.line_spacing)
 
 
 def _line_items(page):
@@ -112,9 +195,8 @@ def extract_staves(page, page_number: int) -> list[Staff]:
             return
         ys = [r[0] for r in run]
         spacing = (ys[-1] - ys[0]) / (len(ys) - 1)
-        # if not 4.0 <= spacing <= 6.5:      # a piano-style brace or a beam cluster
-        if not 2.0 <= spacing <= 6.5:
-            return
+        if not _STAFF_LINE_SPACING_MIN <= spacing <= _STAFF_LINE_SPACING_MAX:
+            return                         # a brace or a beam cluster
         staves.append(Staff(
             page=page_number,
             top=ys[0],
@@ -141,6 +223,7 @@ def staff_barlines(page, staff: Staff) -> list[float]:
     inside the staff's own x-extent are accepted, which keeps out the rules of
     other staves, dynamics hairpins and rehearsal marks.
     """
+    metrics = staff.metrics
     # A real barline is drawn from exactly the top rule to exactly the bottom,
     # so its segment spans the full staff height.  Clef and time-signature
     # strokes reach only part of the way (or start below the top rule) and are
@@ -159,55 +242,60 @@ def staff_barlines(page, staff: Staff) -> list[float]:
         top, bottom = min(y0, y1), max(y0, y1)
         # Endpoint signature, not mere coverage.  A barline starts exactly on
         # the top rule (offset 0.00pt) and overhangs the bottom rule by exactly
-        # _BARLINE_OVERSHOOT (0.24pt).  Verifying both ends is what separates a
-        # barline from a note stem: stems also reach from above the staff to
-        # below it, but they never land on that exact pair of offsets.  The old
-        # "covers the whole staff" test counted 306 barlines where the engraving
-        # has 168 (stems, ledger-line strokes and repeat-barline pairs each
-        # added phantom measure boxes), so every measure count downstream was
-        # wrong.
-        if abs(top - staff.top) > _BARLINE_TOP_TOL:
+        # _BARLINE_OVERSHOOT (0.24pt at the reference scale).  Verifying both
+        # ends is what separates a barline from a note stem: stems also reach
+        # from above the staff to below it, but they never land on that exact
+        # pair of offsets.  The old "covers the whole staff" test counted 306
+        # barlines where the engraving has 168 (stems, ledger-line strokes and
+        # repeat-barline pairs each added phantom measure boxes), so every
+        # measure count downstream was wrong.
+        if abs(top - staff.top) > metrics.barline_top_tol:
             continue                        # does not start on the top rule
-        if abs(bottom - (staff.bottom + _BARLINE_OVERSHOOT)) > _BARLINE_TOL:
+        if abs(bottom - (staff.bottom + metrics.barline_overshoot)) > metrics.barline_tol:
             continue                        # does not end where a barline ends
-        if not (staff.x0 - 2.0 <= x0 <= staff.x1 + 2.0):
+        if not (staff.x0 - metrics.barline_x_margin
+                <= x0 <= staff.x1 + metrics.barline_x_margin):
             continue                        # outside this staff's extent
         xs.append(x0)
 
     xs.sort()
     # Collapse near-duplicates.  A repeat barline is drawn as a thin line and a
-    # thick one ~3-4pt apart; at 1.5pt that pair survived as two barlines and
-    # invented a zero-width measure box (the "5 boxes in a 3-measure system"
-    # mismatches against MuseScore's measure-number ruler).  Real barlines are
-    # >40pt apart, so 5.5pt is safely below the closest genuine spacing.
+    # thick one ~3-4pt apart at the reference scale; at 1.5pt that pair
+    # survived as two barlines and invented a zero-width measure box (the
+    # "5 boxes in a 3-measure system" mismatches against MuseScore's
+    # measure-number ruler).  Real barlines are >40pt apart, so the merged
+    # threshold is safely below the closest genuine spacing.
     merged: list[float] = []
     for x in xs:
-        if merged and x - merged[-1] < _BARLINE_MERGE:
+        if merged and x - merged[-1] < metrics.barline_merge:
             continue
         merged.append(x)
     # A system-opening repeat bar follows the clef but is not a measure.
     thick_repeat = [d['rect'].x0 for d in page.get_drawings()
                     if d['type'] == 's' and (d.get('width') or 0) >= 1.5
-                    and d['rect'].width < 1.2 and d['rect'].height > 8.0
-                    and abs(d['rect'].y0 - staff.top) < 1.0]
-    if (len(merged) > 1 and merged[0] - staff.x0 < 45.0
-            and any(abs(x - merged[0]) < 8.0 for x in thick_repeat)):
+                    and d['rect'].width < metrics.repeat_stroke_max_width
+                    and d['rect'].height > metrics.repeat_stroke_min_height
+                    and abs(d['rect'].y0 - staff.top) < metrics.repeat_top_tol]
+    if (len(merged) > 1 and merged[0] - staff.x0 < metrics.repeat_margin
+            and any(abs(x - merged[0]) < metrics.repeat_merge for x in thick_repeat)):
         merged.pop(0)
     return merged
 
 
-def _maestro_digits(page) -> list[tuple[float, float, int]]:
-    """Return (x0, y0, value) for every whole-number Maestro digit run.
+def _music_digits(page) -> list[tuple[float, float, int]]:
+    """Return (x0, y0, value) for every whole-number digit run in a music font.
 
     MuseScore prints measure numbers and multi-measure-rest counts in the
-    private-use area of its Maestro font (U+F030+digit), which PyMuPDF reads
-    back as plain text with no OCR involved.
+    private-use area of its music font (U+F030+digit in Maestro), which
+    PyMuPDF reads back as plain text with no OCR involved.  MuseScore 4 uses
+    Opus instead.  The caller restricts these to the rest-count band, so
+    digits elsewhere (time signatures, note-adjacent numbers) do no harm.
     """
     out: list[tuple[float, float, int]] = []
     for block in page.get_text("dict")["blocks"]:
         for line in block.get("lines", []):
             for span in line["spans"]:
-                if not span["font"].startswith("Maestro"):
+                if not span["font"].startswith(_MUSIC_FONT_PREFIXES):
                     continue
                 text = "".join(_PUA_DIGIT.get(ch, ch) for ch in span["text"]).strip()
                 if text and text.isdigit():
@@ -223,19 +311,20 @@ def box_measure_counts(page, staff: Staff, barlines: list[float]) -> list[int]:
     printed above it.  Reading that count is what reconciles the engraved boxes
     with the real measure count: 曲笛 has 165 boxes but 314 real measures, and
     without the printed counts the two sides of the alignment disagree for the
-    whole piece.  The printed count sits 33-40pt above the staff's top rule,
-    while time signatures and other digits sit 14-25pt above, so the window is
-    unambiguous (measured over all three source scores).
+    whole piece.  The printed count sits 33-40pt above the reference staff's
+    top rule, while time signatures and other digits sit 14-25pt above, so the
+    window is unambiguous (measured over all three source scores).
     """
-    digits = _maestro_digits(page)
+    metrics = staff.metrics
+    digits = _music_digits(page)
     edges = [staff.x0, *barlines]
     counts: list[int] = []
     for index in range(len(barlines)):
         x0, x1 = edges[index], edges[index + 1]
         hits = [
             value for dx, dy, value in digits
-            if _REST_COUNT_TOP <= staff.top - dy <= _REST_COUNT_BOTTOM
-            and x0 + 4.0 <= dx <= x1 - 2.0
+            if metrics.rest_count_top <= staff.top - dy <= metrics.rest_count_bottom
+            and x0 + metrics.rest_inset_left <= dx <= x1 - metrics.rest_inset_right
         ]
         counts.append(max(hits) if hits else 1)
     return counts
@@ -246,20 +335,24 @@ def measure_numbers(page, staff: Staff) -> Optional[int]:
 
     This is ground truth for the measure-number ruler: it lets us check that
     consecutive staves' spans abut (`start + count == next start`) instead of
-    trusting the box count alone.  The number is Times New Roman Italic at
-    x < 50, 5-50pt above the staff's top rule.
+    trusting the box count alone.  The number is Times New Roman Italic at the
+    staff's left edge (indented first systems included), 5-50pt above the
+    staff's top rule.
     """
+    metrics = staff.metrics
     best: Optional[int] = None
     for block in page.get_text("dict")["blocks"]:
         for line in block.get("lines", []):
             for span in line["spans"]:
-                if not span["font"].startswith("TimesNewRomanPS-Italic"):
+                if not span["font"].startswith(_MEASURE_NUMBER_FONT):
                     continue
                 x0, y0, _, y1 = span["bbox"]
                 text = span["text"].strip()
-                if x0 > 50 or not text.isdigit():
+                if not text.isdigit():
                     continue
-                if 0.0 <= staff.top - y1 <= 60.0:
+                if abs(x0 - staff.x0) > metrics.measure_number_margin:
+                    continue                 # not the left-margin ruler
+                if 0.0 <= staff.top - y1 <= metrics.measure_number_top:
                     best = int(text)
     return best
 

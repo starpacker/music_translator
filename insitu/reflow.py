@@ -125,6 +125,207 @@ def _programs(data: bytes) -> list[bytes]:
     return result
 
 
+_WRAPPERS = {b'q': b'Q', b'BT': b'ET', b'BDC': b'EMC', b'BMC': b'EMC'}
+_STATE_SLOTS = {
+    b'g': 'fill', b'rg': 'fill', b'k': 'fill', b'sc': 'fill', b'scn': 'fill', b'cs': 'fill',
+    b'G': 'stroke', b'RG': 'stroke', b'K': 'stroke', b'SC': 'stroke', b'SCN': 'stroke',
+    b'CS': 'stroke', b'w': 'line', b'J': 'line', b'j': 'line', b'M': 'line', b'd': 'line',
+    b'ri': 'line', b'i': 'line', b'gs': 'gs', b'cm': 'cm',
+    b'Tc': 'text', b'Tw': 'text', b'Tz': 'text', b'TL': 'text', b'Tr': 'text', b'Ts': 'text',
+    b'Tf': 'font',
+}
+_TEXT_STATE_SLOTS = {'text', 'font'}
+_PAINT_ENDERS = {
+    b'S', b's', b'f', b'F', b'f*', b'B', b'B*', b'b', b'b*', b'n',
+    b'Do', b'sh', b'BI', b'EI', b'd0', b'd1', b'Tj', b'TJ', b"'", b'"',
+}
+_TEXT_PAINT = {b'Tj', b'TJ', b"'", b'"'}
+_TEXT_OPERATORS = (set(_STATE_SLOTS) | _PAINT_ENDERS
+                   | {b'Tm', b'Td', b'TD', b'T*', b'BX', b'EX', b'q', b'Q',
+                      b'BT', b'ET', b'BDC', b'BMC', b'EMC'})
+
+
+def _match(events, index):
+    """Index of the token closing the group opened at ``index``."""
+    opener = events[index][2]
+    closer = _WRAPPERS[opener]
+    depth = 0
+    for position in range(index, len(events)):
+        token = events[position][2]
+        if token == opener:
+            depth += 1
+        elif token == closer:
+            depth -= 1
+            if depth == 0:
+                return position
+    return None
+
+
+def _statements(data: bytes):
+    """Yield (is_group, span, leading_operands, operator) at nesting level 0."""
+    events = list(_tokens(data))
+    start, index = None, 0
+    while index < len(events):
+        left, right, token = events[index]
+        if start is None:
+            start = left
+        if token in _WRAPPERS:
+            end = _match(events, index)
+            if end is None:
+                yield False, data[start:], b'', None
+                return
+            yield True, data[left:events[end][1]], data[start:left], token
+            index, start = end + 1, None
+            continue
+        if token in _STATE_SLOTS or token in _PAINT_ENDERS:
+            yield False, data[start:right], b'', token
+            index, start = index + 1, None
+            continue
+        index += 1
+    if start is not None and data[start:].strip():
+        yield False, data[start:], b'', None
+
+
+def _render(state: dict) -> bytes:
+    return b' '.join(value for value in state.values())
+
+
+def _paints(body: bytes) -> bool:
+    return any(token in _TEXT_PAINT for _, _, token in _tokens(body))
+
+
+def _text_object(state: dict, body: bytes) -> bytes:
+    state = _render(state)
+    return b'BT ' + (state + b' ' if state else b'') + body + b' ET'
+
+
+def _text_runs(prefix: bytes, span: bytes, text_state: dict):
+    """Cut a ``BT…ET`` block at absolute text-matrix (``Tm``) boundaries.
+
+    One text block can hold annotations for every system on the page: the
+    pypdf-rewritten source does exactly that, leaving a block far taller than
+    a staff that cannot travel with a single row.  ``Tm`` starts a new absolute
+    position, so it is a safe cut.  Text state (font, size, spacing, render
+    mode) is part of the graphics state and survives ``ET``, so it is replayed
+    inside every run — including runs whose own block never sets a font.
+
+    Returns the runs plus the text state in force after the block.
+    """
+    events = list(_tokens(span))
+    inner = span[events[0][1]:events[-1][0]]
+    current = dict(text_state)
+    cuts, cursor = [], 0
+    for _, right, token in _tokens(inner):
+        if token not in _TEXT_OPERATORS:
+            continue
+        statement = inner[cursor:right].strip()
+        if token in _STATE_SLOTS and _STATE_SLOTS[token] in _TEXT_STATE_SLOTS:
+            current[_STATE_SLOTS[token]] = statement
+        elif token == b'Tm':
+            cuts.append((cursor, dict(current)))
+        cursor = right
+    final = dict(current)
+
+    if not cuts:
+        return [(prefix, _text_object(text_state, inner))], final
+
+    runs = []
+    head = cuts[0][0]
+    if head > 0 and _paints(inner[:head]):
+        runs.append((prefix, _text_object({}, inner[:head])))
+    for index, (start, snapshot) in enumerate(cuts):
+        end = cuts[index + 1][0] if index + 1 < len(cuts) else len(inner)
+        body = inner[start:end]
+        if _paints(body):
+            runs.append((prefix, _text_object(snapshot, body)))
+    if not runs:
+        runs = [(prefix, _text_object(text_state, inner))]
+    return runs, final
+
+
+def _state_objects(data: bytes, state: dict, text_state: dict) -> list[tuple[bytes, bytes]]:
+    """Movable objects as (prefix, body), in paint order.
+
+    State statements (colour, line width, CTM, resource dictionary) cannot be
+    painted alone; they accumulate into the prefix of every following object so
+    each object can be painted in isolation.  ``state``/``text_state`` are
+    mutated in place so a caller descending into a wrapper keeps them.
+    """
+    objects = []
+    for is_group, span, lead, operator in _statements(data):
+        if not is_group and operator in _STATE_SLOTS:
+            slot = _STATE_SLOTS[operator]
+            if slot in _TEXT_STATE_SLOTS:
+                text_state[slot] = span
+            elif slot == 'cm':
+                # Concatenate: successive `cm` operators compose the CTM.
+                state['cm'] = (state.get('cm', b'') + b' ' + span).strip()
+            else:
+                state[slot] = span
+            continue
+        prefix = _render(state)
+        if lead.strip():
+            prefix = (prefix + b' ' if prefix else b'') + lead.strip()
+        if is_group and operator == b'BT':
+            runs, final = _text_runs(prefix, span, text_state)
+            text_state.clear()
+            text_state.update(final)
+            objects.extend(runs)
+        else:
+            objects.append((prefix, span))
+    return objects
+
+
+def _wrapper(body: bytes):
+    """(opener, inner) when ``body`` is one complete ``q…Q``/``BT…ET``/``BDC…EMC``."""
+    events = list(_tokens(body))
+    if len(events) < 2:
+        return None
+    opener = events[0][2]
+    if _WRAPPERS.get(opener) != events[-1][2]:
+        return None
+    if _match(events, 0) != len(events) - 1:
+        return None
+    return opener, body[events[0][1]:events[-1][0]]
+
+
+def _split_objects(data: bytes) -> list[tuple[bytes, bytes]]:
+    """Descend page-level ``q``/marked-content wrappers to the painting level.
+
+    A whole page wrapped in one ``q…Q`` (and often one ``BDC…EMC``) is a single
+    opaque object to ``_programs``; it would be assigned wholesale to one staff
+    and exceed the printable page.  Descending keeps every inner object, and
+    every object carries the accumulated prefix so it stays self-contained.
+    """
+    state, text_state = {}, {}
+    while True:
+        objects = _state_objects(data, state, text_state)
+        if len(objects) != 1:
+            return objects
+        wrapped = _wrapper(objects[0][1])
+        if wrapped is None or wrapped[0] == b'BT':
+            return objects
+        inner = wrapped[1]
+        # Marked content is a tagging wrapper, not painting: its tag and
+        # property operands go with the `BDC`/`EMC` pair and must not be
+        # replayed on their own (a bare `<<…>>` before `BT` is a syntax error).
+        # Graphics state accumulated so far is carried by ``state``; probe the
+        # children on copies so the next pass does not compose state twice.
+        probe = _state_objects(inner, dict(state), dict(text_state))
+        if not probe:
+            return objects
+        if len(probe) > 1 or _wrapper(probe[0][1]) is not None:
+            data = inner
+            continue
+        return objects
+
+
+def _split_programs(data: bytes) -> list[bytes]:
+    """Self-contained painting programs, descending a page-wide wrapper."""
+    return [((prefix + b'\n') if prefix else b'') + body
+            for prefix, body in _split_objects(data)]
+
+
 def _bounds(log) -> fitz.Rect:
     boxes = [fitz.Rect(rect) for kind, rect in log
              if kind != 'ignore-text' and all(math.isfinite(v) for v in rect)
@@ -180,31 +381,45 @@ class SourceObjects:
 
     def _extract(self):
         data = self.page.read_contents()
-        programs = _programs(data)
         contents = self.page.get_contents()
         if len(contents) != 1:
             raise ValueError('PDF cleaning did not create one content stream')
         self.xref = contents[0]
-        objects = []
         try:
-            for program in programs:
-                self.doc.update_stream(self.xref, program)
-                log = self.page.get_bboxlog()
-                box = _bounds(log)
-                if box.is_empty:
-                    # Preserve nonpainting programs too (e.g. marked content).
-                    # The cleaned stream makes their state self-contained.
-                    objects.append(Graphic(program, box, 0))
-                    continue
-                traces = self.page.get_texttrace()
-                chars = [char for trace in traces for char in trace['chars']]
-                text = ''.join(chr(char[0]) for char in chars if char[0] >= 0)
-                # The ink centre works for both high accents and low dynamics;
-                # unlike a font ascender box it does not cover the next staff.
-                anchor = (box.y0 + box.y1) / 2
-                objects.append(Graphic(program, box, anchor, text))
+            objects = self._describe(_programs(data))
+            # A page wrapped in one q…Q (plus marked content) is a single
+            # opaque object to _programs, and one BT block can span every
+            # system.  Both are taller than any staff, so they would be
+            # assigned wholesale to one row and overflow the printable page.
+            # Descend to the painting level only when the evidence says so.
+            tallest = max((g.bounds.height for g in objects if not g.bounds.is_empty),
+                          default=0.0)
+            if tallest > self.height * .5:
+                divided = _split_programs(data)
+                if len(divided) > len(objects):
+                    objects = self._describe(divided)
         finally:
             self.doc.update_stream(self.xref, data)
+        return objects
+
+    def _describe(self, programs):
+        """Measure each program's ink box, text and anchor on the live page."""
+        objects = []
+        for program in programs:
+            self.doc.update_stream(self.xref, program)
+            box = _bounds(self.page.get_bboxlog())
+            if box.is_empty:
+                # Preserve nonpainting programs too (e.g. marked content).
+                # The cleaned stream makes their state self-contained.
+                objects.append(Graphic(program, box, 0))
+                continue
+            traces = self.page.get_texttrace()
+            chars = [char for trace in traces for char in trace['chars']]
+            text = ''.join(chr(char[0]) for char in chars if char[0] >= 0)
+            # The ink centre works for both high accents and low dynamics;
+            # unlike a font ascender box it does not cover the next staff.
+            anchor = (box.y0 + box.y1) / 2
+            objects.append(Graphic(program, box, anchor, text))
         return objects
 
     def _contains_systems(self, graphic):

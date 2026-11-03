@@ -32,7 +32,6 @@ from .measure import (
 )
 from .extract import (
     _extract_part_repeat_barlines,
-    _get_voice_ids_in_part,
     extract_jianpu_measures,
     extract_strict_jianpu_measures,
     strip_grace_notes,
@@ -357,13 +356,10 @@ def build_jianpu_ly_text(score, title: str, use_strict_timing: bool = False,
                           pitch_mode: str = 'movable'):
     """Build jianpu-ly plain-text for all parts in the score.
 
-    For single-part scores the output is identical to the previous behaviour,
-    except that when the single part contains multiple non-rest voices they are
-    each extracted as a separate ``NextPart`` section.
-
-    For multi-part scores each part becomes a separate jianpu section; parts
-    that contain multiple non-rest voices are further split so each voice gets
-    its own section.
+    Source scores are monophonic: each part becomes exactly one jianpu section,
+    so one staff always maps to one jianpu line.  A second MusicXML voice inside
+    a measure is OMR recognition noise; it is merged into that part's line
+    instead of getting a track of its own.
 
     Parameters
     ----------
@@ -371,8 +367,7 @@ def build_jianpu_ly_text(score, title: str, use_strict_timing: bool = False,
         When *True* the function returns ``(text, voice_groups)`` instead of
         just *text*.  ``voice_groups`` is a ``list[list[int]]`` where each
         inner list contains the 0-based section indices to render on the same
-        jianpu staff. Explicit independent voices are currently kept on separate
-        staves to avoid overlapping numbered notes.
+        jianpu staff.  With monophonic sources every group holds one section.
     """
     if pitch_mode not in ('movable', 'fixed'):
         raise ValueError(f'unsupported pitch mode: {pitch_mode}')
@@ -397,84 +392,31 @@ def build_jianpu_ly_text(score, title: str, use_strict_timing: bool = False,
 
     if len(_parts) <= 1:
         part = _parts[0] if _parts else None
-        # Detect multiple voices in the single part (skip in strict mode which flattens)
-        _v_ids = _get_voice_ids_in_part(part) if (not use_strict_timing and part is not None) else []
-
-        if len(_v_ids) <= 1:
-            # Single voice (or strict mode) — existing behaviour
-            fn = extract_strict_jianpu_measures if use_strict_timing else extract_jianpu_measures
-            if use_strict_timing:
-                measures, _time_sig = fn(score, key_tonic_semitone, pitch_mode=pitch_mode)
-            else:
-                measures, _time_sig = fn(score, key_tonic_semitone, follow_key_changes=True,
-                                         pitch_mode=pitch_mode)
-            _sections = [measures]
-            _section_parts = [part if part is not None else score]
-            _voice_groups = [[0]]
+        if use_strict_timing:
+            measures, _time_sig = extract_strict_jianpu_measures(
+                score, key_tonic_semitone, pitch_mode=pitch_mode)
         else:
-            # Multiple voices within a single part — extract each voice separately
-            log_message(
-                f'[jianpu] 单声部多声道: {len(_v_ids)} 个声道 ({", ".join(str(v) for v in _v_ids)})',
-                _logging.DEBUG,
-            )
-            _group_idxs: list[int] = []
-            for i, vid in enumerate(_v_ids):
-                measures, ts = extract_jianpu_measures(
-                    score, key_tonic_semitone, _part=part, _voice_id=vid,
-                    _multi_voice_mode=True, _is_primary_voice=(i == 0), follow_key_changes=True,
-                    pitch_mode=pitch_mode)
-                if not _ts_set:
-                    _time_sig, _ts_set = ts, True
-                if measures:
-                    _group_idxs.append(len(_sections))
-                    _sections.append(measures)
-                    _section_parts.append(part)
-            # Independent numbered voices can collide if painted on the same
-            # rhythmic staff.  Keep separate, synchronised staves instead.
-            _voice_groups = [[index] for index in _group_idxs] if _group_idxs else [[0]]
+            measures, _time_sig = extract_jianpu_measures(
+                score, key_tonic_semitone, follow_key_changes=True, pitch_mode=pitch_mode)
+        _sections = [measures]
+        _section_parts = [part if part is not None else score]
+        _voice_groups = [[0]]
     else:
-        # Multi-part path: one section per part / voice combination
+        # Multi-part path: one section per part.  Source parts are monophonic;
+        # any extra MusicXML voice is OMR noise and is merged into that part's line.
         for part in _parts:
             if use_strict_timing:
-                # Strict mode flattens all voices; emit one section per part
                 measures, ts = extract_strict_jianpu_measures(score, key_tonic_semitone, _part=part,
                                                                pitch_mode=pitch_mode)
-                if not _ts_set:
-                    _time_sig, _ts_set = ts, True
-                if measures:
-                    _voice_groups.append([len(_sections)])
-                    _sections.append(measures)
-                    _section_parts.append(part)
             else:
-                voice_ids = _get_voice_ids_in_part(part)
-                if len(voice_ids) <= 1:
-                    # No multi-voice structure — one section for the whole part
-                    measures, ts = extract_jianpu_measures(score, key_tonic_semitone, _part=part,
-                                                           follow_key_changes=True, pitch_mode=pitch_mode)
-                    if not _ts_set:
-                        _time_sig, _ts_set = ts, True
-                    if measures:
-                        _voice_groups.append([len(_sections)])
-                        _sections.append(measures)
-                        _section_parts.append(part)
-                else:
-                    # Multiple voices: one section per voice.
-                    # In a multi-part score each Part already maps to a separate staff;
-                    # when a Part contains multiple voice IDs (e.g. due to OMR chord
-                    # encoding), each voice is an independent melodic line and should
-                    # get its own staff row — NOT be merged into a shared polyphonic
-                    # staff (that path is reserved for the single-part case above).
-                    for i, vid in enumerate(voice_ids):
-                        measures, ts = extract_jianpu_measures(
-                            score, key_tonic_semitone, _part=part, _voice_id=vid,
-                            _multi_voice_mode=True, _is_primary_voice=(i == 0), follow_key_changes=True,
-                            pitch_mode=pitch_mode)
-                        if not _ts_set:
-                            _time_sig, _ts_set = ts, True
-                        if measures:
-                            _voice_groups.append([len(_sections)])
-                            _sections.append(measures)
-                            _section_parts.append(part)
+                measures, ts = extract_jianpu_measures(score, key_tonic_semitone, _part=part,
+                                                       follow_key_changes=True, pitch_mode=pitch_mode)
+            if not _ts_set:
+                _time_sig, _ts_set = ts, True
+            if measures:
+                _voice_groups.append([len(_sections)])
+                _sections.append(measures)
+                _section_parts.append(part)
 
     # ── Assemble jianpu-ly text ───────────────────────────────────────────────
     header = ['% jianpu-ly.py', f'title={title}']
@@ -493,7 +435,7 @@ def build_jianpu_ly_text(score, title: str, use_strict_timing: bool = False,
     measures_per_line = 4
 
     log_message(
-        f'[jianpu] build_jianpu_ly_text: {len(_sections)} 个声部段落，共 '
+        f'[jianpu] build_jianpu_ly_text: {len(_sections)} 个段落，共 '
         f'{sum(len(s) for s in _sections)} 个小节', _logging.DEBUG,
     )
 

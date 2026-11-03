@@ -36,7 +36,6 @@ from core.notation.jianpu import (  # noqa: E402
     _with_time_signatures,
     extract_jianpu_measures,
     _get_score_key_tonic,
-    _get_voice_ids_in_part,
     _extract_part_repeat_barlines,
 )
 from core.render.jianpu_runner import _insert_repeat_bar_commands  # noqa: E402
@@ -935,16 +934,10 @@ def build(pdf_path: Path, mxl_path: Path, out_path: Path,
     if pitch_mode == 'fixed':
         tonic, key_header = 0, '1=C'
     part = score.parts[0] if score.parts else None
-    voice_ids = _get_voice_ids_in_part(part) if part is not None else []
-    if len(voice_ids) > 1:
-        tracks = [extract_jianpu_measures(score, tonic, _part=part, _voice_id=vid,
-                                          _multi_voice_mode=True, _is_primary_voice=(index == 0),
-                                          follow_key_changes=True, pitch_mode=pitch_mode)
-                  for index, vid in enumerate(voice_ids)]
-        print(f'[insitu] 检测到 {len(tracks)} 个声部，逐行分别排版。')
-    else:
-        tracks = [extract_jianpu_measures(score, tonic, follow_key_changes=True,
-                                          pitch_mode=pitch_mode)]
+    # Source scores are monophonic: one staff maps to exactly one jianpu line.
+    # Any OMR-tagged "second voice" is recognition noise, never a second track.
+    tracks = [extract_jianpu_measures(score, tonic, follow_key_changes=True,
+                                      pitch_mode=pitch_mode)]
     if len(score.parts) > 1:
         print('[insitu] 检测到多个乐器分部；当前原位对齐仅使用第一个分部，请校对。')
     repeat_bars = _extract_part_repeat_barlines(part) if part is not None else {}

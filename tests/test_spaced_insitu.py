@@ -15,7 +15,7 @@ import numpy as np
 import pymupdf as fitz
 
 from insitu.pdf_structure import Staff, StaffLayout
-from insitu.reflow import SourceObjects, _programs, paginate
+from insitu.reflow import SourceObjects, _programs, _split_programs, paginate
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -51,6 +51,29 @@ class SourceObjectsTest(unittest.TestCase):
         self.assertEqual(_programs(first), [first])
         with self.assertRaisesRegex(ValueError, 'unbalanced'):
             _programs(b'q q Q')
+
+    def test_page_wide_wrapper_is_split_into_staff_sized_objects(self):
+        """A page wrapped in one q…Q/BDC…EMC must not become one huge object.
+
+        The pypdf-rewritten source keeps every system in a single graphics
+        state group; left intact that object is assigned wholesale to one
+        staff and exceeds the printable page.  The marked-content wrapper is
+        tagging, not painting: it is dropped, while graphics state such as
+        ``/GS1 gs`` is replayed on every piece.
+        """
+        data = (b'q /Span<</MCID 0>> BDC /GS1 gs '
+                b'BT /TT2 1 Tf 12 0 0 12 56 759 Tm (A)Tj ET '
+                b'BT 12 0 0 12 56 100 Tm (B)Tj ET EMC Q')
+        self.assertEqual(len(_programs(data)), 1)
+        divided = _split_programs(data)
+        self.assertEqual(len(divided), 2)
+        for program in divided:
+            self.assertIn(b'/GS1 gs', program)   # state is replayed
+            self.assertNotIn(b'BDC', program)    # no dangling tag operands
+            self.assertNotIn(b'MCID', program)
+            self.assertNotIn(b'<<', program)
+        self.assertIn(b'(A)', divided[0])
+        self.assertIn(b'(B)', divided[1])
 
     def test_stroked_text_and_disconnected_paths_replay_intact(self):
         with fitz.open() as doc, fitz.open() as out:
