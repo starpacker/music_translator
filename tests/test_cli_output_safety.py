@@ -8,27 +8,22 @@ import jianpu
 
 
 class CliOutputSafetyTest(unittest.TestCase):
-    def test_strip_insitu_regenerates_existing_reference(self):
+    def test_strip_alias_uses_reflow_without_a_full_jianpu_pdf(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            source = root / 'score.pdf'
-            mxl = root / 'input.musicxml'
+            source, mxl = root / 'score.pdf', root / 'input.musicxml'
             source.write_bytes(b'pdf input')
             mxl.write_bytes(b'xml input')
-            reference = root / 'out.jianpu.pdf'
-            reference.write_text('old score')
-            def render(_, output, title):
-                output.write_text('current score')
-                return output
-            with mock.patch.object(jianpu, 'musicxml_to_jianpu', side_effect=render) as render_call, \
-                 mock.patch.object(jianpu, 'insitu_strip') as strip:
+            with mock.patch.object(jianpu, 'musicxml_to_jianpu') as reference, \
+                 mock.patch.object(jianpu, 'insitu_stamp') as stamp:
                 result = jianpu.main([str(source), '--mxl', str(mxl), '--mode', 'insitu', '--engine', 'strip',
                                       '--no-vector-tempos', '--no-vector-dynamics', '--no-vector-wedges',
                                       '-o', str(root / 'out')])
             self.assertEqual(result, 0)
-            self.assertEqual(render_call.call_count, 1)
-            self.assertEqual(reference.read_text(), 'current score')
-            self.assertEqual(strip.call_args.args[1], reference)
+            reference.assert_not_called()
+            self.assertEqual(stamp.call_args.kwargs['layout'], 'single')
+            self.assertTrue(stamp.call_args.kwargs['expand'])
+            self.assertFalse((root / 'out.jianpu.pdf').exists())
 
     def test_both_mode_renders_reference_once(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -37,7 +32,7 @@ class CliOutputSafetyTest(unittest.TestCase):
             source.write_bytes(b'pdf')
             mxl.write_bytes(b'xml')
             with mock.patch.object(jianpu, 'musicxml_to_jianpu') as render, \
-                 mock.patch.object(jianpu, 'insitu_strip'):
+                 mock.patch.object(jianpu, 'insitu_stamp'):
                 self.assertEqual(jianpu.main([str(source), '--mxl', str(mxl), '--mode', 'both', '--engine', 'strip',
                                               '--no-vector-tempos', '--no-vector-dynamics', '--no-vector-wedges',
                                               '-o', str(root / 'out')]), 0)

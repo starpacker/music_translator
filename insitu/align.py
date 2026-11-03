@@ -10,10 +10,10 @@ own:
   cannot say which of the OMR notes belong to which staff beyond that count.
 * The OMR MusicXML carries the notes and, via `<print new-system="yes">`, a
   hint of where the transcriber believed each system began.  That hint is only
-  approximate: measured on 梆笛.pdf, OMR emits 46 system breaks for 51 engraved
-  staves — it silently merges four pairs of adjacent staves and drops every page
-  break — and its per-system measure counts drift by one or two from the
-  engraving in a handful of places.
+  approximate: OMR routinely merges adjacent staves, drops page breaks, and its
+  per-system measure counts drift by one or two from the engraving in a handful
+  of places.  Measured on the bundled 梆笛.pdf (18 engraved staves) it emits
+  only 17 system breaks.
 
 Neither stream is authoritative, so we do not trust either blindly.  We align
 the two by their measure counts with a global optimal sequence alignment that
@@ -79,11 +79,14 @@ def _omr_segments(measure_count: int, break_indices: list[int]) -> list[int]:
     return out
 
 
-def align(pdf_counts: list[int], omr_counts: list[int]) -> list[SystemSlice]:
+def align(pdf_counts: list[int], omr_counts: list[int],
+          index_offset: int = 0) -> list[SystemSlice]:
     """Return the OMR measure range assigned to each engraved staff.
 
     Both inputs are measure counts, in order.  The alignment walks the two
     sequences together and minimises the weighted edit cost described above.
+    ``index_offset`` only shifts the staff numbers quoted in the console
+    warnings; slices always use 0-based indices into ``pdf_counts``.
     """
     n, m = len(pdf_counts), len(omr_counts)
     INF = float('inf')
@@ -207,7 +210,8 @@ def align(pdf_counts: list[int], omr_counts: list[int]) -> list[SystemSlice]:
         for index, sl in enumerate(slices):
             sl.omr_start, sl.omr_end = boundaries[index:index + 2]
             if sl.omr_measures != sl.pdf_measures:
-                print(f'  ! 谱表 {sl.staff_index + 1}: 五线谱 {sl.pdf_measures} 格，'
+                print(f'  ! 谱表 {sl.staff_index + index_offset + 1}: '
+                      f'五线谱 {sl.pdf_measures} 格，'
                       f'识谱分配 {sl.omr_measures} 小节，请校对')
 
     return slices
@@ -241,12 +245,51 @@ def align_from_files(pdf_path, mxl_path) -> tuple[list, list[SystemSlice]]:
     if part is None:
         raise ValueError(f'MusicXML 没有可对齐的声部: {mxl_path}')
     measures = [item for item in part if item.tag.rsplit('}', 1)[-1] == 'measure']
-    breaks = [
-        idx for idx, el in enumerate(measures)
-        if (child(el, 'print') is not None
-            and (child(el, 'print').get('new-system') == 'yes'
-                 or child(el, 'print').get('new-page') == 'yes'))
-    ]
-    omr_counts = _omr_segments(len(measures), breaks)
-    returns = (staves, align(_pdf_counts(staves), omr_counts))
-    return returns
+    breaks: list[int] = []
+    page_breaks: list[int] = []
+    for idx, el in enumerate(measures):
+        print_el = child(el, 'print')
+        if print_el is None:
+            continue
+        if print_el.get('new-page') == 'yes':
+            page_breaks.append(idx)
+        if (print_el.get('new-system') == 'yes'
+                or print_el.get('new-page') == 'yes'):
+            breaks.append(idx)
+
+    pdf_counts = _pdf_counts(staves)
+
+    # Prefer aligning page by page.  A system can never legitimately span a
+    # page turn, so letting the global DP move measures across it can hand one
+    # page's bars to another page's staves — which happened on
+    # 05_中音笙1-2: page 2's OMR was truncated and the aligner stole 20 of
+    # page 1's measures to fill it.
+    staff_pages = [getattr(getattr(layout, 'staff', None), 'page', None)
+                   for layout in staves]
+    if staves and None not in staff_pages:
+        pdf_pages: list[tuple[int, list[int]]] = []
+        for index, page in enumerate(staff_pages):
+            if pdf_pages and pdf_pages[-1][0] == page:
+                pdf_pages[-1][1].append(index)
+            else:
+                pdf_pages.append((page, [index]))
+        page_starts = sorted({0, *page_breaks})
+        omr_pages = [(start, page_starts[i + 1] if i + 1 < len(page_starts)
+                      else len(measures))
+                     for i, start in enumerate(page_starts)]
+        if len(omr_pages) == len(pdf_pages):
+            slices: list[SystemSlice] = []
+            for (_, staff_ids), (start, end) in zip(pdf_pages, omr_pages):
+                local_breaks = [b - start for b in breaks if start <= b < end]
+                page_slices = align([pdf_counts[i] for i in staff_ids],
+                                    _omr_segments(end - start, local_breaks),
+                                    index_offset=staff_ids[0])
+                for system in page_slices:
+                    system.staff_index = staff_ids[system.staff_index]
+                    system.omr_start += start
+                    system.omr_end += start
+                    slices.append(system)
+            slices.sort(key=lambda system: system.staff_index)
+            return staves, slices
+
+    return staves, align(pdf_counts, _omr_segments(len(measures), breaks))

@@ -1,5 +1,6 @@
 """Independent voices must not be discarded merely because they overlap."""
 from pathlib import Path
+import json
 import shutil
 import tempfile
 import unittest
@@ -86,12 +87,15 @@ class PolyphonicPreservationTest(unittest.TestCase):
             parsed = converter.parse(str(mxl))
             text = build_jianpu_ly_text(parsed, 'test')
             self.assertEqual(text.count('NextPart'), 1)
-            with mock.patch.object(renderer, '_place_tile', wraps=renderer._place_tile) as place:
-                renderer.build(pdf, mxl, out, expand=True)
-            self.assertEqual(place.call_count, 2)
-            self.assertGreater(place.call_args_list[1].args[4], place.call_args_list[0].args[4])
+            renderer.build(pdf, mxl, out)
+            report = json.loads((root / 'out.report.json').read_text())
+            voices = report['rows'][0]['voices']
+            self.assertEqual(len(voices), 2)
+            self.assertTrue(all(voice['lines'] for voice in voices))
+            # The second voice starts below the first instead of overlapping it.
+            self.assertGreater(voices[1]['lines'][0]['top'], voices[0]['lines'][0]['top'])
             with pymupdf.open(out) as output:
-                self.assertGreater(output[0].rect.height, 334)
+                self.assertEqual(output[0].rect, pymupdf.Rect(0, 0, 600, 300))
 
 
 if __name__ == '__main__':

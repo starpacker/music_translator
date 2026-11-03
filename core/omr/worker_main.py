@@ -200,7 +200,6 @@ def run_worker() -> None:
 
         files = [Path(f) for f in task.get('files', [])]
         engine_str = task.get('engine', 'auto')
-        sr_engine_str = task.get('sr_engine', 'waifu2x')
         output_dir_path = Path(task['output_dir'])
         gen_midi: bool = task.get('gen_midi', True)
         skip_dup: bool = task.get('skip_dup', False)
@@ -210,10 +209,6 @@ def run_worker() -> None:
         _total_files_orig: int = task.get('total_files_orig', 0)  # 0 = 会在下面用 total 充实
         # ── 修补日志函数 ──────────────────────────────────────────────────────
         _patch_log_message()
-
-        # ── 注入超分辨率引擎选择 ───────────────────────────────────────────────
-        from core.image.sr_upscale import set_sr_engine  # noqa: PLC0415
-        set_sr_engine(sr_engine_str)
 
         # ── 导入（延迟，避免在修补前触发 import-time 副作用）──────────────────
         from core.config import OMREngine  # noqa: PLC0415

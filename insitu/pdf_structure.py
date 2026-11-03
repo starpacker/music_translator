@@ -112,7 +112,8 @@ def extract_staves(page, page_number: int) -> list[Staff]:
             return
         ys = [r[0] for r in run]
         spacing = (ys[-1] - ys[0]) / (len(ys) - 1)
-        if not 4.0 <= spacing <= 6.5:      # a piano-style brace or a beam cluster
+        # if not 4.0 <= spacing <= 6.5:      # a piano-style brace or a beam cluster
+        if not 2.0 <= spacing <= 6.5:
             return
         staves.append(Staff(
             page=page_number,

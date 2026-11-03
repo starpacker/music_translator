@@ -59,7 +59,7 @@ def omr_to_musicxml(score_pdf: Path, work: Path, use_gpu: Optional[bool] = None)
     pipeline.update((HERE / 'homr_shim.py').read_bytes())
     for name in ('core/config.py', 'core/utils.py', 'core/omr/homr_runner.py',
                  'core/omr/multirest_collapse.py', 'core/omr/vector_whole_chords.py',
-                 'core/image/image_preprocess.py', 'core/image/sr_upscale.py',
+                 'core/image/image_preprocess.py',
                  'core/notation/tie_reconstruction.py'):
         pipeline.update((root / name).read_bytes())
     expected = {'source_sha256': digest.hexdigest(), 'gpu': use_gpu,
@@ -338,6 +338,61 @@ def recover_pdf_keys(score_pdf: Path, mxl: Path, work: Path, stem: str) -> Path:
         return mxl
 
 
+def recover_pdf_slurs(score_pdf: Path, mxl: Path, work: Path, stem: str) -> Path:
+    """Rebuild slurs from the engraved crescents, preserving the input XML.
+
+    OMR loses slur stops (all starts share ``number="1"``), so MusicXML slurs
+    run far past where the source ends.  Every slurs is re-derived from the
+    PDF's filled curve paths.  When any curve cannot be resolved to a
+    notehead, the input is returned unchanged and the reason is reported.
+    """
+    report = work / f'{stem}.pdf-slurs.json'
+    enriched = work / f'{stem}.pdf-slurs.musicxml'
+    protected = {score_pdf.resolve(), mxl.resolve()}
+    while report.resolve() in protected:
+        report = report.with_name(report.stem + '.report.json')
+    while enriched.resolve() in protected:
+        enriched = enriched.with_name(enriched.stem + '.derived.musicxml')
+
+    def write(data):
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=report.parent,
+                                             prefix='.slur-report-', suffix='.json', delete=False) as f:
+                temporary = Path(f.name)
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            temporary.replace(report)
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+
+    try:
+        write({'status': 'in_progress', 'source_pdf': str(score_pdf),
+               'source_musicxml': str(mxl)})
+        from core.omr.vector_slurs import discover_pdf_slurs, write_enriched_slurs
+        links, discovery = discover_pdf_slurs(score_pdf, mxl)
+        detail = {'source_pdf': str(score_pdf), 'source_pdf_sha256': _sha256_file(score_pdf),
+                  'source_musicxml': str(mxl), 'source_musicxml_sha256': _sha256_file(mxl)}
+        detail.update(discovery)
+        if discovery.get('status') in ('inferred', 'partial') and links:
+            written = write_enriched_slurs(mxl, enriched, links)
+            detail.update(written)
+            write(detail)
+            print(f"[slur] 根据 PDF 连奏线重建 {len(links)} 条 slur（原始 MusicXML 未修改）：{report}")
+            return enriched
+        write(detail)
+        print(f"[slur] 未能完全核对 PDF 连奏线，保留已有识别结果：{report}")
+        return mxl
+    except Exception as exc:
+        try:
+            write({'status': 'error', 'source_pdf': str(score_pdf),
+                   'source_musicxml': str(mxl), 'error': str(exc)})
+        except Exception:
+            pass
+        print(f'[slur] PDF 连奏线核对失败，保留已有识谱结果继续：{exc}')
+        return mxl
+
+
 def musicxml_to_jianpu(mxl: Path, out_pdf: Path, title: Optional[str] = None,
                        pitch_mode: str = 'movable') -> Path:
     """MusicXML → 整页简谱 PDF（music21 → jianpu-ly → LilyPond）。"""
@@ -360,28 +415,15 @@ def musicxml_to_jianpu(mxl: Path, out_pdf: Path, title: Optional[str] = None,
 # ── 步骤 3：原位简谱 ────────────────────────────────────────────────────────
 
 def insitu_stamp(score_pdf: Path, mxl: Path, out_pdf: Path,
-                 title: Optional[str] = None, expand: bool = False,
-                 pitch_mode: str = 'movable') -> Path:
-    """矢量贴字：把每行简谱贴到对应谱表正下方，页码和原谱完全一致。"""
-    sys.path.insert(0, str(HERE / 'insitu'))
-    import render_insitu                                     # noqa: PLC0415
+                 title: Optional[str] = None, expand: bool = True,
+                 pitch_mode: str = 'movable', layout: str = 'single') -> Path:
+    """同尺寸分页的原位简谱；expand=False 显式保留旧式叠印。"""
+    from insitu import render_insitu                          # noqa: PLC0415
 
     out_pdf.parent.mkdir(parents=True, exist_ok=True)
     render_insitu.build(score_pdf, mxl, out_pdf, title=title or score_pdf.stem,
-                        expand=expand, pitch_mode=pitch_mode)
+                        expand=expand, pitch_mode=pitch_mode, layout=layout)
     print(f'[insitu] -> {out_pdf}  ({out_pdf.stat().st_size/1024:.0f} KB)')
-    return out_pdf
-
-
-def insitu_strip(score_pdf: Path, jianpu_pdf: Path, out_pdf: Path) -> Path:
-    """插条式：在每个谱表系统后插入简谱条，页面相应加长。"""
-    sys.path.insert(0, str(HERE / 'insitu' / 'vendor'))
-    from score_align import Config as InSituConfig, build_output   # noqa: PLC0415
-
-    out_pdf.parent.mkdir(parents=True, exist_ok=True)
-    western, cells = build_output(score_pdf, jianpu_pdf, out_pdf, InSituConfig())
-    print(f'[insitu-strip] {western} 个谱表 / {cells} 个简谱格 -> {out_pdf} '
-          f'({out_pdf.stat().st_size/1024:.0f} KB)')
     return out_pdf
 
 
@@ -402,8 +444,11 @@ def main(argv: list[str]) -> int:
                     help='输出文件（mode=both 时作为前缀，默认与输入同名）')
     ap.add_argument('--mode', choices=('jianpu', 'insitu', 'both'), default='both')
     ap.add_argument('--engine', choices=('spaced', 'stamp', 'strip'), default='spaced',
-                    help='原位简谱：spaced=矢量插入空白（默认）；stamp=矢量贴字；'
-                         'strip=插条并加长页面')
+                    help='原位简谱：spaced=同尺寸分页（默认）；stamp=原位置叠印；'
+                         'strip=spaced 的兼容别名（不再加长页面）')
+    ap.add_argument('--layout', choices=('single', 'wrap'), default='single',
+                    help='原位简谱：single=一行五线谱对应一行简谱（默认，必要时横向压缩）；'
+                         'wrap=原字号，允许换为多行简谱')
     ap.add_argument('--pitch-mode', choices=('movable', 'fixed'), default='movable',
                     help='简谱音高：movable=首调（默认），fixed=固定调（C=1）')
     ap.add_argument('--mxl', type=Path, default=None, help='已有的 MusicXML（跳过 OMR）')
@@ -417,6 +462,8 @@ def main(argv: list[str]) -> int:
                     help='不生成 PDF 符头位置和多小节休止数字核对报告')
     ap.add_argument('--no-vector-keys', action='store_true',
                     help='不依据 PDF 推断识谱中延迟的调号位置')
+    ap.add_argument('--no-vector-slurs', action='store_true',
+                    help='不依据 PDF 连奏线重建 slur 起止')
     ap.add_argument('--work', type=Path, default=None,
                     help='OMR 中间结果目录（默认 <输出目录>/work）')
     ap.add_argument('--title', default=None, help='标题（默认取输入文件名）')
@@ -437,7 +484,7 @@ def main(argv: list[str]) -> int:
     # Generated files must never replace either of the user's inputs, even
     # when an output prefix happens to end in .jianpu or .insitu.
     generated = []
-    if args.mode in ('jianpu', 'both') or (args.mode == 'insitu' and args.engine == 'strip'):
+    if args.mode in ('jianpu', 'both'):
         generated.append(base.parent / f'{base.name}.jianpu.pdf')
     if args.mode in ('insitu', 'both'):
         generated.append(base.parent / f'{base.name}.insitu.pdf')
@@ -457,12 +504,14 @@ def main(argv: list[str]) -> int:
         write_pdf_notehead_audit(score, mxl, work, base.name)
     if not args.no_vector_keys:
         mxl = recover_pdf_keys(score, mxl, work, base.name)
+    if not args.no_vector_slurs:
+        mxl = recover_pdf_slurs(score, mxl, work, base.name)
     jianpu_mxl = mxl
-    if not args.no_vector_tempos and (args.mode in ('jianpu', 'both') or args.engine == 'strip'):
+    if not args.no_vector_tempos and args.mode in ('jianpu', 'both'):
         jianpu_mxl = recover_pdf_tempos(score, mxl, work, base.name)
-    if not args.no_vector_dynamics and (args.mode in ('jianpu', 'both') or args.engine == 'strip'):
+    if not args.no_vector_dynamics and args.mode in ('jianpu', 'both'):
         jianpu_mxl = recover_pdf_dynamics(score, mxl, jianpu_mxl, work, base.name)
-    if not args.no_vector_wedges and (args.mode in ('jianpu', 'both') or args.engine == 'strip'):
+    if not args.no_vector_wedges and args.mode in ('jianpu', 'both'):
         jianpu_mxl = recover_pdf_wedges(score, mxl, jianpu_mxl, work, base.name)
 
     if args.mode in ('jianpu', 'both'):
@@ -472,15 +521,9 @@ def main(argv: list[str]) -> int:
     if args.mode in ('insitu', 'both'):
         out = base.parent / f'{base.name}.insitu.pdf'
         if args.engine == 'strip':
-            ref = base.parent / f'{base.name}.jianpu.pdf'
-            # In insitu-only mode an existing PDF may belong to a previous
-            # MusicXML or source score; it is not a validated cache.
-            if args.mode == 'insitu':
-                musicxml_to_jianpu(jianpu_mxl, ref, title, pitch_mode=args.pitch_mode)
-            insitu_strip(score, ref, out)
-        else:
-            insitu_stamp(score, mxl, out, title, expand=args.engine == 'spaced',
-                         pitch_mode=args.pitch_mode)
+            print('[insitu] strip 已并入 spaced：保留原页面尺寸，空间不足自动分页。')
+        insitu_stamp(score, mxl, out, title, expand=args.engine != 'stamp',
+                     pitch_mode=args.pitch_mode, layout=args.layout)
     return 0
 
 

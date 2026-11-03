@@ -43,8 +43,6 @@ DEFAULT_AUDIVERIS_MIN_JAVA_VERSION = 25
 RUNTIME_ASSETS_DIR_NAME = 'package-assets'
 AUDIVERIS_RUNTIME_DIR_NAME = 'audiveris-runtime'
 LILYPOND_RUNTIME_DIR_NAME = 'lilypond-runtime'
-WAIFU2X_RUNTIME_DIR_NAME = 'waifu2x-runtime'
-REALESRGAN_RUNTIME_DIR_NAME = 'realesrgan-runtime'
 OMR_ENGINE_DIR_NAME = 'omr_engine'
 AUDIVERIS_INSTALL_DIR_NAME = 'Audiveris'
 # Version of the Audiveris source pinned by the omr_engine/audiveris submodule.
@@ -63,18 +61,6 @@ AUDIVERIS_MSI_NAMES = [
     'Audiveris.msi',
     'audiveris.msi',
 ]
-
-
-# Super-resolution engine
-class SREngine(Enum):
-    """Available super-resolution upscaling engines.
-
-    WAIFU2X:    waifu2x-ncnn-vulkan; optimised for line-art (current default).
-    REALESRGAN: Real-ESRGAN anime model; generally better quality for sheet music.
-                Prefers realesrgan-ncnn-vulkan binary, falls back to Python script.
-    """
-    WAIFU2X = 'waifu2x'
-    REALESRGAN = 'realesrgan'
 
 
 # OMR engine

@@ -1,8 +1,7 @@
 # core/image/image_preprocess.py — Pillow-based image processing pipeline (OMR-optimised)
-# SR engine discovery and upscaling have been moved to sr_upscale.py
 # Based on the Audiveris official guide:
 # https://audiveris.github.io/audiveris/_pages/guides/advanced/improved_input/
-# Pipeline: white-border crop → rotation correction → gradient fix → denoise/sharpen → SR → downsample
+# Pipeline: white-border crop → rotation correction → gradient fix → denoise/sharpen → downsample
 from __future__ import annotations
 
 import logging
@@ -18,7 +17,6 @@ except ImportError:
     HAS_PILLOW = False
 
 from ..utils import log_message, safe_remove_file
-from .sr_upscale import _current_sr_engine, upscale_image
 
 try:
     import numpy as np
@@ -451,12 +449,11 @@ def enhance_image(
     """Full image enhancement pipeline for OMR input.
 
     Steps: white-border crop → rotation correction → gradient fix →
-    denoise/sharpen → SR (if low-res) → pixel-limit downsample (if oversized).
+    denoise/sharpen → pixel-limit downsample (if oversized).
 
     apply_geometry=False skips the first three steps (for callers that already
     did geometric preprocessing).
     """
-    from ..config import SREngine
     if not HAS_PILLOW:
         log_message('Pillow 未安装，跳过图像增强管道。', logging.WARNING)
         return None
@@ -494,24 +491,6 @@ def enhance_image(
         intermediate_path = work_dir / f'enhanced_stage_{image_path.stem}.png'
         working.save(intermediate_path)
         current_path = intermediate_path
-
-        with Image.open(current_path) as chk:
-            min_dim = min(chk.size)
-        if min_dim < LOW_RES_PIXEL_THRESHOLD:
-            upscaled_path = work_dir / f'sr_{image_path.stem}.png'
-            ok = upscale_image(current_path, upscaled_path, scale=2)
-            if ok:
-                safe_remove_file(current_path)
-                current_path = upscaled_path
-                meta.sr_applied = True
-                engine_label = 'Real-ESRGAN' if _current_sr_engine == SREngine.REALESRGAN.value else 'waifu2x'
-                steps.append(f'{engine_label} 超分辨率')
-                log_message(
-                    f'  [增强] 最短边 {min_dim}px < {LOW_RES_PIXEL_THRESHOLD}px，'
-                    f'已执行超分辨率放大（{engine_label}）。'
-                )
-            else:
-                log_message('  [增强] 超分辨率放大失败，使用现有分辨率继续。', logging.WARNING)
 
         rescaled = fit_image_within_pixel_limit(current_path, work_dir, max_pixels=max_pixels)
         if rescaled is not None:

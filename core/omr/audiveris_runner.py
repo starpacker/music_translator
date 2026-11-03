@@ -116,8 +116,8 @@ def run_audiveris_batch(
     input_path          : Input score file (PDF / PNG / JPG).
     output_dir          : Directory for Audiveris job outputs.
     skip_preprocessing  : When True, bypass the internal image preprocessing step
-                          (waifu2x SR + Pillow enhancement + downscale).  Set this flag
-                          when the caller has already run enhance_image() upstream.
+                          (Pillow enhancement + downscale).  Set this flag when the
+                          caller has already run enhance_image() upstream.
     """
     required_java_version = get_audiveris_required_java_version()
     java_exe = find_java_executable(required_java_version)

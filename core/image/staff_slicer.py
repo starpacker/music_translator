@@ -11,9 +11,6 @@ from .image_preprocess import (
     HAS_PILLOW,
     detect_and_correct_rotation,
 )
-from .sr_upscale import (
-    upscale_image,
-)
 from ..utils import log_message
 
 try:
@@ -123,8 +120,7 @@ def normalize_dpi_by_interline(
     决策逻辑
     --------
     - 间距在 [spacing_low, spacing_high]：返回 None，调用方保持原路径。
-    - 间距 < spacing_low（图太小）：优先 waifu2x 超分辨率放大后精确缩放；
-      waifu2x 不可用时回退 INTER_CUBIC。
+    - 间距 < spacing_low（图太小）：INTER_CUBIC 双三次插值放大到目标间距。
     - 间距 > spacing_high（图太大）：INTER_AREA 高质量降采样。
 
     打印 print 日志显示原始间距、缩放比例及预计缩放后间距。
@@ -173,25 +169,9 @@ def normalize_dpi_by_interline(
             print(f'[DPI归一化] 降采样完成，预计间距 ≈ {spacing * scale:.2f} px')
             return result
 
-        # 放大：优先超分辨率，失败则 INTER_CUBIC
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            tmp_in = Path(tmp_dir) / 'dpi_in.png'
-            tmp_out = Path(tmp_dir) / 'dpi_out.png'
-            _cv2.imwrite(str(tmp_in), img_array)
-            sr_scale = 4 if scale > 3.0 else 2
-            ok = upscale_image(tmp_in, tmp_out, scale=sr_scale)
-            if ok:
-                sr_img = _cv2.imread(str(tmp_out))
-                if sr_img is not None:
-                    result = _cv2.resize(sr_img, (new_w, new_h), interpolation=_cv2.INTER_AREA)
-                    print(f'[DPI归一化] SR {sr_scale}× 超分+精确缩放完成，'
-                          f'预计间距 ≈ {spacing * scale:.2f} px')
-                    return result
-
-        # 回退：INTER_CUBIC 双三次插值
+        # 放大：INTER_CUBIC 双三次插值
         result = _cv2.resize(img_array, (new_w, new_h), interpolation=_cv2.INTER_CUBIC)
-        print(f'[DPI归一化] INTER_CUBIC 放大完成（超分辨率不可用），'
-              f'预计间距 ≈ {spacing * scale:.2f} px')
+        print(f'[DPI归一化] INTER_CUBIC 放大完成，预计间距 ≈ {spacing * scale:.2f} px')
         return result
 
     except Exception as exc:
