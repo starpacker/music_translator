@@ -126,15 +126,22 @@ def _programs(data: bytes) -> list[bytes]:
 
 
 _WRAPPERS = {b'q': b'Q', b'BT': b'ET', b'BDC': b'EMC', b'BMC': b'EMC'}
+# Each graphics-state operator gets its own slot.  Sharing a slot (e.g. mapping
+# ``w``, ``J``, ``j`` and ``d`` all to ``'line'``) makes later operators overwrite
+# earlier ones in the ``state`` dict: the source writes ``SCN`` (stroke colour),
+# then ``w`` (line width), then ``J``/``j``/``d`` (cap/join/dash) before every
+# path, so a shared ``'line'`` slot kept only the last of those and dropped the
+# staff-line width entirely — every staff rendered as a hairline.  Unique slots
+# keep every operator so each is replayed in the object prefix.
 _STATE_SLOTS = {
-    b'g': 'fill', b'rg': 'fill', b'k': 'fill', b'sc': 'fill', b'scn': 'fill', b'cs': 'fill',
-    b'G': 'stroke', b'RG': 'stroke', b'K': 'stroke', b'SC': 'stroke', b'SCN': 'stroke',
-    b'CS': 'stroke', b'w': 'line', b'J': 'line', b'j': 'line', b'M': 'line', b'd': 'line',
-    b'ri': 'line', b'i': 'line', b'gs': 'gs', b'cm': 'cm',
-    b'Tc': 'text', b'Tw': 'text', b'Tz': 'text', b'TL': 'text', b'Tr': 'text', b'Ts': 'text',
-    b'Tf': 'font',
+    b'g': 'g', b'rg': 'rg', b'k': 'k', b'sc': 'sc', b'scn': 'scn', b'cs': 'cs',
+    b'G': 'G', b'RG': 'RG', b'K': 'K', b'SC': 'SC', b'SCN': 'SCN',
+    b'CS': 'CS', b'w': 'w', b'J': 'J', b'j': 'j', b'M': 'M', b'd': 'd',
+    b'ri': 'ri', b'i': 'i', b'gs': 'gs', b'cm': 'cm',
+    b'Tc': 'Tc', b'Tw': 'Tw', b'Tz': 'Tz', b'TL': 'TL', b'Tr': 'Tr', b'Ts': 'Ts',
+    b'Tf': 'Tf',
 }
-_TEXT_STATE_SLOTS = {'text', 'font'}
+_TEXT_STATE_SLOTS = {'Tc', 'Tw', 'Tz', 'TL', 'Tr', 'Ts', 'Tf'}
 _PAINT_ENDERS = {
     b'S', b's', b'f', b'F', b'f*', b'B', b'B*', b'b', b'b*', b'n',
     b'Do', b'sh', b'BI', b'EI', b'd0', b'd1', b'Tj', b'TJ', b"'", b'"',
@@ -301,7 +308,12 @@ def _split_objects(data: bytes) -> list[tuple[bytes, bytes]]:
     while True:
         objects = _state_objects(data, state, text_state)
         if len(objects) != 1:
-            return objects
+            # A page-wide wrapper often opens onto several nested wrappers.
+            # Each nested one can still hold every system on the page, so stop
+            # only at painting level: descending just until a level yields
+            # more than one object leaves a page-tall fragment that no staff
+            # row can hold.
+            return _descend(objects)
         wrapped = _wrapper(objects[0][1])
         if wrapped is None or wrapped[0] == b'BT':
             return objects
@@ -320,9 +332,39 @@ def _split_objects(data: bytes) -> list[tuple[bytes, bytes]]:
         return objects
 
 
+def _descend(objects: list[tuple[bytes, bytes]]) -> list[tuple[bytes, bytes]]:
+    """Recursively split objects that are themselves ``q…Q``/marked-content wrappers.
+
+    Each child keeps the graphics-state prefix accumulated by its parent, so
+    the resulting programs stay self-contained and can be painted one at a
+    time.  ``len(wrapped[1]) < len(body)`` guarantees the recursion shrinks the
+    input, so it always terminates.
+    """
+    result = []
+    for prefix, body in objects:
+        wrapped = _wrapper(body)
+        if (wrapped is not None and wrapped[0] != b'BT'
+                and len(wrapped[1]) < len(body)):
+            combined = ((prefix + b'\n') if prefix else b'') + wrapped[1]
+            result.extend(_split_objects(combined))
+        else:
+            result.append((prefix, body))
+    return result
+
+
 def _split_programs(data: bytes) -> list[bytes]:
-    """Self-contained painting programs, descending a page-wide wrapper."""
-    return [((prefix + b'\n') if prefix else b'') + body
+    """Self-contained painting programs, descending a page-wide wrapper.
+
+    ``_split_objects`` returns (prefix, body) pairs whose prefix carries the
+    accumulated graphics state (colour, line width, and the ``cm`` CTM) but
+    whose body is usually a bare path or ``BT…ET`` block with no enclosing
+    ``q…Q``.  When ``place`` joins several of these with newlines, the CTM and
+    other state leak from one program into the next: every ``cm`` composes onto
+    the previous program's leftover matrix, shredding and shifting the staff
+    lines off-page.  Enclose each program in its own ``q…Q`` so every program
+    starts from a clean state and restores it afterwards.
+    """
+    return [b'q\n' + ((prefix + b'\n') if prefix else b'') + body + b'\nQ'
             for prefix, body in _split_objects(data)]
 
 
@@ -394,7 +436,13 @@ class SourceObjects:
             # Descend to the painting level only when the evidence says so.
             tallest = max((g.bounds.height for g in objects if not g.bounds.is_empty),
                           default=0.0)
-            if tallest > self.height * .5:
+            # A page-wide wrapper is not always taller than half a short page:
+            # on a five-system page it can cover every staff and still measure
+            # less than that.  Any object that spans more than one staff can
+            # never be placed under a single staff, so descend then too.
+            crossing = max((self._system_span(g) for g in objects
+                            if not g.bounds.is_empty), default=0)
+            if tallest > self.height * .5 or crossing > 1:
                 divided = _split_programs(data)
                 if len(divided) > len(objects):
                     objects = self._describe(divided)
@@ -422,15 +470,19 @@ class SourceObjects:
             objects.append(Graphic(program, box, anchor, text))
         return objects
 
+    def _system_span(self, graphic):
+        """Number of staffs the graphic's ink covers from top to bottom."""
+        return sum(graphic.bounds.y0 <= layout.staff.top
+                   and graphic.bounds.y1 >= layout.staff.bottom
+                   for _, layout in self._layouts)
+
     def _contains_systems(self, graphic):
         if graphic.bounds.is_empty:
             return False
         # Only multi-operation forms need flattening, not long intact curves.
         if b'Do' not in graphic.program:
             return False
-        return sum(graphic.bounds.y0 <= layout.staff.top
-                   and graphic.bounds.y1 >= layout.staff.bottom
-                   for _, layout in self._layouts) > 1
+        return self._system_span(graphic) > 1
 
     def _assign(self):
         if not self._layouts:

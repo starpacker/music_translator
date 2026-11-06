@@ -283,6 +283,23 @@ def _reference_step_from_header(header: str | None, tonic_semitone: int) -> str 
         return None
 
 
+def fixed_reference(name: str = 'C') -> tuple[int, str, str]:
+    """Resolve a fixed-Do reference such as ``C``, ``D`` or ``Bb``.
+
+    Returns ``(pitch-class semitone, diatonic step letter, header name)`` so
+    fixed-pitch jianpu can number notes from any reference note, not only C.
+    """
+    from music21.pitch import Pitch
+    cleaned = (name or 'C').strip()
+    if not cleaned:
+        cleaned = 'C'
+    try:
+        pitch = Pitch(cleaned[0].upper() + cleaned[1:].replace('b', '-'))
+    except Exception as exc:  # music21 raises PitchException for bad step names
+        raise ValueError(f'无效的固定调主音: {name!r}（应为 C、D、Bb、F# 之类的音名）') from exc
+    return pitch.pitchClass, pitch.step, pitch.name.replace('-', 'b')
+
+
 def _pitch_to_fields(pitch, key_tonic_semitone: int,
                      tonic_step: str | None = None) -> tuple[str, str, int, int, int]:
     """Map a music21 Pitch to (accidental, symbol, upper_dots, lower_dots, midi).
@@ -527,23 +544,33 @@ def _jianpu_note_token_unmarked(note: JianpuNote) -> str:
     else:
         base_note = note.accidental + note.symbol + jianpu_octave_symbol(note.upper_dots, note.lower_dots)
 
+    # Per-pitch ties (合音里只连其中某几个音) are encoded as an ``@PT`` suffix.
+    # jianpu-ly strips ``@PT…`` off the end of the word *before* parsing the note,
+    # so the suffix must sit after the dots/prefix that spell the duration —
+    # ``q#1'#4'.@PT1e1``, never ``q#1'#4'@PT1e1.`` (the trailing dot would be
+    # swallowed into the tie spec and rejected as an invalid pitch tie).
+    pt_suffix = ''
     if (note.pitch_tie_starts or note.pitch_tie_stops
             or note.pitch_tie_carry_in or note.pitch_tie_carry_out):
-        # Keep annotations in the note word so tempo, dynamics, tuplets, and
-        # duration dashes still attach to the right musical event.
         markers = ([f'{index}e{tie_id}' for index, tie_id in note.pitch_tie_stops]
                    + [f'{index}s{tie_id}' for index, tie_id in note.pitch_tie_starts]
                    + [f'{index}i{tie_id}' for index, tie_id in note.pitch_tie_carry_in]
                    + [f'{index}o{tie_id}' for index, tie_id in note.pitch_tie_carry_out])
-        base_note += '@PT' + ','.join(markers)
+        pt_suffix = '@PT' + ','.join(markers)
 
     if getattr(note, 'is_grace', False):
-        return f'g[{base_note}]'
+        return f'g[{base_note}{pt_suffix}]'
 
     tol = 0.01
     d = note.written_duration if note.written_duration is not None else note.duration
 
     if note.is_rest:
+        if abs(d - 8.0) < tol:
+            return '0 - - - - - - -'
+        if abs(d - 6.0) < tol:
+            return '0 - - - - -'
+        if abs(d - 5.0) < tol:
+            return '0 - - - -'
         if abs(d - 4.0) < tol:
             return '0 - - -'
         if abs(d - 3.0) < tol:
@@ -572,33 +599,39 @@ def _jianpu_note_token_unmarked(note: JianpuNote) -> str:
             return 'h0'
         return '0'
 
+    if abs(d - 8.0) < tol:
+        return f'{base_note}{pt_suffix} - - - - - - -'
+    if abs(d - 6.0) < tol:
+        return f'{base_note}{pt_suffix} - - - - -'
+    if abs(d - 5.0) < tol:
+        return f'{base_note}{pt_suffix} - - - -'
     if abs(d - 4.0) < tol:
-        return f'{base_note} - - -'
+        return f'{base_note}{pt_suffix} - - -'
     if abs(d - 3.0) < tol:
-        return f'{base_note} - -'
+        return f'{base_note}{pt_suffix} - -'
     if abs(d - 2.0) < tol:
-        return f'{base_note} -'
+        return f'{base_note}{pt_suffix} -'
     if abs(d - 1.5) < tol:
-        return f'{base_note}.'
+        return f'{base_note}.{pt_suffix}'
     if abs(d - 1.0) < tol:
-        return base_note
+        return f'{base_note}{pt_suffix}'
     if abs(d - 0.75) < tol:
-        return f'q{base_note}.'
+        return f'q{base_note}.{pt_suffix}'
     if abs(d - 0.5) < tol:
-        return f'q{base_note}'
+        return f'q{base_note}{pt_suffix}'
     if abs(d - 0.375) < tol:
-        return f's{base_note}.'
+        return f's{base_note}.{pt_suffix}'
     if abs(d - 0.25) < tol:
-        return f's{base_note}'
+        return f's{base_note}{pt_suffix}'
     if abs(d - 0.1875) < tol:
-        return f'd{base_note}.'
+        return f'd{base_note}.{pt_suffix}'
     if abs(d - 0.125) < tol:
-        return f'd{base_note}'
+        return f'd{base_note}{pt_suffix}'
     if abs(d - 0.09375) < tol:
-        return f'h{base_note}.'
+        return f'h{base_note}.{pt_suffix}'
     if abs(d - 0.0625) < tol:
-        return f'h{base_note}'
-    return f'q{base_note}'
+        return f'h{base_note}{pt_suffix}'
+    return f'q{base_note}{pt_suffix}'
 
 
 def jianpu_note_token(note: JianpuNote) -> str:
@@ -743,7 +776,7 @@ def split_duration_chunks(duration: float) -> list[float]:
 # jianpu-ly.py sets barLength = int(64 * num / denom) and uses integer Fraction arithmetic.
 # Map each allowed quarter-length duration to its 64th-note unit count.
 _DURATION_TO_UNITS: dict[float, int | Fraction] = {
-    4.0: 64, 3.0: 48, 2.0: 32, 1.5: 24, 1.0: 16,
+    8.0: 128, 6.0: 96, 5.0: 80, 4.0: 64, 3.0: 48, 2.0: 32, 1.5: 24, 1.0: 16,
     0.75: 12, 0.5: 8, 0.375: 6, 0.25: 4, 0.1875: 3, 0.125: 2, 0.09375: Fraction(3, 2), 0.0625: 1,
 }
 _ALLOWED_UNITS_DESC: list[tuple[int | Fraction, float]] = sorted(

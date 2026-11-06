@@ -73,6 +73,19 @@ class NotationPreservationTest(unittest.TestCase):
         source = list(score.parts[0].getElementsByClass(stream.Measure))[0]
         self.assertEqual([type(a).__name__ for a in source.notes[0].articulations], ['Accent', 'Staccato'])
 
+    def test_notes_longer_than_a_whole_note_are_not_clamped(self):
+        # A dotted-whole (6 QL, the standard whole note in 6/4 or 12/8) and a
+        # breve (8 QL) must survive extraction at full length.  The old
+        # ALLOWED_JIANPU_DURATIONS stopped at 4.0, so normalize_jianpu_duration
+        # silently clamped 6.0 -> 4.0 and the tokenizer dropped two beats.
+        from core.notation.jianpu.primitives import normalize_jianpu_duration
+        for q_len, expected_token in ((5.0, '1 - - - -'),
+                                      (6.0, '1 - - - - -'),
+                                      (8.0, '1 - - - - - - -')):
+            jn = note_to_jianpu(note.Note('C4', quarterLength=q_len))
+            self.assertEqual(normalize_jianpu_duration(q_len), q_len)
+            self.assertEqual(jianpu_note_token(jn), expected_token)
+
     def test_long_note_and_tuplet_attach_before_dashes_or_group_end(self):
         original = note.Note('C4', quarterLength=3)
         original.articulations.append(articulations.Accent())

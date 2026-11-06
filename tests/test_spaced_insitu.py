@@ -52,6 +52,27 @@ class SourceObjectsTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'unbalanced'):
             _programs(b'q q Q')
 
+    def test_graphics_state_operators_do_not_overwrite_each_other(self):
+        """``w``/``J``/``j``/``d`` must each survive splitting.
+
+        The source writes stroke colour (``SCN``), then line width (``w``),
+        then cap/join/dash (``J``/``j``/``d``) before every path.  When these
+        shared a single ``'line'`` state slot, later operators overwrote earlier
+        ones and the staff-line width was dropped — every staff rendered as a
+        hairline.  Each operator keeps its own slot so all of them are replayed.
+        """
+        data = (b'q 0 0 0 SCN 1.8 w 0 J 2 j [] 0 d '
+                b'3203 806 m 3203 754 l S '
+                b'0 0 0 SCN 1 w 0 J 2 j [] 0 d '
+                b'4000 806 m 4000 754 l S Q')
+        divided = _split_programs(data)
+        self.assertEqual(len(divided), 2)
+        self.assertIn(b'1.8 w', divided[0])
+        self.assertIn(b'0 J', divided[0])
+        self.assertIn(b'2 j', divided[0])
+        self.assertIn(b'[] 0 d', divided[0])
+        self.assertIn(b'1 w', divided[1])   # second path's own width, not 1.8
+
     def test_page_wide_wrapper_is_split_into_staff_sized_objects(self):
         """A page wrapped in one q…Q/BDC…EMC must not become one huge object.
 
@@ -74,6 +95,25 @@ class SourceObjectsTest(unittest.TestCase):
             self.assertNotIn(b'<<', program)
         self.assertIn(b'(A)', divided[0])
         self.assertIn(b'(B)', divided[1])
+
+    def test_nested_wrappers_are_split_to_the_painting_level(self):
+        """Two nested wrappers must not stay whole just because the page-wide
+        wrapper yielded more than one child.
+
+        MuseScore-style sources nest a ``q…Q`` inside the page-wide wrapper,
+        and each nested group can still hold every system on the page.  If the
+        descent stops as soon as a level yields two children, one child remains
+        page-tall and can never be placed under a single staff.
+        """
+        data = (b'q /GS1 gs '
+                b'q BT 12 0 0 12 56 759 Tm (A)Tj ET BT 12 0 0 12 56 300 Tm (B)Tj ET Q '
+                b'q BT 12 0 0 12 56 100 Tm (C)Tj ET Q Q')
+        divided = _split_programs(data)
+        self.assertEqual(len(divided), 3)
+        for program, letter in zip(divided, (b'(A)', b'(B)', b'(C)')):
+            self.assertIn(b'/GS1 gs', program)
+            self.assertIn(letter, program)
+            self.assertEqual(program.count(b'Tj'), 1)
 
     def test_stroked_text_and_disconnected_paths_replay_intact(self):
         with fitz.open() as doc, fitz.open() as out:

@@ -16,6 +16,7 @@ from .primitives import (
     _get_score_key_tonic,
     _reference_step_from_header,
     _tonic_result,
+    fixed_reference,
 )
 from .measure import (
     MeasureBarUnits,
@@ -172,7 +173,8 @@ def _extract_part_repeat_barlines(part) -> dict[int, dict[str, bool]]:
 def extract_jianpu_measures(score, key_tonic_semitone: int = 0,
                              _part=None, _voice_id: str = '1',
                              *, follow_key_changes: bool = False,
-                             pitch_mode: str = 'movable') -> tuple[list[list[JianpuNote]], str]:
+                             pitch_mode: str = 'movable',
+                             fixed_tonic: str = 'C') -> tuple[list[list[JianpuNote]], str]:
     """
     Extract jianpu measure list and time signature from a music21 score.
     Merges polyphony by offset; fills gaps and overflows with rests at bar boundaries.
@@ -191,8 +193,9 @@ def extract_jianpu_measures(score, key_tonic_semitone: int = 0,
     """
     if pitch_mode not in ('movable', 'fixed'):
         raise ValueError(f'unsupported pitch mode: {pitch_mode}')
+    fixed_step: str | None = None
     if pitch_mode == 'fixed':
-        key_tonic_semitone = 0
+        key_tonic_semitone, fixed_step, _ = fixed_reference(fixed_tonic)
         follow_key_changes = False
     part = _part if _part is not None else (score.parts[0] if score.parts else score.flatten())
     time_signature = '4/4'
@@ -205,7 +208,7 @@ def extract_jianpu_measures(score, key_tonic_semitone: int = 0,
     measures: MeasureBarUnits = MeasureBarUnits()
     initial_tonic, initial_header = _get_score_key_tonic(score)
     active_header = initial_header if initial_tonic == key_tonic_semitone else None
-    tonic_step = 'C' if pitch_mode == 'fixed' else _reference_step_from_header(active_header, key_tonic_semitone)
+    tonic_step = fixed_step if pitch_mode == 'fixed' else _reference_step_from_header(active_header, key_tonic_semitone)
     measure_streams = list(part.getElementsByClass(stream.Measure))
     if not measure_streams:
         fallback_notes = [note_to_jianpu(element, key_tonic_semitone, tonic_step=tonic_step)
@@ -514,7 +517,8 @@ def extract_jianpu_measures(score, key_tonic_semitone: int = 0,
 
 
 def extract_strict_jianpu_measures(score, key_tonic_semitone: int = 0,
-                                    _part=None, *, pitch_mode: str = 'movable') -> tuple[list[list[JianpuNote]], str]:
+                                    _part=None, *, pitch_mode: str = 'movable',
+                                    fixed_tonic: str = 'C') -> tuple[list[list[JianpuNote]], str]:
     """
     Extract jianpu measures by re-slicing all notes strictly by bar length,
     ignoring the score's own Measure objects.
@@ -527,11 +531,12 @@ def extract_strict_jianpu_measures(score, key_tonic_semitone: int = 0,
     """
     if pitch_mode not in ('movable', 'fixed'):
         raise ValueError(f'unsupported pitch mode: {pitch_mode}')
+    fixed_step: str | None = None
     if pitch_mode == 'fixed':
-        key_tonic_semitone = 0
+        key_tonic_semitone, fixed_step, _ = fixed_reference(fixed_tonic)
     part = _part if _part is not None else (score.parts[0] if score.parts else score.flatten())
     initial_tonic, header = _get_score_key_tonic(score)
-    tonic_step = ('C' if pitch_mode == 'fixed' else
+    tonic_step = (fixed_step if pitch_mode == 'fixed' else
                   _reference_step_from_header(header, key_tonic_semitone)
                   if initial_tonic == key_tonic_semitone else None)
     # 合并延音线：同小节 start→stop 对合并为单音符；跨小节 tie 的合并音符由

@@ -37,6 +37,7 @@ from core.notation.jianpu import (  # noqa: E402
     extract_jianpu_measures,
     _get_score_key_tonic,
     _extract_part_repeat_barlines,
+    fixed_reference,
 )
 from core.render.jianpu_runner import _insert_repeat_bar_commands  # noqa: E402
 from core.notation.musicxml_wedges import parse_musicxml_compatible  # noqa: E402
@@ -61,12 +62,82 @@ _LINE_WIDTH_PT = 540
 
 # ── per-measure tokens ───────────────────────────────────────────────────────
 
+# Dot-style articulations (staccato/staccatissimo) render as a LilyPond dot
+# directly above the jianpu digit — the same place a high-octave (高音) dot
+# goes.  On a numbered-notation line that dot is indistinguishable from a 高音
+# mark and was misreading e.g. a plain staccato ``6`` as 高音6.  These are
+# performance marks with no numbered-notation counterpart, so drop them from
+# the in-situ line (the standalone reportlab fallback already ignores them,
+# which is why jianpu.pdf never showed the dot).
+_DOT_ARTICULATIONS = {'\\staccato', '\\staccatissimo'}
+
+
 def _measure_texts(measures, time_sig: str) -> list[str]:
-    """Return one jianpu-ly token string per measure, exactly as the library does."""
+    """Return one jianpu-ly token string per measure, exactly as the library does.
+
+    Dot-style articulations are filtered out so they cannot collide with the
+    octave-dot position (see ``_DOT_ARTICULATIONS``).
+    """
     out = []
     for m in measures:
-        out.append(' '.join(jianpu_note_token(n) for n in m))
+        tokens = []
+        for n in m:
+            if n.notations:
+                kept = tuple(mark for mark in n.notations
+                             if mark.lstrip('^_') not in _DOT_ARTICULATIONS)
+                n = copy.copy(n)
+                n.notations = kept
+            tokens.append(jianpu_note_token(n))
+        out.append(' '.join(tokens))
     return out
+
+
+def _overfilled_measures(measures, time_sig: str, *, is_first_line: bool,
+                         time_sigs: list = ()) -> list[int]:
+    """Return 0-based indices of measures whose total duration exceeds the meter.
+
+    jianpu-ly's own barcheck only fails when a single note *crosses* a barline;
+    an OMR over-filled measure that happens to end cleanly on a note boundary
+    (e.g. 4.5 beats in 4/4) is silently typeset with the wrong rhythm.  We flag
+    those here so the caller can blank the offending measure rather than render
+    a rhythm the source never had.  Anacrusis/short pickup bars and a short
+    final bar are legitimate under-fills and are not reported.
+
+    ``time_sigs`` is an optional per-measure list of time-signature strings
+    (aligned with ``measures``) carrying each measure's *own* meter, including
+    mid-piece metre changes (e.g. 2/4 → 5/8 → 2/4).  It is authoritative when
+    present; the piece-level ``time_sig`` is only the fallback.  Without this,
+    every measure in a 5/8 section would be judged against the piece's first
+    signature (say 2/4) and wrongly flagged as over-filled.
+
+    ``measure_bar_signature`` only writes a string on measures that carry an
+    explicit ``<time>`` element; every following measure that merely *inherits*
+    the signature is recorded as ``None``.  Treat ``None`` as "carry forward the
+    most recent explicit signature" rather than "fall back to the piece-level
+    signature", otherwise the first measure of a new metre (5/8) is judged
+    against the old one (2/4) and the whole line is wrongly skipped.
+    """
+    bad = []
+    carried: str | None = None
+    for i, measure in enumerate(measures):
+        own = time_sigs[i] if i < len(time_sigs) and time_sigs[i] else None
+        if own:
+            carried = own
+        sig = carried or time_sig
+        try:
+            num_s, denom_s = sig.split(',')[0].split('/')
+            expected = int(num_s) * 4.0 / int(denom_s)
+        except (ValueError, ZeroDivisionError, AttributeError):
+            continue
+        total = sum(float(getattr(n, 'duration', 0.0)) for n in measure)
+        if total <= expected + 1e-6:
+            continue
+        # Allow a leading pickup/anacrusis to run short, but a *full* measure
+        # that runs long is an OMR over-fill.
+        if is_first_line and i == 0:
+            continue
+        bad.append(i)
+    return bad
 
 
 def _line_slur_continuations(measures, start: int, end: int):
@@ -907,7 +978,8 @@ def _render_source(chunk, line_key, time_sig, title, workdir, local_repeats):
 
 def build(pdf_path: Path, mxl_path: Path, out_path: Path,
           title: Optional[str] = None, expand: bool = True,
-          pitch_mode: str = 'movable', layout: str = 'single') -> Path:
+          pitch_mode: str = 'movable', layout: str = 'single',
+          fixed_tonic: str = 'C') -> Path:
     from insitu.line_layout import render_lines, place_line
     from insitu.reflow import SourceObjects, paginate
 
@@ -932,12 +1004,13 @@ def build(pdf_path: Path, mxl_path: Path, out_path: Path,
     score = parse_musicxml_compatible(mxl_path)
     tonic, key_header = _get_score_key_tonic(score)
     if pitch_mode == 'fixed':
-        tonic, key_header = 0, '1=C'
+        tonic, _, tonic_name = fixed_reference(fixed_tonic)
+        key_header = f'1={tonic_name}'
     part = score.parts[0] if score.parts else None
     # Source scores are monophonic: one staff maps to exactly one jianpu line.
     # Any OMR-tagged "second voice" is recognition noise, never a second track.
     tracks = [extract_jianpu_measures(score, tonic, follow_key_changes=True,
-                                      pitch_mode=pitch_mode)]
+                                      pitch_mode=pitch_mode, fixed_tonic=fixed_tonic)]
     if len(score.parts) > 1:
         print('[insitu] 检测到多个乐器分部；当前原位对齐仅使用第一个分部，请校对。')
     repeat_bars = _extract_part_repeat_barlines(part) if part is not None else {}
@@ -977,11 +1050,35 @@ def build(pdf_path: Path, mxl_path: Path, out_path: Path,
                     if any(event.tie_review for event in measure)
                 ]
 
+                # Over-filled measures are still rendered, not blanked or
+                # skipped: the user's decision is to pass HOMR's raw output
+                # through even when a measure runs long ("即便超时值了，也
+                # 输出").  jianpu-ly derives each measure's \time from the notes
+                # we actually emit (layout_time_tokens), so a long measure
+                # renders fine on its own; blanking it would shrink its bar
+                # length and desynchronise barPos, making the *next* measure's
+                # note cross a barline and aborting the whole line.  We only
+                # log the over-fill as a review hint.
+                line_time_sigs = getattr(measures, 'time_signatures', [])
+                # ``overfilled`` is slice-relative (0-based within the staff's
+                # own measure slice), matching ``place_line``'s ``start+offset``.
+                # A parallel piece-absolute list is derived for logging/report.
+                overfilled = set(
+                    i for i in _overfilled_measures(
+                        measures[sl.omr_start:sl.omr_end], time_sig,
+                        is_first_line=(sl.omr_start == 0),
+                        time_sigs=line_time_sigs[sl.omr_start:sl.omr_end]))
+                # Keep the over-fill set on the voice report so the placement
+                # pass can draw a per-measure review marker (and the JSON report
+                # carries it for downstream consumers).
+                voice_report['overfilled_measures'] = sorted(overfilled)
+
                 def source_chunk(start, end):
                     absolute = sl.omr_start + start
                     line = _line_slur_continuations(measures, absolute, sl.omr_start + end)
-                    texts = _with_time_signatures(_measure_texts(line, time_sig), 0,
-                                                  layout_time_tokens(line, 64))
+                    texts = _with_time_signatures(
+                        _measure_texts(line, time_sig), 0,
+                        layout_time_tokens(line, 64))
                     changes = getattr(measures, 'key_changes', {})
                     return [f'{changes[absolute + offset][1]} {text}'
                             if absolute + offset in changes else text
@@ -991,6 +1088,10 @@ def build(pdf_path: Path, mxl_path: Path, out_path: Path,
                 if not chunk:
                     voice_report['error'] = 'no_measures_assigned'
                     continue
+                if overfilled:
+                    print(f'  ! staff {index + 1} voice {voice_index + 1}: 小节'
+                          f' {"、".join(str(sl.omr_start + n + 1) for n in sorted(overfilled))}'
+                          f' 时值超出，请校对（仍输出简谱）')
                 try:
                     workdir = tmpdir / f'sys_{index}_voice_{voice_index}'
                     workdir.mkdir(parents=True, exist_ok=True)
@@ -1005,8 +1106,19 @@ def build(pdf_path: Path, mxl_path: Path, out_path: Path,
                     voice_report['rendered'] = True
                     first_key = False
                 except Exception as exc:
+                    # LilyPond/jianpu-ly rejected this line (typically ``note
+                    # crosses barline`` from OMR over-filled measures).  A
+                    # reportlab fallback used to draw the digits here, but the
+                    # recovered line was visually jarring next to the real
+                    # jianpu lines, so we now leave the staff without a jianpu
+                    # line instead of rendering a mismatched one.
                     voice_report['error'] = str(exc)
-                    print(f'  ! staff {index + 1} voice {voice_index + 1}: {exc}')
+                    voice_report['fallback'] = True
+                    voice_report['placement'] = 'skipped'
+                    voice_report['rendered'] = False
+                    print(f'  ! staff {index + 1} voice {voice_index + 1}: {exc}'
+                          f'（不输出简谱）')
+                    first_key = False
             tiles[index] = line_tiles
 
         def place_tiles(page, index, row_tiles, top):
@@ -1018,7 +1130,8 @@ def build(pdf_path: Path, mxl_path: Path, out_path: Path,
                                        top, available, layout,
                                        target_barlines=[staff_layout.staff.x0, *staff_layout.barlines],
                                        tile_barlines=_tile_barlines, place_cell=_place_cell,
-                                       measure_report=voice['measures'])
+                                       measure_report=voice['measures'],
+                                       overfilled_measures=set(voice.get('overfilled_measures', ())))
                 compressed = sum(1 for item in voice['measures'][before:]
                                  if item['placement'] == 'scaled')
                 voice['compressed_measure_count'] = (
@@ -1080,11 +1193,13 @@ def build(pdf_path: Path, mxl_path: Path, out_path: Path,
     for row in row_reports:
         for voice in row['voices']:
             voice['line_count'] = len(voice['lines'])
+        # A row is "rendered" when every voice got a jianpu line, *or* was an
+        # intentional fallback skip (source staff present, jianpu omitted).
         row['rendered'] = (len(row['voices']) == len(tracks)
-                           and all(v['rendered'] and v['lines'] for v in row['voices']))
+                           and all(v['rendered'] or v.get('fallback') for v in row['voices']))
     placed = sum(row['rendered'] for row in row_reports)
     missing = len(staves) - placed
-    fallback_rows = sum(any(v['placement'] in ('scaled', 'line') for v in row['voices'])
+    fallback_rows = sum(any(v.get('fallback') for v in row['voices'])
                         for row in row_reports)
     mismatches = sum(row['pdf_measures'] != row['musicxml_measures'] for row in row_reports)
     tie_review_count = sum(len(v['tie_review_measures']) for row in row_reports for v in row['voices'])

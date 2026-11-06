@@ -36,6 +36,7 @@ from .extract import (
     extract_strict_jianpu_measures,
     strip_grace_notes,
 )
+from .primitives import fixed_reference
 
 from ...config import JianpuNote  # re-export for callers that import it from here
 
@@ -275,13 +276,16 @@ def _measure_text_with_tempos(notes: list[JianpuNote], marks: list[tuple[float, 
     return ' '.join(words)
 
 
-def parse_score_to_jianpu(score, pitch_mode: str = 'movable') -> tuple[list[list[JianpuNote]], list[str], str]:
+def parse_score_to_jianpu(score, pitch_mode: str = 'movable',
+                          fixed_tonic: str = 'C') -> tuple[list[list[JianpuNote]], list[str], str]:
     """Parse a score into jianpu format; return (measures, header_lines, time_sig)."""
     key_tonic_semitone, key_header = _get_score_key_tonic(score)
     if pitch_mode == 'fixed':
-        key_tonic_semitone, key_header = 0, '1=C'
+        key_tonic_semitone, _, tonic_name = fixed_reference(fixed_tonic)
+        key_header = f'1={tonic_name}'
 
-    measures, time_signature = extract_jianpu_measures(score, key_tonic_semitone, pitch_mode=pitch_mode)
+    measures, time_signature = extract_jianpu_measures(
+        score, key_tonic_semitone, pitch_mode=pitch_mode, fixed_tonic=fixed_tonic)
     header_lines: list[str] = [f'{key_header} {time_signature}', '']
 
     measures_per_line = choose_measures_per_line(measures)
@@ -343,17 +347,17 @@ def build_jianpu_ly_text_from_measures(
 def build_jianpu_ly_text(score, title: str, use_strict_timing: bool = False,
                           composer: str = '', tempo: int = 0,
                           _return_groups: Literal[False] = False, *, _source_wedges=None,
-                          pitch_mode: str = 'movable') -> str: ...
+                          pitch_mode: str = 'movable', fixed_tonic: str = 'C') -> str: ...
 @overload
 def build_jianpu_ly_text(score, title: str, use_strict_timing: bool = False,
                           composer: str = '', tempo: int = 0,
                           *, _return_groups: Literal[True], _source_wedges=None,
-                          pitch_mode: str = 'movable',
+                          pitch_mode: str = 'movable', fixed_tonic: str = 'C',
                           ) -> tuple[str, list[list[int]], dict[int, dict[str, bool]]]: ...
 def build_jianpu_ly_text(score, title: str, use_strict_timing: bool = False,
                           composer: str = '', tempo: int = 0,
                           _return_groups: bool = False, *, _source_wedges=None,
-                          pitch_mode: str = 'movable'):
+                          pitch_mode: str = 'movable', fixed_tonic: str = 'C'):
     """Build jianpu-ly plain-text for all parts in the score.
 
     Source scores are monophonic: each part becomes exactly one jianpu section,
@@ -373,7 +377,8 @@ def build_jianpu_ly_text(score, title: str, use_strict_timing: bool = False,
         raise ValueError(f'unsupported pitch mode: {pitch_mode}')
     key_tonic_semitone, key_header_line = _get_score_key_tonic(score)
     if pitch_mode == 'fixed':
-        key_tonic_semitone, key_header_line = 0, '1=C'
+        key_tonic_semitone, _, tonic_name = fixed_reference(fixed_tonic)
+        key_header_line = f'1={tonic_name}'
     if _source_wedges is None:
         from music21 import dynamics as m21dynamics
         if list(score.recurse().getElementsByClass(m21dynamics.DynamicWedge)):
@@ -394,10 +399,11 @@ def build_jianpu_ly_text(score, title: str, use_strict_timing: bool = False,
         part = _parts[0] if _parts else None
         if use_strict_timing:
             measures, _time_sig = extract_strict_jianpu_measures(
-                score, key_tonic_semitone, pitch_mode=pitch_mode)
+                score, key_tonic_semitone, pitch_mode=pitch_mode, fixed_tonic=fixed_tonic)
         else:
             measures, _time_sig = extract_jianpu_measures(
-                score, key_tonic_semitone, follow_key_changes=True, pitch_mode=pitch_mode)
+                score, key_tonic_semitone, follow_key_changes=True, pitch_mode=pitch_mode,
+                fixed_tonic=fixed_tonic)
         _sections = [measures]
         _section_parts = [part if part is not None else score]
         _voice_groups = [[0]]
@@ -407,10 +413,12 @@ def build_jianpu_ly_text(score, title: str, use_strict_timing: bool = False,
         for part in _parts:
             if use_strict_timing:
                 measures, ts = extract_strict_jianpu_measures(score, key_tonic_semitone, _part=part,
-                                                               pitch_mode=pitch_mode)
+                                                               pitch_mode=pitch_mode,
+                                                               fixed_tonic=fixed_tonic)
             else:
                 measures, ts = extract_jianpu_measures(score, key_tonic_semitone, _part=part,
-                                                       follow_key_changes=True, pitch_mode=pitch_mode)
+                                                       follow_key_changes=True, pitch_mode=pitch_mode,
+                                                       fixed_tonic=fixed_tonic)
             if not _ts_set:
                 _time_sig, _ts_set = ts, True
             if measures:

@@ -128,9 +128,27 @@ def render_lines(chunk, line_key: str, time_sig: str, title: str, workdir: Path,
     return lines
 
 
+def _mark_overfilled(page, target: fitz.Rect) -> None:
+    """Draw a small review marker above an over-filled measure's cell.
+
+    The marker is a red asterisk bracketed by two short vertical ticks, centred
+    just above the measure, so a human reviewer can spot the over-filled bar
+    without the measure being blanked or the line being dropped.
+    """
+    mid = (target.x0 + target.x1) / 2
+    y = target.y0
+    red = (1.0, 0.0, 0.0)
+    # Two corner ticks delimiting the measure.
+    for tick_x in (target.x0, target.x1):
+        page.draw_line(fitz.Point(tick_x, y - 6), fitz.Point(tick_x, y - 2),
+                       color=red, width=1.0)
+    # A centred asterisk between them.
+    page.insert_text(fitz.Point(mid - 3, y - 1), '*', fontsize=8, color=red)
+
+
 def place_line(page, line, x: float, top: float, available_width: float,
                layout_mode: str, *, target_barlines, tile_barlines, place_cell,
-               measure_report=None) -> str:
+               measure_report=None, overfilled_measures=()) -> str:
     """Draw one rendered Jianpu line below a source staff.
 
     Returns ``natural`` (wrap), ``aligned`` (per-measure alignment),
@@ -141,6 +159,11 @@ def place_line(page, line, x: float, top: float, available_width: float,
     narrowed horizontally: that is the documented behaviour of ``single``
     layout, not a degraded fallback.  The individual measures that were
     squeezed are recorded in ``measure_report``.
+
+    ``overfilled_measures`` is an optional set of *absolute* measure indices
+    whose OMR durations exceed their metre.  Those measures are still rendered
+    in full; a small marker is drawn above each one so the over-fill is visible
+    for review instead of being silently blanked or skipped.
     """
     tile, ink, start, count = line
     height = ink.height
@@ -180,6 +203,8 @@ def place_line(page, line, x: float, top: float, available_width: float,
                                        'placement': 'unscaled' if cell_unscaled else 'scaled',
                                        'source_width_points': round(clip.width, 3),
                                        'target_width_points': round(target.width, 3)})
+            if (start + offset) in overfilled_measures:
+                _mark_overfilled(page, target)
         trailing = ink.x1 - bars[-1]
         if trailing > 0.2:
             left = targets[-1]

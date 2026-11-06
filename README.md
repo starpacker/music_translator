@@ -354,14 +354,16 @@ python jianpu.py 曲笛.pdf --mxl 曲笛.musicxml --mode both
 ### 简谱唱名模式
 
 默认使用首调（`--pitch-mode movable`）：主音唱作 `1`，调号变化时数字随调性变化，并在需要处标出 `1=G` 等调号提示。
-固定调使用 `--pitch-mode fixed`：C 始终为 `1`、D 为 `2`，按音名拼写显示升降号；调号变化不会改变数字所对应的音名。
-两种模式都适用于整页简谱和两种原位排版。
+固定调使用 `--pitch-mode fixed`：默认 C 为 `1`、D 为 `2`，按音名拼写显示升降号；调号变化不会改变数字所对应的音名。
+固定调的参考音可以用 `--fixed-tonic` 改成任意音名，例如 `--fixed-tonic D` 即「固定调 1=D」，
+`--fixed-tonic Bb` 即「固定调 1=Bb」。两种模式都适用于整页简谱和两种原位排版。
 
 ```bash
-python jianpu.py 曲笛.pdf --pitch-mode fixed       # 固定调，两种 PDF 都生成
+python jianpu.py 曲笛.pdf --pitch-mode fixed       # 固定调 1=C，两种 PDF 都生成
+python jianpu.py 曲笛.pdf --pitch-mode fixed --fixed-tonic D  # 固定调 1=D
 python jianpu.py 曲笛.pdf --mode insitu --pitch-mode movable  # 首调原位简谱
 python batch.py input/吹管 -o output --pitch-mode fixed  # 批量生成固定调简谱
-python batch.py input/ -o output --pitch-mode fixed
+python batch.py input -o output_fixed_D --pitch-mode fixed --fixed-tonic D  # 批量固定调 1=D
 ```
 
 OMR 结果默认缓存在 `<输出目录>/work/<曲名>.musicxml`，输入内容、设备选择、Homr 版本及识谱处理代码一致时才复用；没有缓存元数据的旧缓存会重新识谱：
@@ -421,7 +423,8 @@ python jianpu.py 曲笛.pdf --mode jianpu -o out/曲笛-简谱.pdf
 | `--mode {jianpu,insitu,both}` | 产物类型，默认 `both` |
 | `--engine {spaced,stamp,strip}` | 原位简谱合成方式，默认 `spaced`；`strip` 为兼容别名 |
 | `--layout {single,wrap}` | 原位简谱排版，默认 `single`（一行对一行）；`wrap` 保原字号自动换行 |
-| `--pitch-mode {movable,fixed}` | 首调（默认）或固定调（C=1） |
+| `--pitch-mode {movable,fixed}` | 首调（默认）或固定调（默认 C=1） |
+| `--fixed-tonic NOTE` | 固定调的参考音名，默认 `C`；如 `D`、`Bb`、`F#`，该音唱作 `1` |
 | `--mxl` | 已有的 MusicXML，给出后跳过 OMR |
 | `--work` | OMR 中间结果目录，默认 `<输出目录>/work` |
 | `--title` | 简谱标题，默认取输入文件名 |
@@ -584,7 +587,7 @@ python jianpu.py 曲笛.pdf --mode jianpu -o out/曲笛-简谱.pdf
   已解析的连奏线照常采用，残缺的那条不会退化成 OMR 那种「有头无尾」的长线。只有 `unverified`
   （一条都没解析成）才整份退回 MusicXML 原有标记——而 Homr 的原标记常常只有 `start` 没有 `stop`。
   扫描件没有可用矢量曲线，也只能退回原标记。
-- **调号**默认按首调标注（`1=D` 之类）；`--pitch-mode fixed` 固定 C 为 `1` 并按音名显示升降号。临时升降号会在音符前带 `#`/`b`。
+- **调号**默认按首调标注（`1=D` 之类）；`--pitch-mode fixed` 按固定调标注（默认 C 为 `1`，可用 `--fixed-tonic` 改参考音）并按音名显示升降号。临时升降号会在音符前带 `#`/`b`。
 
 ---
 

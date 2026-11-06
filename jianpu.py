@@ -59,7 +59,11 @@ def omr_to_musicxml(score_pdf: Path, work: Path, use_gpu: Optional[bool] = None)
     pipeline.update((HERE / 'homr_shim.py').read_bytes())
     for name in ('core/config.py', 'core/utils.py', 'core/omr/homr_runner.py',
                  'core/omr/multirest_collapse.py', 'core/omr/vector_whole_chords.py',
+                 'core/omr/dl_fix.py',
                  'core/image/image_preprocess.py',
+                 'core/notation/jianpu/measure.py',
+                 'core/notation/jianpu/primitives.py',
+                 'core/notation/jianpu/extract.py',
                  'core/notation/tie_reconstruction.py'):
         pipeline.update((root / name).read_bytes())
     expected = {'source_sha256': digest.hexdigest(), 'gpu': use_gpu,
@@ -394,7 +398,7 @@ def recover_pdf_slurs(score_pdf: Path, mxl: Path, work: Path, stem: str) -> Path
 
 
 def musicxml_to_jianpu(mxl: Path, out_pdf: Path, title: Optional[str] = None,
-                       pitch_mode: str = 'movable') -> Path:
+                       pitch_mode: str = 'movable', fixed_tonic: str = 'C') -> Path:
     """MusicXML → 整页简谱 PDF（music21 → jianpu-ly → LilyPond）。"""
     ensure_sumisora()
     from core.render.renderer import generate_jianpu_pdf_from_mxl   # noqa: PLC0415
@@ -403,7 +407,8 @@ def musicxml_to_jianpu(mxl: Path, out_pdf: Path, title: Optional[str] = None,
     tmp = Path(tempfile.mkdtemp(prefix='jianpu_'))
     try:
         ok = generate_jianpu_pdf_from_mxl(
-            mxl, out_pdf, tmp, preferred_title=title or mxl.stem, pitch_mode=pitch_mode)
+            mxl, out_pdf, tmp, preferred_title=title or mxl.stem,
+            pitch_mode=pitch_mode, fixed_tonic=fixed_tonic)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     if not ok or not out_pdf.is_file():
@@ -416,13 +421,15 @@ def musicxml_to_jianpu(mxl: Path, out_pdf: Path, title: Optional[str] = None,
 
 def insitu_stamp(score_pdf: Path, mxl: Path, out_pdf: Path,
                  title: Optional[str] = None, expand: bool = True,
-                 pitch_mode: str = 'movable', layout: str = 'single') -> Path:
+                 pitch_mode: str = 'movable', layout: str = 'single',
+                 fixed_tonic: str = 'C') -> Path:
     """同尺寸分页的原位简谱；expand=False 显式保留旧式叠印。"""
     from insitu import render_insitu                          # noqa: PLC0415
 
     out_pdf.parent.mkdir(parents=True, exist_ok=True)
     render_insitu.build(score_pdf, mxl, out_pdf, title=title or score_pdf.stem,
-                        expand=expand, pitch_mode=pitch_mode, layout=layout)
+                        expand=expand, pitch_mode=pitch_mode, layout=layout,
+                        fixed_tonic=fixed_tonic)
     print(f'[insitu] -> {out_pdf}  ({out_pdf.stat().st_size/1024:.0f} KB)')
     return out_pdf
 
@@ -450,7 +457,9 @@ def main(argv: list[str]) -> int:
                     help='原位简谱：single=一行五线谱对应一行简谱（默认，必要时横向压缩）；'
                          'wrap=原字号，允许换为多行简谱')
     ap.add_argument('--pitch-mode', choices=('movable', 'fixed'), default='movable',
-                    help='简谱音高：movable=首调（默认），fixed=固定调（C=1）')
+                    help='简谱音高：movable=首调（默认），fixed=固定调（默认 C=1）')
+    ap.add_argument('--fixed-tonic', default='C', metavar='NOTE',
+                    help='固定调的参考音（默认 C；可写 D、Bb、F# 等），即该音唱作 1')
     ap.add_argument('--mxl', type=Path, default=None, help='已有的 MusicXML（跳过 OMR）')
     ap.add_argument('--no-vector-tempos', action='store_true',
                     help='不从 PDF 矢量文字推断速度记号')
@@ -516,14 +525,15 @@ def main(argv: list[str]) -> int:
 
     if args.mode in ('jianpu', 'both'):
         musicxml_to_jianpu(jianpu_mxl, base.parent / f'{base.name}.jianpu.pdf', title,
-                           pitch_mode=args.pitch_mode)
+                           pitch_mode=args.pitch_mode, fixed_tonic=args.fixed_tonic)
 
     if args.mode in ('insitu', 'both'):
         out = base.parent / f'{base.name}.insitu.pdf'
         if args.engine == 'strip':
             print('[insitu] strip 已并入 spaced：保留原页面尺寸，空间不足自动分页。')
         insitu_stamp(score, mxl, out, title, expand=args.engine != 'stamp',
-                     pitch_mode=args.pitch_mode, layout=args.layout)
+                     pitch_mode=args.pitch_mode, layout=args.layout,
+                     fixed_tonic=args.fixed_tonic)
     return 0
 
 

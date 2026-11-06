@@ -1041,7 +1041,14 @@ class NoteheadMarkup:
         else:
             ret = r" \jianpuGraceCurveEnd " + ret
     # sys.stderr.write(accidental+figure+octave+dots+"/"+str(nBeams)+"->"+str(self.barPos)+" ") # if need to see where we are
-    if self.barPos > self.barLength: errExit("(notesHad=%s) barcheck fail: note crosses barline at \"%s\" with %d beams (%d skipped from %d to %d, bypassing %d), scoreNo=%d barNo=%d (but the error could be earlier)" % (' '.join(self.notesHad),figures,nBeams,toAdd,self.barPos-toAdd,self.barPos,self.barLength,scoreNo,self.barNo))
+    if self.barPos > self.barLength:
+        if os.environ.get("j2ly_sloppy_bars",""):
+            # Over-filled measure: the OMR run recognised more notes than the
+            # metre, and the user's decision is to pass it through anyway
+            # ("即便超时值了，也输出") instead of dropping the whole line.
+            # Absorb the overflow here so the next measure still starts clean.
+            sys.stderr.write("Over-filled bar %d ignored (j2ly_sloppy_bars set): %d units over barLength %d\n" % (self.barNo, self.barPos - self.barLength, self.barLength))
+        else: errExit("(notesHad=%s) barcheck fail: note crosses barline at \"%s\" with %d beams (%d skipped from %d to %d, bypassing %d), scoreNo=%d barNo=%d (but the error could be earlier)" % (' '.join(self.notesHad),figures,nBeams,toAdd,self.barPos-toAdd,self.barPos,self.barLength,scoreNo,self.barNo))
     if (self.barPos%self.beatLength == 0 or self.barPos==self.barLength) and self.inBeamGroup: # (or added for irregular time signatures; self.inBeamGroup is set only if not midi/western)
         # jianpu printouts tend to restart beams every beat
         # (but if there are no beams running anyway, it occasionally helps typesetting to keep the logical group running, e.g. to work around bugs involving beaming a dash-and-rest beat in 6/8) (TODO: what if there's a dash-and-rest BAR?  [..]-notated beams don't usually work across barlines
@@ -1053,7 +1060,7 @@ class NoteheadMarkup:
     self.lastNBeams = nBeams
     beamC = u'\u0333' if nBeams>=2 else u'\u0332' if nBeams==1 else u""
     self.unicode_approx.append({'#':u"\u266f",'b':u"\u266d",'##':u"\U0001d12a",'bb':u"\U0001d12b"}.get(0 if invisTieLast else accidental,u"")+(u"-" if invisTieLast else figures[-1:])+beamC+(u"" if invisTieLast else (u'\u0323' if "," in octave else u'\u0307' if "'" in octave else u""))+u''.join(c+beamC for c in dots)+(u"" if self.inBeamGroup else u" ")) # (NB inBeamGroup is correct only if not midi and not western)
-    if self.barPos == self.barLength:
+    if self.barPos >= self.barLength:
         self.unicode_approx[-1]=self.unicode_approx[-1].rstrip()+u'\u2502'
         self.barPos = 0 ; self.barNo += 1
         self.current_accidentals = {}

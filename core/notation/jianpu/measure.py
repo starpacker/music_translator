@@ -1,6 +1,7 @@
 # core/notation/jianpu/measure.py — Measure-level operations for Jianpu conversion.
 from fractions import Fraction
 import logging
+import math
 from typing import Optional
 
 from music21 import chord as m21chord, note as m21note
@@ -176,8 +177,17 @@ def layout_time_word(units: int) -> Optional[str]:
     if units <= 0:
         return None
     if isinstance(units, Fraction) and units.denominator != 1:
-        logging.getLogger(__name__).warning('小节时值不能用当前排版网格精确表示，请校对连音符。')
-        return None
+        # 连音符（如三连音 2:3）使小节总时值落在 64 分网格之外（如 200/3 ≈ 66.7）。
+        # jianpu-ly 的 barLength 只能是整数（setTime 里 int(64*num/denom)），
+        # 因此任何 \time 都无法让 barPos 精确等于 barLength：向上取整会让小节
+        # 差一点点到不了 barLength、永不闭合，下一小节的 \time 一重置就触发
+        # "note crosses barline" 硬失败、整行被跳过。向下取整到最近的可表示
+        # 整数，让小节末尾恰到好处地「多出」一小点，由 jianpu-ly 的宽松小节
+        # 检查（j2ly_sloppy_bars）把这点溢出吸收掉、照常换行。配合 render 层
+        # 的红色超时标记，超时值的小节仍完整输出。
+        units = math.floor(units)
+        logging.getLogger(__name__).warning(
+            '小节时值无法用 64 分网格精确表示，已向下取整为 %s 单元以便输出。', units)
     if units % 16 == 0:
         return f'{units // 16}/4'
     if units % 8 == 0:

@@ -40,6 +40,8 @@ def main(argv=None):
     parser.add_argument('--engine', choices=('spaced', 'strip', 'stamp'), default='spaced')
     parser.add_argument('--layout', choices=('single', 'wrap'), default='single')
     parser.add_argument('--pitch-mode', choices=('movable', 'fixed'), default='movable')
+    parser.add_argument('--fixed-tonic', default='C', metavar='NOTE',
+                        help='Fixed-pitch reference note (default C; e.g. D, Bb, F#)')
     parser.add_argument('--gpu', choices=('auto', 'on', 'off'), default='auto')
     parser.add_argument('--zip', dest='zip_path', type=Path, default=None,
                         metavar='PATH',
@@ -61,7 +63,8 @@ def main(argv=None):
                    str(score.resolve()), '-o', str((args.output / score.stem).resolve()),
                    '--work', str((work / score.stem).resolve()), '--mode', args.mode,
                    '--engine', args.engine, '--layout', args.layout,
-                   '--pitch-mode', args.pitch_mode, '--gpu', args.gpu]
+                   '--pitch-mode', args.pitch_mode, '--fixed-tonic', args.fixed_tonic,
+                   '--gpu', args.gpu]
         log = args.output / f'{score.stem}.log'
         with log.open('w', encoding='utf-8') as stream:
             result = subprocess.run(command, stdout=stream, stderr=subprocess.STDOUT)
